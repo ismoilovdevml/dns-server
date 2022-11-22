@@ -6,3 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.66"
+async-trait = "0.1.58"
+clap = { version = "4.0.26", features = ["derive", "env"] }
+thiserror = "1.0.37"
+tokio = { version = "1.22.0", features = ["macros", "rt-multi-thread", "net"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.16"
+trust-dns-server = "0.22.0"
