@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use handler::Handler;
+use handler::Hander;
 use options::Options;
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
@@ -17,7 +17,7 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(10);
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let options =Options::parse();
-    let handler = Handler::from_options(&options);
+    let handler = Hander::from_options(&options);
 
     // DNS server yaratamiz
 
