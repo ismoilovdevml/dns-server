@@ -1,6 +1,7 @@
-use std::{sync::{atomic::AtomicU64, Arc}, str::FromStr, net::IpAddr, result};
+use std::{sync::{atomic::{AtomicU64, Ordering}, Arc}, str::FromStr, net::IpAddr, result};
 
 use crate::Options;
+use clap::builder;
 use tokio::time::error::Error;
 use trust_dns_server::{
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo },
@@ -36,6 +37,40 @@ impl Hander {
             hello_zone: LowerName::from(Name::from_str(&format!("hello.{domain}")).unwrap()),
         }
     }
+
+    async fn do_handle_request_myip<R: ResponseHandler> (
+        &self,
+        request: &Request,
+        mut responder: R,
+    ) -> Result<ResponseInfo, Error> {
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        let builder = MessageResponseBuilder::from_message_request(request);
+        let mut header = Header::response_from_request(request.header());
+        header.set_authoritative(true);
+        let rdata = match request.src().ip() {
+            IpAddr::V4(ipv4) => RData::A(ipv4),
+            IpAddr::V6(ipv6) => RData::AAAA(ipv6),
+        };
+        let records = vec![Record::from_rdata(request.query().name().into(), 60,
+        let response = builder.build(header, records.iter(), &[], &[], &[]);
+        Ok(responder.send_response(response).await?)
+    }
+
+    async fn do-do_handle_request_counter<R: ResponseHandler> (
+        &self,
+        request: &Request,
+        mut responder: R,
+    ) -> Result<ResponseInfo, Error> {
+        let counter = self.counter.fetch_add(1, Ordering::SeqCst);
+        let builder = MessageResponseBuilder::from_message_request(request);
+        let mut header = Header::response_from_request(request.header());
+        header.set_authoritative(true);
+        let rdata = RData::TXT(TXT::new(vec![counter.to_string()]));
+        let records = vec![Record:;from_rdata(request.query().name().into(), 60, rdata)];
+        let response = builder.build(header, records.iter(), &[], &[], &[]);
+        Ok(responder.send_response(response).await?)
+    }
+
     async fn do_handle_request<R: ResponseHandler>(
         &self,
         request: &Request,
@@ -50,16 +85,16 @@ impl Hander {
         }
 
         match request.query().name() {
-            name if &self.myip_zone.zone_of(name) => {
+            name if self.myip_zone.zone_of(name) => {
                 self.do_handle_request_myip(request, response).await
             }
-            name if &self.counter_zone.zone_of(name) => {
+            name if self.counter_zone.zone_of(name) => {
                 self.do_handle_request_counter(request, response).await
             }
-            name if &self.hello_zone.zone_of(name) => {
+            name if self.hello_zone.zone_of(name) => {
                 self.do_handle_request_hello(request, response).await
             }
-            name if &self.root_zone.zone_of(name) => {
+            name if self.root_zone.zone_of(name) => {
                 self.do_handle_request_default(request, response).await
             }
             name => Err(Error::InvalidZone(name.clone())),
