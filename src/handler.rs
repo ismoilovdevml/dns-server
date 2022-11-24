@@ -7,7 +7,7 @@ use trust_dns_server::{
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo },
     client::rr::LowerName,
     proto::{op::{header, Header, OpCode, MessageType},
-    rr::{Name, domain, RData}}, authority::MessageResponseBuilder};
+    rr::{Name, domain, RData, Record, rdata::TXT}}, authority::MessageResponseBuilder};
 //DNS so'rovlarini qayta ishlash
 
 #[derive(Clone, Debug)]
@@ -51,12 +51,12 @@ impl Hander {
             IpAddr::V4(ipv4) => RData::A(ipv4),
             IpAddr::V6(ipv6) => RData::AAAA(ipv6),
         };
-        let records = vec![Record::from_rdata(request.query().name().into(), 60,
+        let records = vec![Record::from_rdata(request.query().name().into(), 60, rdata)];
         let response = builder.build(header, records.iter(), &[], &[], &[]);
         Ok(responder.send_response(response).await?)
     }
 
-    async fn do-do_handle_request_counter<R: ResponseHandler> (
+    async fn do_handle_request_counter<R: ResponseHandler> (
         &self,
         request: &Request,
         mut responder: R,
@@ -66,7 +66,7 @@ impl Hander {
         let mut header = Header::response_from_request(request.header());
         header.set_authoritative(true);
         let rdata = RData::TXT(TXT::new(vec![counter.to_string()]));
-        let records = vec![Record:;from_rdata(request.query().name().into(), 60, rdata)];
+        let records = vec![Record::from_rdata(request.query().name().into(), 60, rdata)];
         let response = builder.build(header, records.iter(), &[], &[], &[]);
         Ok(responder.send_response(response).await?)
     }
