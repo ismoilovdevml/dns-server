@@ -1,11 +1,12 @@
-use std::{sync::{atomic::AtomicU64, Arc}, str::FromStr};
+use std::{sync::{atomic::AtomicU64, Arc}, str::FromStr, net::IpAddr, result};
 
 use crate::Options;
+use tokio::time::error::Error;
 use trust_dns_server::{
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo },
     client::rr::LowerName,
-    proto::{op::{header, Header},
-    rr::{Name, domain}}};
+    proto::{op::{header, Header, OpCode, MessageType},
+    rr::{Name, domain, RData}}, authority::MessageResponseBuilder};
 //DNS so'rovlarini qayta ishlash
 
 #[derive(Clone, Debug)]
@@ -35,7 +36,35 @@ impl Hander {
             hello_zone: LowerName::from(Name::from_str(&format!("hello.{domain}")).unwrap()),
         }
     }
-    
+    async fn do_handle_request<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        response: R,
+    ) -> Result<ResponseInfo, Error> {
+        if request.op_code() != OpCode::Query {
+            return Err(Error::InvalidOpCode(request.op_code()));
+        }
+
+        if request.message_type() != MessageType::Query {
+            return Err(Error::InvalidMessageType(request.message_type()));
+        }
+
+        match request.query().name() {
+            name if &self.myip_zone.zone_of(name) => {
+                self.do_handle_request_myip(request, response).await
+            }
+            name if &self.counter_zone.zone_of(name) => {
+                self.do_handle_request_counter(request, response).await
+            }
+            name if &self.hello_zone.zone_of(name) => {
+                self.do_handle_request_hello(request, response).await
+            }
+            name if &self.root_zone.zone_of(name) => {
+                self.do_handle_request_default(request, response).await
+            }
+            name => Err(Error::InvalidZone(name.clone())),
+        }
+    }
 }
 
 #[async_trait::async_trait]
