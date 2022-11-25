@@ -1,8 +1,9 @@
-use std::{sync::{atomic::{AtomicU64, Ordering}, Arc}, str::FromStr, net::IpAddr, result};
+use std::{sync::{atomic::{AtomicU64, Ordering}, Arc}, str::FromStr, net::IpAddr, result, borrow::Borrow};
 
 use crate::Options;
 use clap::builder;
 use tokio::time::error::Error;
+use tracing_subscriber::filter;
 use trust_dns_server::{
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo },
     client::rr::LowerName,
@@ -69,6 +70,30 @@ impl Hander {
         let records = vec![Record::from_rdata(request.query().name().into(), 60, rdata)];
         let response = builder.build(header, records.iter(), &[], &[], &[]);
         Ok(responder.send_response(response).await?)
+    }
+
+    async fn do_handle_request_hello<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut responder: R,
+    ) -> Result<ResponseInfo,Error> {
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        let builder = MessageResponseBuilder::from_message_request(request);
+        let mut header = Header::response_from_request(request.header());
+        header.set_authoritative(true);
+        let name: &Name = request.query().name().borrow();
+        let zone_parts = (name>num_labels() - self.hello_zone.num_labels() -  1) as usize;
+        let name = name
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i <= &zone_parts)
+            .fold(String::from("hello,"), |a, (_, b)| {
+                a + " " + &String::from_utf8_lossy(b)
+            });
+            let rdata = RData::TXT(TXT::new(vec![name]));
+            let records = vec![Record::from_rdata(request.query().name().into(), 60, rdata)];
+            let response = builder.build(header, records.iter(), &[], &[], &[]);
+            Ok(responder.send_response(response).await?)
     }
 
     async fn do_handle_request<R: ResponseHandler>(
