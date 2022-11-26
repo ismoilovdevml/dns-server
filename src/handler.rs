@@ -1,15 +1,20 @@
-use std::{sync::{atomic::{AtomicU64, Ordering}, Arc}, str::FromStr, net::IpAddr, result, borrow::Borrow};
-
 use crate::Options;
-use clap::builder;
-use tokio::time::error::Error;
-use tracing_subscriber::filter;
+use std::{
+    borrow::Borrow,
+    net::IpAddr,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
+use tracing::*;
 use trust_dns_server::{
-    server::{Request, RequestHandler, ResponseHandler, ResponseInfo },
-    client::rr::LowerName,
-    proto::{op::{header, Header, OpCode, MessageType, ResponseCode},
-    rr::{Name, domain, RData, Record, rdata::TXT}}, authority::MessageResponseBuilder};
-//DNS so'rovlarini qayta ishlash
+    authority::MessageResponseBuilder,
+    client::rr::{rdata::TXT, LowerName, Name, RData, Record},
+    proto::op::{Header, MessageType, OpCode, ResponseCode},
+    server::{Request, RequestHandler, ResponseHandler, ResponseInfo},
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -23,6 +28,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+/// DNS Request Handler
 #[derive(Clone, Debug)]
 pub struct Hander {
     // So'rovlarni hisoblovchi
@@ -35,14 +41,13 @@ pub struct Hander {
     pub myip_zone: LowerName,
     // Salomlashish uchun zoan nomi :) (hello.dnsserver.dev)
     pub hello_zone: LowerName,
-
 }
 
 impl Hander {
-    // command-line parametrlari
-
-    pub fn from_options(_options: &Options) -> Self {
-        Hander{
+   // command-line parametrlari
+    pub fn from_options(options: &Options) -> Self {
+        let domain = &options.domain;
+        Hander {
             root_zone: LowerName::from(Name::from_str(domain).unwrap()),
             counter: Arc::new(AtomicU64::new(0)),
             counter_zone: LowerName::from(Name::from_str(&format!("counter.{domain}")).unwrap()),
@@ -51,7 +56,8 @@ impl Hander {
         }
     }
 
-    async fn do_handle_request_myip<R: ResponseHandler> (
+    /// myip.{domain} uchun so'rovlarni boshqarish.
+    async fn do_handle_request_myip<R: ResponseHandler>(
         &self,
         request: &Request,
         mut responder: R,
@@ -69,7 +75,8 @@ impl Hander {
         Ok(responder.send_response(response).await?)
     }
 
-    async fn do_handle_request_counter<R: ResponseHandler> (
+    //so'rovlarni boshqarish.{domen}.
+    async fn do_handle_request_counter<R: ResponseHandler>(
         &self,
         request: &Request,
         mut responder: R,
@@ -84,17 +91,18 @@ impl Hander {
         Ok(responder.send_response(response).await?)
     }
 
+    // *.hello.{domain} so'rovlarini ko'rib chiqish
     async fn do_handle_request_hello<R: ResponseHandler>(
         &self,
         request: &Request,
         mut responder: R,
-    ) -> Result<ResponseInfo,Error> {
+    ) -> Result<ResponseInfo, Error> {
         self.counter.fetch_add(1, Ordering::SeqCst);
         let builder = MessageResponseBuilder::from_message_request(request);
         let mut header = Header::response_from_request(request.header());
         header.set_authoritative(true);
         let name: &Name = request.query().name().borrow();
-        let zone_parts = (name.num_labels() - self.hello_zone.num_labels() -  1) as usize;
+        let zone_parts = (name.num_labels() - self.hello_zone.num_labels() - 1) as usize;
         let name = name
             .iter()
             .enumerate()
@@ -102,17 +110,34 @@ impl Hander {
             .fold(String::from("hello,"), |a, (_, b)| {
                 a + " " + &String::from_utf8_lossy(b)
             });
-            let rdata = RData::TXT(TXT::new(vec![name]));
-            let records = vec![Record::from_rdata(request.query().name().into(), 60, rdata)];
-            let response = builder.build(header, records.iter(), &[], &[], &[]);
-            Ok(responder.send_response(response).await?)
+        let rdata = RData::TXT(TXT::new(vec![name]));
+        let records = vec![Record::from_rdata(request.query().name().into(), 60, rdata)];
+        let response = builder.build(header, records.iter(), &[], &[], &[]);
+        Ok(responder.send_response(response).await?)
     }
 
+    // Boshqa so'rovlarni ko'rib chiqish (NXDOMAIN)
+    async fn do_handle_request_default<R: ResponseHandler>(
+        &self,
+        request: &Request,
+        mut responder: R,
+    ) -> Result<ResponseInfo, Error> {
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        let builder = MessageResponseBuilder::from_message_request(request);
+        let mut header = Header::response_from_request(request.header());
+        header.set_authoritative(true);
+        header.set_response_code(ResponseCode::NXDomain);
+        let response = builder.build_no_records(header);
+        Ok(responder.send_response(response).await?)
+    }
+
+    /// Agar javob xato yoki to'gri bo'lsa ResponseInfoni qaytaruvchi
     async fn do_handle_request<R: ResponseHandler>(
         &self,
         request: &Request,
         response: R,
     ) -> Result<ResponseInfo, Error> {
+        // So'rovlarni tekshirish
         if request.op_code() != OpCode::Query {
             return Err(Error::InvalidOpCode(request.op_code()));
         }
@@ -146,10 +171,11 @@ impl RequestHandler for Hander {
         request: &Request,
         response: R,
     ) -> ResponseInfo {
-        match self.do_handle_request(request, response).await? {
+        // try to handle request
+        match self.do_handle_request(request, response).await {
             Ok(info) => info,
             Err(error) => {
-                error("RequestHandlerda xato: {error}");
+                error!("RequestHandlerda xato: {error}");
                 let mut header = Header::new();
                 header.set_response_code(ResponseCode::ServFail);
                 header.into()
