@@ -7,9 +7,21 @@ use tracing_subscriber::filter;
 use trust_dns_server::{
     server::{Request, RequestHandler, ResponseHandler, ResponseInfo },
     client::rr::LowerName,
-    proto::{op::{header, Header, OpCode, MessageType},
+    proto::{op::{header, Header, OpCode, MessageType, ResponseCode},
     rr::{Name, domain, RData, Record, rdata::TXT}}, authority::MessageResponseBuilder};
 //DNS so'rovlarini qayta ishlash
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Xato OpCode {0:}")]
+    InvalidOpCode(OpCode),
+    #[error("Yaroqsiz xabar turi {0:}")]
+    InvalidMessageType(MessageType),
+    #[error("Yaroqsiz zona {0:}")]
+    InvalidZone(LowerName),
+    #[error("IO xato: {0:}")]
+    Io(#[from] std::io::Error),
+}
 
 #[derive(Clone, Debug)]
 pub struct Hander {
@@ -82,7 +94,7 @@ impl Hander {
         let mut header = Header::response_from_request(request.header());
         header.set_authoritative(true);
         let name: &Name = request.query().name().borrow();
-        let zone_parts = (name>num_labels() - self.hello_zone.num_labels() -  1) as usize;
+        let zone_parts = (name.num_labels() - self.hello_zone.num_labels() -  1) as usize;
         let name = name
             .iter()
             .enumerate()
