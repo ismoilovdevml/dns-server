@@ -74,7 +74,7 @@ jobs:
         run: docker build -t dns-server:scan .
 
       - name: Scan for vulnerabilities
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: dns-server:scan
           format: sarif
@@ -91,7 +91,7 @@ jobs:
 
       # A HIGH or CRITICAL with a fix available should block the merge.
       - name: Fail on fixable findings
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: dns-server:scan
           format: table
