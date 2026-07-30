@@ -1,0 +1,212 @@
+# Kubernetes deployment for dns-server.
+#
+#   kubectl apply -f deploy/kubernetes/dns-server.yaml
+#
+# Edit the ConfigMap to describe your zone, then bump the `config-hash`
+# annotation (or use a tool like Kustomize's configMapGenerator) so a config
+# change actually rolls the pods.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dns-server
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dns-server-config
+  namespace: dns-server
+data:
+  dns-server.toml: |
+    [server]
+    udp = ["0.0.0.0:5300"]
+    tcp = ["0.0.0.0:5300"]
+    admin_listen = "0.0.0.0:9100"
+    log_format = "json"
+    log_level = "info"
+
+    [server.rate_limit]
+    qps = 50
+    burst = 100
+
+    [zone]
+    origin = "example.com"
+    default_ttl = 300
+    builtins = true
+
+    [zone.soa]
+    mname = "ns1.example.com."
+    rname = "hostmaster.example.com."
+    serial = 1
+    minimum = 60
+
+    [[zone.records]]
+    name = "@"
+    type = "A"
+    values = ["203.0.113.10"]
+
+    [[zone.records]]
+    name = "www"
+    type = "CNAME"
+    values = ["example.com."]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dns-server
+  namespace: dns-server
+  labels:
+    app.kubernetes.io/name: dns-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dns-server
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dns-server
+      annotations:
+        # Bump this whenever the ConfigMap changes so the rollout happens.
+        config-hash: "replace-me"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Spread replicas so one node going away does not take the zone with it.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: dns-server
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: dns-server
+          image: ghcr.io/ismoilovdevml/dns-server:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config=/etc/dns-server/dns-server.toml
+          ports:
+            - name: dns-udp
+              containerPort: 5300
+              protocol: UDP
+            - name: dns-tcp
+              containerPort: 5300
+              protocol: TCP
+            - name: admin
+              containerPort: 9100
+              protocol: TCP
+          env:
+            # Listening above 1024 means we need no capabilities at all.
+            - name: DNS_LOG_FORMAT
+              value: json
+          # Liveness only asks "is the runtime scheduling tasks"; readiness is
+          # what gates traffic, and it flips to 503 while we drain on SIGTERM.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            initialDelaySeconds: 3
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            initialDelaySeconds: 1
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 2
+            failureThreshold: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: "1"
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/dns-server
+              readOnly: true
+      # Give in-flight queries and the load balancer time to notice /readyz.
+      terminationGracePeriodSeconds: 20
+      volumes:
+        - name: config
+          configMap:
+            name: dns-server-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-server
+  namespace: dns-server
+  labels:
+    app.kubernetes.io/name: dns-server
+spec:
+  type: LoadBalancer
+  # Preserve the client IP: `myip.` and the per-source rate limiter are both
+  # useless if every query appears to come from a node.
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: dns-server
+  ports:
+    - name: dns-udp
+      port: 53
+      targetPort: dns-udp
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      targetPort: dns-tcp
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-server-admin
+  namespace: dns-server
+  labels:
+    app.kubernetes.io/name: dns-server
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: dns-server
+  ports:
+    - name: admin
+      port: 9100
+      targetPort: admin
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dns-server
+  namespace: dns-server
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dns-server

@@ -1,1 +1,11 @@
 /target
+# Local config written by `dns-server init`; the committed example is
+# dns-server.example.toml.
+/dns-server.toml
+/deploy/dns-server.toml
+*.tmp
+.dns-server.toml.tmp
+.DS_Store
+
+# Scratch output from tooling.
+.playwright-mcp/

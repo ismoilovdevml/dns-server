@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest a capability
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation you are in, not just the feature you want.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would it look like?
+      description: A CLI invocation, a config snippet, or an endpoint.
+      render: shell
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried instead?

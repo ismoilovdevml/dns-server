@@ -1,0 +1,3 @@
+edition = "2021"
+# Defaults everywhere else: matching the wider Rust ecosystem is worth more than
+# any local preference, and it keeps `cargo fmt` diffs boring.

@@ -1,0 +1,221 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build (must already exist)
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Refuse to publish a release whose version does not match its tag, and refuse
+  # to publish one that does not pass its own tests.
+  verify:
+    name: Verify the tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Tag must match Cargo.toml
+        id: check
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          crate="$(grep -m1 '^version' Cargo.toml | tr -d '"' | awk '{print $3}')"
+          echo "tag=$tag crate=$crate"
+          if [ "$tag" != "v$crate" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+          echo "version=$crate" >> "$GITHUB_OUTPUT"
+
+      - name: cargo test
+        run: cargo test --all-features --locked
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl first: a static binary runs on any Linux, whatever its glibc.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked --version ^0.2
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }} --bin dns-server
+          else
+            cargo build --release --locked --target ${{ matrix.target }} --bin dns-server
+          fi
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          name="dns-server-${{ needs.verify.outputs.version }}"
+          archive="dns-server-v${{ needs.verify.outputs.version }}-${{ matrix.target }}.tar.gz"
+
+          staging="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/dns-server" "$staging/"
+          cp README.md LICENSE dns-server.example.toml "$staging/"
+
+          # Flat archive: install.sh expects ./dns-server at the root.
+          tar -czf "$archive" -C "$staging" .
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish the release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          set -euo pipefail
+          sha256sum ./*.tar.gz | sed 's|\./||' > SHA256SUMS
+          cat SHA256SUMS
+
+      # Lets a consumer verify the binaries came from this workflow, not just
+      # from someone with push access to the releases page.
+      - name: Attest the artifacts
+        uses: actions/attest-build-provenance@v2
+        continue-on-error: true
+        with:
+          subject-path: artifacts/*.tar.gz
+
+      - name: Release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          version="${{ needs.verify.outputs.version }}"
+          {
+            echo "## dns-server v$version"
+            echo
+            echo "### Install"
+            echo
+            echo '```bash'
+            echo "curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh"
+            echo '```'
+            echo
+            echo "### Docker"
+            echo
+            echo '```bash'
+            echo "docker pull ghcr.io/${{ github.repository }}:$version"
+            echo '```'
+            echo
+            echo "### Verify a download"
+            echo
+            echo '```bash'
+            echo "sha256sum -c SHA256SUMS --ignore-missing"
+            echo '```'
+          } > notes.md
+
+          if [ -f CHANGELOG.md ]; then
+            echo "" >> notes.md
+            echo "### Changes" >> notes.md
+            echo "" >> notes.md
+            # Everything between this version's heading and the next one.
+            awk "/^## \[?v?$version\]?/{flag=1; next} /^## /{flag=0} flag" CHANGELOG.md >> notes.md || true
+          fi
+          cat notes.md
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: v${{ needs.verify.outputs.version }}
+          body_path: notes.md
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+          draft: false
+          # A tag like v0.3.0-rc.1 is a pre-release.
+          prerelease: ${{ contains(needs.verify.outputs.version, '-') }}
+          fail_on_unmatched_files: true
+
+  crates-io:
+    name: Publish to crates.io
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    # Opt-in: nothing is published unless the token is configured.
+    if: vars.PUBLISH_TO_CRATES_IO == 'true'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

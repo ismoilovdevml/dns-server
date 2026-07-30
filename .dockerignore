@@ -1,2 +1,9 @@
-/target
-/.git
+# Keep the build context small: everything the image needs is Cargo.toml,
+# Cargo.lock and src/ (plus tests/ for the cargo-chef recipe).
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!src/**
+!tests
+!tests/**

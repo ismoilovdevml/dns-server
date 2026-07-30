@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+# A new push to a PR makes the in-flight run obsolete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Fewer retries, faster failures on a flaky network.
+  CARGO_NET_RETRY: 3
+  RUSTUP_MAX_RETRIES: 3
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo doc
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The server binds sockets and handles signals, so it is worth proving it
+        # works on more than the CI default.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+
+      - name: cargo test
+        run: cargo test --all-features --locked
+
+      # The library tests cover the same paths, but running the real binary
+      # catches packaging problems the test harness cannot see.
+      - name: Smoke test the CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          run() { cargo run --locked --quiet -- "$@"; }
+          run --version
+          run init --origin ci.example --output ci.toml --json
+          run --config ci.toml record add www A 203.0.113.10 --json
+          run --config ci.toml record list --json
+          run --config ci.toml check --json
+          run --config ci.toml zone export
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version="$(grep -m1 '^rust-version' Cargo.toml | tr -d '"' | awk '{print $3}')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV is $version"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      # `cargo check` rather than a full test run: the point is that the declared
+      # MSRV still compiles, not that it passes on an old toolchain.
+      - name: cargo check
+        run: cargo check --all-features --locked
+
+  shell:
+    name: Shell lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck install.sh
+        run: shellcheck --shell=sh install.sh
+
+  manifests:
+    name: Validate deployment manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: manifests
+
+      # The example config is documentation; if it stops being valid, the docs
+      # are wrong.
+      - name: Validate the example config
+        run: cargo run --locked --quiet -- --config dns-server.example.toml check
+
+      - name: Validate compose file
+        run: docker compose -f deploy/docker-compose.yml config --quiet
+
+      - name: Validate Kubernetes manifests
+        run: |
+          curl -fsSL -o kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar -xzf kubeconform.tar.gz kubeconform
+          ./kubeconform -summary -strict deploy/kubernetes/dns-server.yaml
+
+  # A single required check, so branch protection does not need updating every
+  # time the matrix changes.
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [lint, test, msrv, shell, manifests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "All CI jobs passed."

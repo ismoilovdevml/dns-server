@@ -1,0 +1,61 @@
+# Minimal production-shaped Compose deployment.
+#
+#   cp ../dns-server.example.toml ./dns-server.toml   # then edit it
+#   docker compose up -d
+#   dig +short @127.0.0.1 version.example.com TXT
+#
+# Note: something already owns port 53 on most Linux hosts (systemd-resolved).
+# Either stop it, or publish on a different host port and point resolvers there.
+
+services:
+  dns-server:
+    image: ghcr.io/ismoilovdevml/dns-server:latest
+    # Build locally instead of pulling:
+    #   docker compose build
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: dns-server
+    restart: unless-stopped
+
+    command:
+      - --config=/etc/dns-server/dns-server.toml
+
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      # Admin endpoints stay on loopback — they are unauthenticated.
+      - "127.0.0.1:9100:9100/tcp"
+
+    volumes:
+      - ./dns-server.toml:/etc/dns-server/dns-server.toml:ro
+
+    environment:
+      DNS_LOG_FORMAT: json
+      DNS_LOG_LEVEL: info
+      DNS_ADMIN_LISTEN: 0.0.0.0:9100
+
+    # We run as an unprivileged user, so binding :53 needs this one capability
+    # rather than the whole root capability set.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+
+    # A static authoritative server has no reason to grow unbounded; these caps
+    # turn a runaway into a restart instead of a host-wide problem.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 128M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

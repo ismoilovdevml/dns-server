@@ -1,0 +1,68 @@
+[Unit]
+Description=Authoritative DNS server (dns-server)
+Documentation=https://github.com/ismoilovdevml/dns-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dns-server --config /etc/dns-server/dns-server.toml
+
+# Refuse to start on a bad config rather than failing halfway through startup.
+ExecStartPre=/usr/local/bin/dns-server --config /etc/dns-server/dns-server.toml --check
+
+# There is no in-place config reload: changing records means `systemctl restart`.
+# The process handles SIGTERM and drains, so let it.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=2s
+
+User=dns-server
+Group=dns-server
+DynamicUser=no
+
+# Binding :53 as a non-root user needs exactly this capability, nothing more.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# --- Sandboxing --------------------------------------------------------------
+# A name server reads one config file and talks to the network. Everything else
+# it could touch is a liability, so take it away.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ReadOnlyPaths=/etc/dns-server
+
+# --- Resource limits ---------------------------------------------------------
+LimitNOFILE=65535
+MemoryMax=256M
+TasksMax=256
+
+# Structured logs go to the journal; use `journalctl -u dns-server -f`.
+Environment=DNS_LOG_FORMAT=pretty
+Environment=DNS_LOG_LEVEL=info
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

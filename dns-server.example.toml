@@ -1,0 +1,123 @@
+# dns-server configuration.
+#
+# Copy to /etc/dns-server/dns-server.toml and edit. Every value here can also be
+# set with a CLI flag or an environment variable, and those win over the file:
+#
+#   dns-server --config /etc/dns-server/dns-server.toml
+#   DNS_UDP=0.0.0.0:53 dns-server
+#
+# Validate before restarting anything:
+#
+#   dns-server --config /etc/dns-server/dns-server.toml --check
+
+[server]
+# Listeners. Use port 53 in production; 1053 needs no privileges for local tests.
+udp = ["0.0.0.0:53", "[::]:53"]
+tcp = ["0.0.0.0:53", "[::]:53"]
+
+# Admin HTTP endpoints: /healthz, /readyz, /metrics, /version.
+# There is no authentication — keep this on a private interface.
+admin_listen = "127.0.0.1:9100"
+
+# Close TCP connections that go idle. Guards against slow-loris style hoarding.
+tcp_timeout_secs = 10
+
+# "pretty" for a terminal, "json" for log shipping.
+log_format = "json"
+log_level = "info"
+
+[server.rate_limit]
+# Sustained queries per second allowed from one source IP. Set qps = 0 to disable.
+qps = 50
+# Bucket capacity: how big a burst a client may spend at once. Defaults to 2 * qps.
+burst = 100
+
+[zone]
+# The single zone this server is authoritative for.
+origin = "example.com"
+
+# TTL for records that do not set their own.
+default_ttl = 300
+
+# Diagnostic sub-zones: hello., counter., myip., version.
+# Handy for smoke tests; turn off if you would rather not expose server internals.
+builtins = true
+
+# The SOA is what lets resolvers cache your negative answers. Without it,
+# NXDOMAIN responses carry no authority record and get re-queried constantly.
+[zone.soa]
+mname = "ns1.example.com."            # primary name server
+rname = "hostmaster.example.com."     # zone contact, in DNS form
+serial = 2026073001                    # bump on every change (YYYYMMDDnn is conventional)
+refresh = 3600
+retry = 900
+expire = 604800
+minimum = 60                           # negative-cache TTL
+
+# --- Records -----------------------------------------------------------------
+# `name` is relative to `origin`. Use "@" for the apex, "*" or "*.sub" for
+# wildcards, and a trailing dot for a fully-qualified name.
+# `values` are written exactly as they would appear in a zone file.
+
+[[zone.records]]
+name = "@"
+type = "A"
+values = ["203.0.113.10", "203.0.113.11"]
+
+[[zone.records]]
+name = "@"
+type = "AAAA"
+values = ["2001:db8::10"]
+
+[[zone.records]]
+name = "@"
+type = "NS"
+values = ["ns1.example.com.", "ns2.example.com."]
+
+[[zone.records]]
+name = "@"
+type = "MX"
+values = ["10 mail.example.com.", "20 mail2.example.com."]
+
+[[zone.records]]
+name = "@"
+type = "TXT"
+values = ["\"v=spf1 mx -all\""]
+
+[[zone.records]]
+name = "ns1"
+type = "A"
+values = ["203.0.113.10"]
+
+[[zone.records]]
+name = "ns2"
+type = "A"
+values = ["203.0.113.11"]
+
+[[zone.records]]
+name = "www"
+type = "CNAME"
+ttl = 900
+values = ["example.com."]
+
+[[zone.records]]
+name = "api"
+type = "A"
+ttl = 30                               # short TTL for something that fails over
+values = ["203.0.113.20"]
+
+# Every *.apps.example.com resolves here unless a more specific record exists.
+[[zone.records]]
+name = "*.apps"
+type = "A"
+values = ["203.0.113.30"]
+
+[[zone.records]]
+name = "_dmarc"
+type = "TXT"
+values = ["\"v=DMARC1; p=reject; rua=mailto:dmarc@example.com\""]
+
+[[zone.records]]
+name = "@"
+type = "CAA"
+values = ["0 issue \"letsencrypt.org\""]

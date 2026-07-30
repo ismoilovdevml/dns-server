@@ -1,0 +1,65 @@
+name: Bug report
+description: Something does not work the way it should
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The two most useful things you can include are the
+        output of `dns-server check --json` and the query that misbehaved.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `dns-server --version`
+      placeholder: dns-server 0.2.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How is it installed?
+      options:
+        - install.sh
+        - Docker / Kubernetes
+        - cargo install
+        - built from source
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can it be reproduced?
+      description: Commands, the query you sent, and the answer you got.
+      render: shell
+      placeholder: |
+        dns-server record add www A 203.0.113.10
+        dns-server query www.example.com A
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Your config file, with anything sensitive removed.
+      render: toml
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Run with `--log-level debug` if you can.
+      render: shell
