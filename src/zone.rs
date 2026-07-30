@@ -747,6 +747,71 @@ mod tests {
     // for.
     // -----------------------------------------------------------------------
 
+    /// A TXT value whose *presentation form* is exactly `chars` characters
+    /// long, which is what `MAX_RECORD_VALUE_CHARS` counts. Quoted, because
+    /// hickory otherwise reads whitespace-free runs as separate
+    /// character-strings and the length under test would not be one value.
+    fn txt_of(chars: usize) -> String {
+        let mut value = String::with_capacity(chars);
+        value.push('"');
+        for _ in 0..chars - 2 {
+            value.push('x');
+        }
+        value.push('"');
+        value
+    }
+
+    #[test]
+    fn a_record_value_at_the_character_limit_is_accepted() {
+        // Kills `chars > MAX_RECORD_VALUE_CHARS` -> `>=`. The bound is
+        // inclusive: 4090 characters is the largest value an operator may
+        // write, and moving the comparison one place rejects a config that has
+        // been valid since the limit landed.
+        let value = txt_of(MAX_RECORD_VALUE_CHARS);
+        let zone = Zone::from_config(&ZoneConfig {
+            origin: "example.com".to_owned(),
+            default_ttl: 300,
+            builtins: false,
+            soa: None,
+            records: vec![spec("long", "TXT", &[&value])],
+        })
+        .expect("a value of exactly MAX_RECORD_VALUE_CHARS characters must build");
+        assert!(matches!(
+            zone.lookup(&lower("long.example.com."), RecordType::TXT),
+            Answer::Records(_)
+        ));
+    }
+
+    #[test]
+    fn a_record_value_over_the_character_limit_is_refused_however_far_over() {
+        // Kills both `chars > MAX_RECORD_VALUE_CHARS` -> `>=` (one past the
+        // bound must fail) and -> `==` (a value *far* past the bound must fail
+        // too — an `==` rejects only the single length 4090 and waves through
+        // every larger one). Nothing in the suite asserted on this limit at
+        // all before mutation testing, so the whole check could have been
+        // deleted silently.
+        for over in [MAX_RECORD_VALUE_CHARS + 1, MAX_RECORD_VALUE_CHARS * 4] {
+            let value = txt_of(over);
+            let err = Zone::from_config(&ZoneConfig {
+                origin: "example.com".to_owned(),
+                default_ttl: 300,
+                builtins: false,
+                soa: None,
+                records: vec![spec("long", "TXT", &[&value])],
+            })
+            .unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("characters; the maximum is"),
+                "a {over}-character value must be refused by name, not by accident: {text}"
+            );
+            assert!(
+                text.contains(&over.to_string()),
+                "the error must tell the operator how long their value actually is: {text}"
+            );
+        }
+    }
+
     #[test]
     fn a_fully_qualified_in_zone_record_name_is_accepted() {
         // Kills `delete !` in Zone::qualify: with the `!` gone, an in-zone FQDN

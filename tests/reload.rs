@@ -13,7 +13,10 @@ use std::{
     net::{SocketAddr, TcpListener as StdTcpListener, UdpSocket as StdUdpSocket},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc, Mutex, MutexGuard, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -84,6 +87,52 @@ const RESET_ENV: &[&str] = &[
 /// Path to the binary under test, as provided by Cargo.
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_vega"))
+}
+
+/// Serialises "probe a port, then `spawn` a child that binds it" across the whole
+/// test binary.
+///
+/// Not a style choice — without it this file failed 7 runs in 15, always
+/// `EADDRINUSE`, always on a different test. macOS has no atomic `SOCK_CLOEXEC`,
+/// so `std` creates a socket with `socket(2)` and *then* sets close-on-exec with
+/// `ioctl(FIOCLEX)`. A `Command::spawn` on another thread inside that gap hands
+/// the child a duplicate of the probe socket. The parent then closes its copy and
+/// hands the port to a *different* child — which cannot bind it, because the
+/// first child is still holding the port open. That is why every collided port
+/// had been handed out exactly once and why widening the port range did not help.
+///
+/// Measured on this machine (6 threads binding loopback sockets in a loop, 400
+/// `/bin/sh -c 'ls -l /dev/fd'` children): 17 of 400 children inherited a socket
+/// fd, against 0 of 400 with the probe threads stopped. Re-binding a
+/// just-probed UDP port failed 7-14 times in 3000 with concurrent spawns and
+/// 0 times in 3000 without.
+///
+/// Holding one gate from the first probe to the end of `spawn` closes the window
+/// in both directions: no other thread can spawn while our probe socket exists,
+/// and no other thread's probe socket exists while we spawn. It also stops one
+/// child inheriting another's stdout pipe, since `pipe(2)` on macOS is
+/// `pipe` + `FIOCLEX` for the same reason.
+fn spawn_gate() -> &'static Mutex<()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
+}
+
+/// How many times the gate has been taken. Exists only so
+/// `starting_a_server_takes_the_spawn_gate` can fail if the gate is ever dropped
+/// from the spawn path — the flake it prevents is probabilistic, so nothing else
+/// in this file would notice for weeks.
+static GATE_TAKEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Take the spawn gate, recovering from a poisoning left by a failed test.
+///
+/// A panicking test must fail on its own assertion, not turn every later test in
+/// the file into a poison error that hides it.
+fn hold_spawn_gate() -> MutexGuard<'static, ()> {
+    let guard = spawn_gate()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    GATE_TAKEN.fetch_add(1, AtomicOrdering::SeqCst);
+    guard
 }
 
 fn free_udp_port() -> u16 {
@@ -176,6 +225,9 @@ impl Spawn {
             std::fs::write(&config, &self.toml).expect("config writes");
         }
 
+        // Held until the child is running: see `spawn_gate`.
+        let gate = hold_spawn_gate();
+
         let dns: SocketAddr = format!("127.0.0.1:{}", free_udp_port())
             .parse()
             .expect("dns addr parses");
@@ -209,6 +261,8 @@ impl Spawn {
         let mut child = command
             .spawn()
             .expect("the server binary should be runnable");
+        drop(gate);
+
         let log = Arc::new(Mutex::new(String::new()));
         if let Some(out) = child.stdout.take() {
             drain(out, Arc::clone(&log));
@@ -1203,12 +1257,16 @@ async fn the_reload_command_prints_the_ignored_keys_to_the_terminal() {
         "203.0.113.10",
     ));
 
+    // Under the gate like every other spawn: this child is just as capable of
+    // inheriting another test's probe socket and holding its port hostage.
+    let gate = hold_spawn_gate();
     let output = Command::new(bin())
         .args(["reload", "--admin-listen", &vega.admin.to_string()])
         .current_dir(vega.dir.path())
         .env("NO_COLOR", "1")
         .output()
         .expect("the reload subcommand runs");
+    drop(gate);
 
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(output.status.success(), "{text}");
@@ -1463,3 +1521,38 @@ async fn fifty_reloads_under_a_steady_query_stream_never_drop_or_mix_an_answer()
 // G. Ordering — see the report; `dns_zone_records` vs the swap is not
 //    observable from outside the process.
 // ==========================================================================
+
+// ==========================================================================
+// H. The harness itself
+// ==========================================================================
+
+/// Regression guard for the `EADDRINUSE` flake this file used to fail 7 runs in
+/// 15 with (qa-adversary, VEGA-005 stage 4).
+///
+/// The bug is a race between `socket(2)` and `ioctl(FIOCLEX)` in `std` on macOS,
+/// so a run that happens to pass proves nothing and no assertion inside a normal
+/// test can see it. What *is* deterministic is that the spawn path must take the
+/// gate; if a later edit drops `hold_spawn_gate` from `Spawn::start`, the flake
+/// comes straight back and only this test notices.
+#[tokio::test]
+async fn starting_a_server_takes_the_spawn_gate() {
+    let before = GATE_TAKEN.load(AtomicOrdering::SeqCst);
+    let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
+        .start()
+        .await;
+    let after = GATE_TAKEN.load(AtomicOrdering::SeqCst);
+
+    // Other tests run concurrently and take the gate too, so this is a lower
+    // bound rather than an equality — the point is that ours cannot be zero.
+    assert!(
+        after > before,
+        "Spawn::start must probe its ports and spawn the child under the spawn \
+         gate; without it a concurrent spawn inherits the probe socket and the \
+         child cannot bind the port it was given"
+    );
+
+    // Prove the server that was started under the gate is the usual working one,
+    // so this cannot pass against a gate bolted onto a broken spawn path.
+    let response = vega.ask("www.example.test.", RecordType::A).await;
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+}

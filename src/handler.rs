@@ -48,6 +48,22 @@ const MAX_EDNS_PAYLOAD: u16 = 1232;
 /// enforce the limit ourselves rather than inheriting that default.
 const MAX_UDP_NO_EDNS: usize = 512;
 
+/// QTYPE 253, "a request for mailbox-related records (MB, MG or MR)".
+///
+/// RFC 1035 §3.2.3 defines it as a QTYPE, never a TYPE; RFC 973 withdrew the
+/// service behind it. Spelled as a number because hickory has no variant for it
+/// — `RecordType::from(u16)` ends `_ => Self::Unknown(value)`, so this is
+/// exactly how it arrives off the wire, and matching a named variant here would
+/// silently never fire.
+const MAILB_QTYPE: RecordType = RecordType::Unknown(253);
+
+/// QTYPE 254, "a request for mail agent RRs (Obsolete - see MX)".
+///
+/// RFC 1035 §3.2.3, and see [`MAILB_QTYPE`] for why it is a raw number. Note the
+/// ordering is the one the RFC gives and not alphabetical: MAILB is 253 and
+/// MAILA is 254.
+const MAILA_QTYPE: RecordType = RecordType::Unknown(254);
+
 /// DNS header, fixed size. RFC 1035 §4.1.1.
 const HEADER_SIZE: usize = 12;
 
@@ -378,6 +394,16 @@ impl DnsHandler {
             // value on decode, so matching `Unknown(0)` here would never fire.
             RecordType::OPT | RecordType::TSIG | RecordType::ZERO => {
                 return Some(Resolved::error(ResponseCode::FormErr));
+            }
+            // MAILB and MAILA are QTYPE-only (RFC 1035 §3.2.3) and the service
+            // they asked about was withdrawn by RFC 973, so there is no type to
+            // look up and never will be: NOTIMP, not REFUSED, which would claim
+            // the zone is someone else's. They reach us as `Unknown` rather than
+            // as variants — see MAILB_QTYPE — which is how they escaped the
+            // first pass at this and kept answering with the owner's CNAME.
+            MAILB_QTYPE | MAILA_QTYPE => {
+                debug!(qtype = %query.query_type(), "obsolete mail meta query");
+                return Some(Resolved::error(ResponseCode::NotImp));
             }
             _ => {}
         }
@@ -1105,5 +1131,72 @@ mod tests {
                 assert_eq!(r.authority[0].record_type(), RecordType::SOA);
             }
         }
+    }
+
+    /// Scenario: The MAILB meta QTYPE is answered NOTIMP, not with the owner's CNAME
+    /// Scenario: The MAILA meta QTYPE is answered NOTIMP, not with the owner's CNAME
+    /// features/negative-answers.feature — the same clause
+    /// `tests/rfc_conformance.rs::meta_query_types_are_not_answered_as_ordinary_types`
+    /// covers on the wire, pinned here to the *exact* rcode.
+    ///
+    /// The wire test accepts any of FORMERR/NOTIMP/REFUSED, so it cannot tell a
+    /// deliberate NOTIMP from a lucky REFUSED. MAILA and MAILB were withdrawn by
+    /// RFC 973 and RFC 1035 §3.2.3 lists them as QTYPEs only — they name a
+    /// transaction we do not implement rather than a zone we decline to serve,
+    /// so NOTIMP is the answer and REFUSED is not.
+    #[test]
+    fn mailb_and_maila_qtypes_are_notimp_rather_than_the_owner_cname() {
+        let h = handler(
+            vec![
+                spec("alias", "CNAME", &["origin.example.com."]),
+                spec("origin", "A", &["203.0.113.20"]),
+            ],
+            false,
+        );
+
+        for (qtype, name) in [(MAILB_QTYPE, "MAILB"), (MAILA_QTYPE, "MAILA")] {
+            let resolved = h
+                .dispatch(&query_request("alias.example.com.", qtype), client())
+                .unwrap_or_else(|| panic!("{name} should be answered, not dropped"));
+            assert_eq!(
+                resolved.code,
+                ResponseCode::NotImp,
+                "{name} (qtype {}) got rcode {:?}",
+                u16::from(qtype),
+                resolved.code
+            );
+            assert!(
+                resolved.answers.is_empty(),
+                "{name} (qtype {}) was answered with {} records",
+                u16::from(qtype),
+                resolved.answers.len()
+            );
+        }
+    }
+
+    /// A single-question UDP request for `name`/`qtype`, as `dispatch` sees it.
+    ///
+    /// Goes through the wire encoding on purpose: `RecordType::from(u16)` is
+    /// where 253 and 254 become `Unknown`, and a test that skipped the decode
+    /// could assert against a variant no packet can ever produce.
+    fn query_request(name: &str, qtype: RecordType) -> Request {
+        use hickory_proto::op::{Message, Query};
+
+        let mut query = Query::new();
+        let mut owner: Name = name.parse().expect("name parses");
+        owner.set_fqdn(true);
+        query
+            .set_name(owner)
+            .set_query_type(qtype)
+            .set_query_class(DNSClass::IN);
+
+        let mut message = Message::query();
+        message.add_query(query);
+        Request::from_bytes(
+            message.to_vec().expect("request encodes"),
+            "198.51.100.10:5353".parse().expect("source address parses"),
+            Protocol::Udp,
+        )
+        .expect("request decodes")
     }
 }

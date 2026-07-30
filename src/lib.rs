@@ -5,6 +5,7 @@
 //! Serving:
 //!
 //! * [`config`] — CLI flags + TOML file, merged and validated up-front.
+//! * [`rdata`] — the one place operator text is turned into RDATA.
 //! * [`zone`] — the in-memory record store and the lookup algorithm.
 //! * [`handler`] — the [`hickory_server::server::RequestHandler`] implementation.
 //! * [`lifecycle`] — the process phase every admin endpoint answers from.
@@ -37,6 +38,7 @@ pub mod http;
 pub mod lifecycle;
 pub mod metrics;
 pub mod ratelimit;
+pub mod rdata;
 pub mod reload;
 pub mod shutdown;
 pub mod ui;

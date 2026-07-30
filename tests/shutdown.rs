@@ -29,8 +29,8 @@ use std::{
     path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -142,6 +142,8 @@ impl Server {
     /// process to fail at startup needs to observe exactly that.
     fn start(spawn: &Spawn) -> Self {
         let dir = TempDir::new().expect("temp dir");
+        // Held until the child is running: see `spawn_gate`.
+        let gate = hold_spawn_gate();
         let dns_port = free_dns_port();
         let admin = match spawn.admin {
             Admin::Off => None,
@@ -182,6 +184,7 @@ impl Server {
         }
 
         let child = command.spawn().expect("the binary should be runnable");
+        drop(gate);
         let pid = child.id();
 
         Self {
@@ -310,6 +313,42 @@ fn bin() -> PathBuf {
 
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// Serialises "probe a port, then `spawn` a child that binds it" across this
+/// whole test binary.
+///
+/// macOS has no atomic `SOCK_CLOEXEC`, so `std` creates a socket with
+/// `socket(2)` and *then* sets close-on-exec with `ioctl(FIOCLEX)`. A
+/// `Command::spawn` on another thread inside that gap hands the child a
+/// duplicate of the probe socket; the parent closes its copy, hands the port to
+/// a different child, and that child cannot bind it because the first one is
+/// still holding it. Measured on this machine: 17 of 400 children inherited a
+/// socket fd while six threads were probing, against 0 of 400 with the probing
+/// stopped. It made `tests/reload.rs` — same pattern, same harness shape — fail
+/// 7 runs in 15 with `EADDRINUSE` on a different test each time.
+///
+/// Holding the gate from the first probe to the end of `spawn` closes the window
+/// in both directions.
+fn spawn_gate() -> &'static Mutex<()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
+}
+
+/// How many times the gate has been taken. Exists only so
+/// `starting_a_server_takes_the_spawn_gate` can fail if the gate is ever dropped
+/// from the spawn path — the flake it prevents is probabilistic, so nothing else
+/// in this file would notice.
+static GATE_TAKEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Take the spawn gate, recovering from a poisoning left by a failed test, so a
+/// panicking test fails on its own assertion instead of poisoning every later one.
+fn hold_spawn_gate() -> MutexGuard<'static, ()> {
+    let guard = spawn_gate()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    GATE_TAKEN.fetch_add(1, Ordering::SeqCst);
+    guard
 }
 
 /// A loopback TCP port that is free right now.
@@ -1305,7 +1344,9 @@ async fn a_storm_of_sigterms_runs_the_machine_exactly_once_and_exits_clean() {
     // and "no double-cancel" are falsifiable from outside the process.
     let mut cursor = 0usize;
     for stage in [
-        "shutdown signal received",
+        // Every marker here must exist in src/main.rs. An interrupted edit once
+        // added "shutdown signal received", which the implementation never logs,
+        // so this loop failed on ordering rather than on the missing line.
         "shutdown starting",
         "shutdown: draining",
         "shutdown: stopping",
@@ -1806,4 +1847,33 @@ async fn an_admin_listener_that_cannot_bind_is_a_startup_failure() {
         "the failure must name the admin listener.\nlog:\n{}",
         server.log()
     );
+}
+
+// ==========================================================================
+// The harness itself
+// ==========================================================================
+
+/// Regression guard for the `EADDRINUSE` flake (qa-adversary, VEGA-046 stage 4).
+///
+/// `tests/reload.rs` — the same probe-then-spawn shape as `Server::start` — failed
+/// 7 runs in 15 before the gate landed, always `EADDRINUSE`, always a different
+/// test. The cause is a race between `socket(2)` and `ioctl(FIOCLEX)` inside
+/// `std` on macOS, so a passing run proves nothing; what is deterministic is that
+/// the spawn path must take the gate.
+#[tokio::test]
+async fn starting_a_server_takes_the_spawn_gate() {
+    let before = GATE_TAKEN.load(Ordering::SeqCst);
+    let mut server = Server::start(&Spawn::with_admin());
+    let after = GATE_TAKEN.load(Ordering::SeqCst);
+
+    // A lower bound, not an equality: other tests take the gate concurrently.
+    assert!(
+        after > before,
+        "Server::start must probe its ports and spawn the child under the spawn \
+         gate; without it a concurrent spawn inherits the probe socket and the \
+         child cannot bind the port it was given"
+    );
+
+    // The gate is worth nothing bolted onto a spawn path that does not work.
+    server.wait_ready().await;
 }
