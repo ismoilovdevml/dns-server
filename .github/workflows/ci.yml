@@ -119,7 +119,10 @@ jobs:
         run: shellcheck --shell=sh install.sh
 
       - name: shellcheck the deployment scripts
-        run: shellcheck --shell=sh deploy/check-shutdown-invariants.sh
+        run: |
+          shellcheck --shell=sh \
+            deploy/check-shutdown-invariants.sh \
+            deploy/prove-unit-guard-fails.sh
 
   manifests:
     name: Validate deployment manifests
@@ -169,6 +172,15 @@ jobs:
             exit 1
           fi
           echo "the check rejects a bad manifest, as it must"
+
+      # The unit file is a command line we ship, and until VEGA-007 nothing ran
+      # it: `ExecStartPre=... --check` used a flag that does not exist, and with
+      # Type=simple no one's service started. The guard lives in tests/cli.rs
+      # (`systemd_unit_*`) and runs in the test job on every OS. This step is the
+      # other half — it reintroduces that exact bug in a scratch copy and proves
+      # the guard rejects it, so the guard cannot quietly become decoration.
+      - name: Prove the systemd unit-file guard can fail
+        run: ./deploy/prove-unit-guard-fails.sh
 
   # A single required check, so branch protection does not need updating every
   # time the matrix changes.

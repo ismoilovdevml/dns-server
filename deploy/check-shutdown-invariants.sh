@@ -111,9 +111,17 @@ toml_scalar() {
     grep -m1 "^[[:space:]]*$2[[:space:]]*=" "$1" | sed -e 's/.*=[[:space:]]*//' -e 's/[[:space:]]*#.*//' -e 's/[[:space:]]*$//'
 }
 
+# A decimal unsigned integer, and only that.
+#
+# Leading zeros are rejected rather than tolerated: POSIX `$((...))` reads them
+# as octal, so `shutdown_drain_secs = 010` would sail through as 8 and every
+# derived deadline in this file would be checked against a number the operator
+# never wrote. A gate that mis-verifies quietly is worse than no gate.
 is_uint() {
     case "$1" in
         '' | *[!0-9]*) return 1 ;;
+        0) return 0 ;;
+        0*) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -129,9 +137,11 @@ need_file "$EXAMPLE"
 
 W=$(toml_scalar "$K8S" shutdown_drain_secs)
 if ! is_uint "$W"; then
-    printf 'error: shutdown_drain_secs not found (or not an integer) in %s\n' "$K8S" >&2
+    printf 'error: shutdown_drain_secs not found (or not a plain decimal) in %s\n' "$K8S" >&2
     printf '       the shipped ConfigMap must state the drain window explicitly;\n' >&2
-    printf '       every other number here is derived from it.\n' >&2
+    printf '       every other number here is derived from it. Write 8, not 010:\n' >&2
+    printf '       shell arithmetic reads a leading zero as octal, so a value\n' >&2
+    printf '       like that is rejected rather than checked as the wrong number.\n' >&2
     exit 2
 fi
 

@@ -19,8 +19,9 @@ test: ## Run every test
 check: ## Validate the example config
 	cargo run --quiet -- --config vega.example.toml check
 
-deploy-check: ## Check the shutdown timings across every deployment artifact
+deploy-check: ## Check the shutdown timings, and prove the unit-file guard fails
 	./deploy/check-shutdown-invariants.sh
+	./deploy/prove-unit-guard-fails.sh
 
 audit: ## Licence and advisory checks
 	cargo deny check
