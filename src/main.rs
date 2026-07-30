@@ -25,15 +25,12 @@ use vega::{
     healthcheck,
     lifecycle::{Lifecycle, Phase},
     metrics::Metrics,
-    ratelimit::{RateLimiter, DEFAULT_IDLE_TTL},
+    ratelimit::RateLimiter,
     reload::ReloadContext,
     shutdown::{self, Signals},
     ui,
     zone::Zone,
 };
-
-/// How often the rate-limiter janitor sweeps out idle buckets.
-const JANITOR_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long `Stopping` waits for in-flight requests before cancelling the DNS
 /// token.
@@ -411,12 +408,15 @@ fn run(config: Config, invocation: GlobalArgs) -> Result<ExitCode> {
 /// 1.3 ms, and the 503 the whole drain exists to serve was never on the wire.
 async fn serve(config: Config, invocation: GlobalArgs) -> Result<ExitCode> {
     let zone = Arc::new(Zone::from_config(&config.zone).context("building the zone")?);
-    let metrics = Arc::new(Metrics::new());
-    metrics.set_zone_records(zone.record_count() as u64);
 
+    // Before the metrics, which borrow it: the limiter keeps no per-source state
+    // to count, so `/metrics` reads its occupancy out of the table on scrape.
     let limiter = config
         .rate_limit
         .map(|rl| Arc::new(RateLimiter::new(rl.qps, rl.burst)));
+
+    let metrics = Arc::new(Metrics::new().with_rate_limiter(limiter.clone()));
+    metrics.set_zone_records(zone.record_count() as u64);
 
     // The reload hook and the server share one handler, so a swapped zone is
     // visible to both.
@@ -484,12 +484,6 @@ async fn serve(config: Config, invocation: GlobalArgs) -> Result<ExitCode> {
             }
         })
     });
-
-    if let Some(limiter) = limiter.clone() {
-        // A background sweeper with no client-visible state: it must not outlive
-        // the listeners it serves, and it must not be able to stop them.
-        spawn_janitor(limiter, dns.child_token());
-    }
 
     log_shutdown_plan(&config);
     info!(
@@ -781,25 +775,6 @@ impl hickory_server::server::RequestHandler for SharedHandler {
             .handle_request::<R, T>(request, response_handle)
             .await
     }
-}
-
-/// Periodically drop rate-limiter buckets for sources we have not seen recently.
-fn spawn_janitor(limiter: Arc<RateLimiter>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(JANITOR_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                () = shutdown.cancelled() => break,
-                _ = ticker.tick() => {
-                    let removed = limiter.prune(DEFAULT_IDLE_TTL);
-                    if removed > 0 {
-                        tracing::debug!(removed, tracked = limiter.tracked(), "pruned rate limiter");
-                    }
-                }
-            }
-        }
-    });
 }
 
 /// Install the global tracing subscriber.

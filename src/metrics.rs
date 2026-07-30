@@ -6,11 +6,16 @@
 
 use std::{
     fmt::Write as _,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use hickory_proto::op::ResponseCode;
+
+use crate::ratelimit::RateLimiter;
 
 /// Upper bounds, in seconds, of the query-latency histogram buckets.
 const LATENCY_BUCKETS: [f64; 9] = [
@@ -56,6 +61,12 @@ pub struct Metrics {
     latency_count: AtomicU64,
     /// Sum of latencies in microseconds; converted to seconds when rendering.
     latency_sum_micros: AtomicU64,
+    /// The limiter, when one is configured, so a scrape can read its occupancy.
+    ///
+    /// Held here rather than counted into a gauge as queries arrive: the limiter
+    /// deliberately keeps no per-source state to count, so the only honest
+    /// occupancy number is one derived from the table at scrape time.
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl Default for Metrics {
@@ -80,7 +91,20 @@ impl Metrics {
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             latency_count: AtomicU64::new(0),
             latency_sum_micros: AtomicU64::new(0),
+            rate_limiter: None,
         }
+    }
+
+    /// Publish the rate limiter's occupancy on `/metrics`.
+    ///
+    /// Takes the limiter itself, not a snapshot, because the gauges are computed
+    /// on scrape. Nothing is published when limiting is off: a table size for a
+    /// table that does not exist would have an operator alerting on a saturation
+    /// that cannot happen.
+    #[must_use]
+    pub fn with_rate_limiter(mut self, limiter: Option<Arc<RateLimiter>>) -> Self {
+        self.rate_limiter = limiter;
+        self
     }
 
     /// Publish the number of records loaded from the zone.
@@ -167,8 +191,41 @@ impl Metrics {
         let mut out = String::with_capacity(2048);
         self.render_info(&mut out);
         self.render_queries(&mut out);
+        self.render_rate_limit(&mut out);
         self.render_latency(&mut out);
         out
+    }
+
+    /// The two limiter gauges (VEGA-003 §8).
+    ///
+    /// `dns_ratelimit_tracked` — the map size VEGA-043 originally asked for — is
+    /// unimplementable: the limiter retains no per-source state, on purpose, and
+    /// a gauge whose name promises source cardinality while reporting something
+    /// else is worse than no gauge. What an operator can act on is the ratio:
+    /// rate-limited queries rising with `active` low is a concentrated attack
+    /// working as designed, while `active` approaching `slots` means a
+    /// maximal-diversity flood has degraded the table towards a global limit and
+    /// legitimate clients are being denied alongside it.
+    ///
+    /// The occupancy walk is 262,144 relaxed loads over 2 MiB of sequential
+    /// memory — a few hundred microseconds on the scrape task, taking no lock,
+    /// blocking no query.
+    fn render_rate_limit(&self, out: &mut String) {
+        let Some(limiter) = &self.rate_limiter else {
+            return;
+        };
+        gauge(
+            out,
+            "dns_ratelimit_slots",
+            "Slots in the rate limiter's fixed table. Constant for the process lifetime.",
+            as_f64(as_u64(limiter.slots())),
+        );
+        gauge(
+            out,
+            "dns_ratelimit_active",
+            "Slots whose token bucket is below full at scrape time.",
+            as_f64(as_u64(limiter.active())),
+        );
     }
 
     fn render_info(&self, out: &mut String) {
@@ -289,6 +346,13 @@ impl Metrics {
 #[allow(clippy::cast_precision_loss)]
 fn as_f64(value: u64) -> f64 {
     value as f64
+}
+
+/// Slot counts are bounded by the table size, so the conversion is exact on
+/// every target; the saturation is there only because a panic must not be
+/// reachable from a scrape.
+fn as_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn gauge(out: &mut String, name: &str, help: &str, value: f64) {

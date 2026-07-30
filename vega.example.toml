@@ -35,9 +35,14 @@ log_format = "json"
 log_level = "info"
 
 [server.rate_limit]
-# Sustained queries per second allowed from one source IP. Set qps = 0 to disable.
+# Sustained queries per second allowed from one source NETWORK, not one address:
+# an IPv4 /24, or an IPv6 /56. Every host inside one /24 shares this budget, so
+# size it for the busiest single /24 you serve, not for a single resolver — a
+# 200-host resolver farm in one /24 gets qps between them, not qps each.
+# Set qps = 0 to disable rate limiting entirely (the default).
 qps = 50
-# Bucket capacity: how big a burst a client may spend at once. Defaults to 2 * qps.
+# Bucket capacity: how big a burst one /24 or /56 may spend at once.
+# Defaults to 2 * qps.
 burst = 100
 
 [zone]

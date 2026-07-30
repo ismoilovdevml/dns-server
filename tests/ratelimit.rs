@@ -1,28 +1,44 @@
-//! Structural guards for VEGA-003's bounded rate limiter.
+//! Cross-module guards for VEGA-003's bounded rate limiter.
 //!
-//! Everything in this file is a guard on the *shape* of `src/ratelimit.rs`
-//! rather than on its behaviour, and each one says why the behavioural form
-//! cannot be written yet. Two reasons recur:
+//! Most of the limiter's behaviour is pinned by the unit tests at the bottom of
+//! `src/ratelimit.rs`, next to the arithmetic they describe. Two kinds of claim
+//! cannot live there and are made here instead:
 //!
-//! 1. **The accessor does not exist.** A test that names an API before
-//!    `rust-dev` writes it does not fail — it fails to *compile*, and a test
-//!    target that does not compile reports nothing about any other scenario in
-//!    the suite. The repository already prefers a source-text guard in this
-//!    situation (`tests/shutdown.rs`, "a structural guard, because the
-//!    type-level form cannot compile until the API exists"). Each guard below
-//!    carries the exact behavioural assertion that must replace it in the same
-//!    commit that lands the accessor.
-//! 2. **The lint forbids the instrument.** Counting allocations needs a
-//!    `#[global_allocator]` implementing `GlobalAlloc`, which is an `unsafe
-//!    impl`. `unsafe_code = "forbid"` in `Cargo.toml` applies to every target in
-//!    this package and cannot be lifted from inside a file, so the counting
-//!    allocator has to come from a dev-dependency. That is a `Cargo.toml` and
-//!    `cargo deny` change; it is recorded on VEGA-003 rather than smuggled in.
+//! 1. **The gauges**, which span `src/ratelimit.rs` and `src/metrics.rs`.
+//! 2. **The absence of pruning**, which is a claim about the *shape* of the tree
+//!    rather than about any value a program can compute. Ruling §13 E1 asks for
+//!    it in that form deliberately: a revert that "restores" the janitor has to
+//!    fail a test, not merely a review, and there is no runtime observation that
+//!    distinguishes a tree with a dead janitor from one without it.
 //!
-//! A structural guard is weaker than a behavioural one and is reported as a
-//! partial, never as coverage.
+//! Three guards that stood here while the API was being designed have been
+//! replaced by the behavioural assertions their doc comments specified, now that
+//! the accessors exist:
+//!
+//! | scenario | now asserted by |
+//! |---|---|
+//! | the table is a compile-time constant | `src/ratelimit.rs`, `the_slot_table_is_the_same_size_before_and_after_a_two_million_source_flood` |
+//! | a denied query does not write to its slot | `src/ratelimit.rs`, `a_denied_query_leaves_its_slot_word_byte_identical` (needs the `#[cfg(test)]` raw-word accessor, so it cannot live in this file) |
+//! | the gauges are named for what they measure | below, on `active_at`/`slots` and the rendered exposition |
+//!
+//! The zero-allocation guard below is **still a partial and is reported as one**,
+//! but it is no longer all there is. Ruling §13 B3 asks for 0 allocations across
+//! 100,000 checks under a counting global allocator, and the architect ruled on
+//! 2026-07-31 that the dev-dependency is worth taking: that test now lives in
+//! `tests/ratelimit_alloc.rs`, in its own binary. This one stays as a tripwire,
+//! because it fails fast and without an allocator, and it stays classified as a
+//! partial because it asserts about *text*: it cannot see through a helper and
+//! misses `format!`, `to_owned`, `Box::new`, `collect`, and anything allocating
+//! inside `hash_one`.
 
-use std::path::PathBuf;
+use std::{
+    net::IpAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use vega::{metrics::Metrics, ratelimit::RateLimiter};
 
 /// Read a source file of the crate under test.
 fn source(relative: &str) -> String {
@@ -43,62 +59,12 @@ fn method_body(src: &str, signature: &str) -> String {
         .to_owned()
 }
 
-/// Scenario: The table size is a compile-time constant, not a function of traffic
-/// features/rate-limiting.feature:140
-///
-/// Ruling §3.3: 2^18 slots of 8 bytes = 2,097,152 bytes, allocated once, never
-/// grown, never shrunk, never pruned, identical after one query and after 2^64.
-///
-/// STRUCTURAL PLACEHOLDER. `rust-dev` must delete this and put the behavioural
-/// form in `src/ratelimit.rs`'s test module in the same commit:
-///
-/// ```ignore
-/// let rl = RateLimiter::new(1, 1);
-/// let before = rl.memory_bytes();
-/// for i in 0..2_000_000 { rl.check_at(v4_prefix(i), now); }
-/// assert_eq!(rl.memory_bytes(), before);           // equality, not a threshold
-/// assert_eq!(rl.memory_bytes(), SLOTS * 8);
-/// assert_eq!(RateLimiter::new(1_000_000, 1_000_000).memory_bytes(), before);
-/// ```
-#[test]
-fn the_slot_table_is_sized_by_a_constant_and_reports_its_own_footprint() {
-    let src = source("src/ratelimit.rs");
-
-    assert!(
-        src.contains("const SLOTS"),
-        "src/ratelimit.rs must declare the slot count as a constant. The memory \
-         ceiling has to be a property of the binary, not the outcome of a race \
-         between a janitor and an attacker (ruling §3.1)."
-    );
-    assert!(
-        src.contains("fn memory_bytes"),
-        "src/ratelimit.rs must expose `memory_bytes()` so the ceiling can be \
-         asserted by equality before and after a 2,000,000-source flood \
-         (ruling §13 B1, B5). Without an accessor the bound is a claim in a \
-         comment."
-    );
-    assert!(
-        !src.contains("HashMap"),
-        "the limiter must not hold a map at all: every distinct key an attacker \
-         forges is 186 measured bytes, and `HashMap::retain` never returns the \
-         high-water mark (ruling §1.2, §1.3)."
-    );
-}
-
 /// Scenario: The check path allocates nothing
-/// features/rate-limiting.feature:151
+/// features/rate-limiting.feature:165
 ///
-/// Ruling §13 B3 asks for a counting global allocator around 100,000 checks
-/// asserting **0** allocations. That instrument cannot be built inside this
-/// package: `#[global_allocator]` needs an `unsafe impl GlobalAlloc`, and
-/// `unsafe_code = "forbid"` applies to every target here and cannot be
-/// overridden from inside a file. Doing it properly needs a dev-dependency
-/// (`stats_alloc` or `cap`) plus a `cargo deny` review — a `Cargo.toml` change,
-/// which is not this agent's to make.
-///
-/// PARTIAL, and reported as one. What survives is the mutant this criterion
-/// actually exists to kill: somebody puts a map, a `Vec` or a lock back on the
-/// query path. That is visible in the source and is worth pinning now.
+/// PARTIAL, and reported as one. The behavioural form of this criterion — zero
+/// allocations under a counting allocator — is `tests/ratelimit_alloc.rs`; this
+/// is the tripwire that fails first and without an instrument.
 #[test]
 fn the_check_path_contains_no_allocating_or_locking_construct() {
     let src = source("src/ratelimit.rs");
@@ -118,55 +84,10 @@ fn the_check_path_contains_no_allocating_or_locking_construct() {
     }
 }
 
-/// Scenario: A denied query does not write to its slot
-/// features/rate-limiting.feature:266
-///
-/// Under a flood the denial path IS the hot path, so a write-back per dropped
-/// packet is a cache line bounced between every core for no semantic gain — and
-/// a token bucket that refuses a query has not consumed anything (ruling §5.3
-/// step 6). No timing test catches this reliably.
-///
-/// STRUCTURAL PLACEHOLDER. It cannot be asserted behaviourally at all: a store
-/// on the denied path would write back the same refilled deficit and a later
-/// timestamp, which is semantically identical, so only the raw word tells the
-/// two apart. `rust-dev` must add a `#[cfg(test)]` accessor for the raw slot and
-/// replace this with:
-///
-/// ```ignore
-/// let idx = rl.slot_of(prefix);
-/// drain(&rl, prefix, now);
-/// let before = rl.slot_word(idx);
-/// assert!(!rl.check_at(prefix, now));
-/// assert_eq!(rl.slot_word(idx), before, "the denied path wrote to its slot");
-/// ```
-#[test]
-fn the_denied_path_has_no_way_to_write_to_its_slot() {
-    let src = source("src/ratelimit.rs");
-    let body = method_body(&src, "pub fn check_at(");
-
-    assert!(
-        !body.contains(".store("),
-        "`check_at` performs a plain store. The only write on the query path may \
-         be the compare-exchange on the ALLOWED path; a denied query must return \
-         without touching the cache line (ruling §5.3 step 6)."
-    );
-    assert!(
-        body.matches("compare_exchange").count() <= 1,
-        "`check_at` has more than one compare-exchange site. The denied path must \
-         have no write at all, and a second CAS is where one creeps back in."
-    );
-    assert!(
-        body.contains("compare_exchange"),
-        "`check_at` must claim its token with a bounded compare-exchange loop \
-         failing closed at 8 attempts (ruling §5.3 steps 7-9), not with a lock \
-         and not with an unconditional store."
-    );
-}
-
 /// Scenario: Pruning and the janitor cannot come back
-/// features/rate-limiting.feature:372
+/// features/rate-limiting.feature:456
 ///
-/// The janitor was not merely useless, it was a second defect: `prune_at` walks
+/// The janitor was not merely useless, it was a second defect: `prune_at` walked
 /// every entry of a shard while holding that shard's mutex, and with VEGA-020's
 /// fixed-seed hasher an attacker concentrates the map into one shard and turns
 /// the minute-ly sweep into a synchronised p99 cliff for all traffic (ruling
@@ -202,44 +123,96 @@ fn pruning_and_the_janitor_do_not_exist_anywhere_in_the_tree() {
 }
 
 /// Scenario: The limiter exposes a constant slot count and a live occupancy gauge
-/// features/rate-limiting.feature:450
+/// features/rate-limiting.feature:534
 ///
-/// `dns_ratelimit_tracked`, as asked for by VEGA-043 and by this issue's own
+/// `dns_ratelimit_tracked`, as asked for by VEGA-043 and by VEGA-003's own
 /// acceptance text, is UNIMPLEMENTABLE after this change: nothing is tracked and
 /// source cardinality is deliberately not retained. Shipping a plausible number
-/// that does not mean what its name says is worse than renaming it, so it
-/// becomes two gauges computed on scrape with relaxed loads — no task, no lock
-/// (ruling §8).
+/// that does not mean what its name says is worse than renaming it, so it became
+/// two gauges computed on scrape with relaxed loads — no task, no lock (ruling
+/// §8). The pair is what tells an operator whether they are seeing a
+/// concentrated attack (rate-limited total rising, active low) or a
+/// maximal-diversity flood that has collapsed the table into a near-global
+/// limiter (active approaching slots), which is the alert that says the
+/// deployment needs VEGA-041.
 ///
-/// STRUCTURAL PLACEHOLDER. The behavioural form needs both the accessor and the
-/// render path, and belongs with whoever wires the gauge into `src/metrics.rs`:
-///
-/// ```ignore
-/// let rl = RateLimiter::new(1, 1);
-/// assert_eq!(rl.active_at(now), 0);              // fresh limiter, zero deficit
-/// assert!(rl.check_at(prefix, now));
-/// assert!(rl.active_at(now) >= 1);
-/// assert!(rl.active_at(now) <= rl.slots());
-/// assert_eq!(rl.active_at(now + refill_window), 0);   // returns to zero
-/// ```
+/// REPLACES the structural guard that could only grep `src/metrics.rs` for the
+/// two names while the accessors did not exist. Ruling §13 F1, F2.
 #[test]
-fn the_limiter_gauges_are_named_for_what_they_actually_measure() {
-    let metrics = source("src/metrics.rs");
+fn the_limiter_gauges_report_a_constant_slot_count_and_live_occupancy() {
+    // One qps means one milli-token per millisecond, so a spent token takes a
+    // full second to come back and the occupancy window is not a race with the
+    // test's own runtime.
+    let limiter = Arc::new(RateLimiter::new(1, 1));
+    let now = Instant::now();
+    let source: IpAddr = "198.51.100.1".parse().expect("literal address parses");
+
+    assert_eq!(
+        limiter.active_at(now),
+        0,
+        "a fresh table has no deficit anywhere: the zero word means a full \
+         bucket, never touched"
+    );
+
+    assert!(limiter.check_at(source, now));
+    assert_eq!(
+        limiter.active_at(now),
+        1,
+        "one prefix spent its token, so exactly one slot is below full"
+    );
+    assert!(
+        limiter.active_at(now) <= limiter.slots(),
+        "occupancy can never exceed the table"
+    );
+    assert_eq!(
+        limiter.active_at(now + Duration::from_secs(1)),
+        0,
+        "one second at 1 qps refills the token, and a refilled slot is not \
+         active: the gauge is computed against scrape time, not left as a \
+         high-water mark"
+    );
+
+    let metrics = Metrics::new().with_rate_limiter(Some(Arc::clone(&limiter)));
+    let text = metrics.render_prometheus();
 
     assert!(
-        !metrics.contains("dns_ratelimit_tracked"),
+        !text.contains("dns_ratelimit_tracked"),
         "`dns_ratelimit_tracked` cannot exist after VEGA-003 — nothing is \
          tracked. A gauge whose name promises source cardinality and reports \
-         something else is worse than no gauge (ruling §8)."
+         something else is worse than no gauge (ruling §8):\n{text}"
+    );
+    assert!(
+        text.contains(&format!("dns_ratelimit_slots {}", limiter.slots())),
+        "the slot gauge must report the constant table size:\n{text}"
+    );
+    assert!(
+        text.contains("dns_ratelimit_slots 262144"),
+        "2^18 slots, so an alert can compute saturation against a known \
+         denominator:\n{text}"
+    );
+    assert!(
+        text.contains("dns_ratelimit_active 1"),
+        "the occupancy gauge must report the one slot that is below full:\n{text}"
     );
     for gauge in ["dns_ratelimit_slots", "dns_ratelimit_active"] {
         assert!(
-            metrics.contains(gauge),
-            "src/metrics.rs must expose `{gauge}`. The pair is what tells an \
-             operator whether they are seeing a concentrated attack (rate-limited \
-             total rising, active low) or a maximal-diversity flood that has \
-             collapsed the table into a near-global limiter (active approaching \
-             slots) — which is the alert that says the deployment needs VEGA-041."
+            text.contains(&format!("# TYPE {gauge} gauge")),
+            "{gauge} must declare its type:\n{text}"
         );
     }
+}
+
+/// Scenario: The limiter gauges are absent when rate limiting is off
+/// features/rate-limiting.feature:549
+///
+/// The other side of the gauges: with rate limiting off there is no table, and a
+/// series reporting 262,144 slots of a limiter that does not exist would have an
+/// operator alerting on saturation that cannot happen.
+#[test]
+fn the_limiter_gauges_are_absent_when_rate_limiting_is_off() {
+    let text = Metrics::new().render_prometheus();
+    assert!(
+        !text.contains("dns_ratelimit"),
+        "a server with no rate limiter must expose no limiter gauges:\n{text}"
+    );
 }

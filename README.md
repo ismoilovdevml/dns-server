@@ -253,7 +253,7 @@ log_format = "json"                # or "pretty"
 log_level = "info"
 
 [server.rate_limit]
-qps = 50                           # per source IP; 0 disables
+qps = 50                           # per source /24 or /56, not per address; 0 disables
 burst = 100                        # defaults to 2 * qps
 
 [zone]
@@ -384,6 +384,50 @@ depend on your cloud load balancer's own health check, which is usually slower
 than kube-proxy — if yours needs longer than 15 s, raise `shutdown_drain_secs`
 and `terminationGracePeriodSeconds` together.
 
+### Rate limiting
+
+Off unless you set `rate_limit.qps`. When it is on, **`qps` and `burst` apply to
+a source network, not to a source address**: an IPv4 **/24** or an IPv6 **/56**,
+the same defaults BIND 9 uses. A 200-host resolver farm inside one /24 shares one
+bucket, so `qps = 50` grants that farm 50 queries per second between them.
+
+> **Changed in 0.3.0.** This used to be per address. If you sized `qps` for one
+> resolver and your traffic arrives from many hosts in one network, raise it:
+> size it for the busiest single /24 you serve. Nothing changes for a deployment
+> that leaves rate limiting off.
+
+Why a network and not an address: DNS over UDP carries no proof of who sent a
+packet, so the source is whatever the attacker typed. Per-address buckets meant
+an attacker holding one IPv6 /64 — the smallest allocation any LAN gets — could
+present 2^64 distinct "sources", each meeting a bucket that had never been
+touched, so the limiter never fired *and* every forged address cost memory.
+Aggregating to a /56 makes that attacker one bucket.
+
+The state is a fixed table of 262,144 slots — **2 MiB, allocated at startup and
+never grown, whatever the traffic** — so a flood cannot exhaust memory. The cost
+of a fixed table is that two networks can land on the same slot and share a
+bucket. That is always stricter, never looser, and which networks share is
+decided by a per-process random seed, so it cannot be computed in advance and
+aimed at somebody. It also means two nodes behind the same anycast address
+disagree about who shares with whom: if you are debugging a client that is
+limited on one node and not another, that is expected and not a fault.
+
+A limited query over UDP receives **no answer at all** — replying would deliver a
+packet to whatever address the attacker forged, which is the amplification this
+exists to prevent. Over TCP, where the handshake proves the source, it is
+answered `REFUSED` so a legitimate resolver sees a signal rather than a timeout.
+
+Watch `dns_rate_limited_total` against `dns_ratelimit_active`: the total rising
+while `active` stays low is a concentrated attack, working as intended. `active`
+climbing towards `dns_ratelimit_slots` means a flood spread across many networks
+has pushed the table towards a single global limit, and legitimate clients are
+being denied alongside the attack.
+
+For volumetric floods, rate limiting in the kernel — `nftables` `limit rate over`,
+or XDP — drops the packet before it reaches this process at all, and is worth
+having in front of a public deployment. It is not a substitute: Vega has to be
+safe where you do not control the firewall.
+
 ### Shutdown and draining
 
 Stopping a name server is the risky part of every deploy: a process that exits
@@ -475,6 +519,8 @@ these defaults — or every deploy pages you.
 | `dns_responses_total{rcode}` | counter | `noerror`, `nxdomain`, `refused`, … |
 | `dns_query_duration_seconds` | histogram | per-query latency |
 | `dns_rate_limited_total` | counter | queries the limiter dropped |
+| `dns_ratelimit_slots` | gauge | slots in the limiter's fixed table; constant, absent when limiting is off |
+| `dns_ratelimit_active` | gauge | slots whose bucket is below full, computed at scrape time |
 | `dns_send_errors_total` | counter | failures writing a response |
 | `dns_zone_records` | gauge | records currently loaded |
 | `dns_uptime_seconds` | gauge | since start |

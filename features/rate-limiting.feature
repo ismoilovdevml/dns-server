@@ -36,13 +36,27 @@ Feature: Per-source-prefix rate limiting
   # longer exists is a permanent false debt. Ruling:
   # .claude/backlog/decisions/VEGA-003-bounded-rate-limiter.md §4, §13 E2.
   #
+  # THE 32-BIT TIMESTAMP, AND WHY THREE BANDS AND NOT TWO
+  # Each slot carries 32 bits of milliseconds, which wrap every 49.71 days, so
+  # "the reading moved backwards by X" and "the slot has been idle for 2^32 - X"
+  # are the same bit pattern. The ambiguity is irreducible; the only question is
+  # which reading to favour and what the residual costs. The ruling's first answer
+  # — deny anything past 24.86 days — was wrong, and qa-spec caught it: the denied
+  # path stores nothing, so a slot denied that way never advanced its timestamp
+  # and stayed denied for up to 24.86 days rather than the 2 seconds claimed. The
+  # amended rule splits the window at STALE_MAX = 60 s: under a minute back is a
+  # backwards reading (no refill, no store), beyond that is a long idle (full
+  # bucket, allowed, and it stores through the ordinary path). Residual: up to
+  # 60 s of over-strict limiting for a slot last touched 46.6-49.7 days ago, once
+  # per uptime cycle. Ruling §4.3 and §4.3.1, amended 2026-07-31.
+  #
   # Implementation: src/ratelimit.rs (prefix key, fixed slot table, token bucket)
   #                 src/handler.rs:331 (dispatch-time check, before opcode validation)
   #                 src/config.rs:494-542 (qps/burst resolution)
 
   # ------------------------------------------------------- PREFIX KEYING
 
-  @happy @enforced src/ratelimit.rs:266
+  @happy @enforced src/ratelimit.rs:554
   Scenario: Two addresses in the same /24 share one bucket
     # SUPERSEDES "Each source IP gets its own bucket". Per-address buckets are
     # the defect: they are what an attacker mints memory with, and what lets a
@@ -51,39 +65,39 @@ Feature: Per-source-prefix rate limiting
     When 198.51.100.1 exhausts its bucket
     Then a query from 198.51.100.2 is denied
 
-  @happy @enforced src/ratelimit.rs:280
+  @happy @enforced src/ratelimit.rs:568
   Scenario: Two addresses in different /24s do not share a bucket
     Given a rate limiter allowing 1 qps with a burst of 1
     When 198.51.100.1 exhausts its bucket
     Then a query from 198.51.101.1 is allowed
 
-  @boundary @enforced src/ratelimit.rs:293
+  @boundary @enforced src/ratelimit.rs:581
   Scenario: The first and last address of a /24 share one bucket
     Given a rate limiter allowing 1 qps with a burst of 1
     When 203.0.113.0 exhausts its bucket
     Then a query from 203.0.113.255 is denied
 
-  @boundary @enforced src/ratelimit.rs:306
+  @boundary @enforced src/ratelimit.rs:594
   Scenario: Addresses one apart across a /24 boundary do not share
     Given a rate limiter allowing 1 qps with a burst of 1
     When 203.0.113.255 exhausts its bucket
     Then a query from 203.0.114.0 is allowed
 
-  @happy @enforced src/ratelimit.rs:316
+  @happy @enforced src/ratelimit.rs:604
   Scenario: Two addresses in the same /56 share one bucket
     # Byte 8 differs, which is inside a /56.
     Given a rate limiter allowing 1 qps with a burst of 1
     When 2001:db8:0:0::1 exhausts its bucket
     Then a query from 2001:db8:0:00ff:ffff:ffff:ffff:ffff is denied
 
-  @boundary @enforced src/ratelimit.rs:329
+  @boundary @enforced src/ratelimit.rs:617
   Scenario: Addresses across a /56 boundary do not share
     # Byte 7 differs, which is outside a /56.
     Given a rate limiter allowing 1 qps with a burst of 1
     When 2001:db8:0:0000::1 exhausts its bucket
     Then a query from 2001:db8:0:0100::1 is allowed
 
-  @hostile @enforced src/ratelimit.rs:343
+  @hostile @enforced src/ratelimit.rs:631
   Scenario: An IPv4-mapped IPv6 source shares the bucket of its bare IPv4 form
     # A socket bound to [::] delivers IPv4 peers as ::ffff:a.b.c.d. If the two
     # forms key differently, an attacker gets two buckets per address by
@@ -92,7 +106,7 @@ Feature: Per-source-prefix rate limiting
     When 198.51.100.1 exhausts its bucket
     Then a query from ::ffff:198.51.100.1 is denied
 
-  @hostile @enforced src/ratelimit.rs:364
+  @hostile @enforced src/ratelimit.rs:652
   Scenario: Two IPv4-mapped sources in different /24s stay in different buckets
     # THE ASSERTION THAT FAILS WITHOUT to_ipv4_mapped(). Unfolded, the top 56
     # bits of ::ffff:a.b.c.d are zero for every IPv4 client alive, so a /56 mask
@@ -102,7 +116,7 @@ Feature: Per-source-prefix rate limiting
     When ::ffff:198.51.100.1 exhausts its bucket
     Then a query from ::ffff:203.0.113.1 is allowed
 
-  @hostile @enforced src/ratelimit.rs:387
+  @hostile @enforced src/ratelimit.rs:675
   Scenario: An IPv6 /56 never aliases the IPv4 /24 with the same payload
     # The canonical key carries a two-bit family tag. Without it, 198.51.100.0/24
     # and the /56 whose 56-bit payload happens to equal 0xC63364 are one bucket.
@@ -111,7 +125,7 @@ Feature: Per-source-prefix rate limiting
     And each IPv4 prefix exhausts its bucket
     Then all but a handful of the paired IPv6 prefixes are still allowed
 
-  @hostile @enforced src/ratelimit.rs:414
+  @hostile @enforced src/ratelimit.rs:702
   Scenario: A flood spread across one /64 is rate-limited as a single source
     # THE HEADLINE. 65,536 forged addresses inside 2001:db8::/64 — the smallest
     # allocation any LAN gets — one query each. Today all 65,536 are allowed and
@@ -124,7 +138,7 @@ Feature: Per-source-prefix rate limiting
 
   # --------------------------------------------------------- THE BOUND
 
-  @hostile @enforced src/ratelimit.rs:451
+  @hostile @enforced src/ratelimit.rs:782
   Scenario: A flood of two million distinct spoofed prefixes does not grow the process
     # REPLACES the #[ignore]d `the_bucket_map_is_bounded`, un-ignored and with a
     # real bound instead of the placeholder `< 100_000`. This is the issue's
@@ -136,7 +150,7 @@ Feature: Per-source-prefix rate limiting
     Then process memory grows by less than 32 MiB
     And far fewer than 2000000 queries are allowed
 
-  @hostile @enforced tests/ratelimit.rs:64
+  @hostile @enforced src/ratelimit.rs:734
   Scenario: The table size is a compile-time constant, not a function of traffic
     # Ruling §3.3: 2^18 slots x 8 bytes = 2,097,152 bytes, allocated once, never
     # grown, never shrunk, never pruned. The accessor must be derived from the
@@ -147,15 +161,25 @@ Feature: Per-source-prefix rate limiting
     Then both report the same number of bytes
     And the number is the slot count times eight
 
-  @hostile @enforced tests/ratelimit.rs:103
+  @hostile @enforced tests/ratelimit.rs:69
   Scenario: The check path allocates nothing
     # The mutant this kills is "somebody put a map back". A check that allocates
-    # is a check whose cost an attacker controls. Ruling §13 B3.
+    # is a check whose cost an attacker controls, at whatever rate they can send.
+    # Asserted on ZERO under a counting global allocator, in its own
+    # single-test binary because the allocator counts the whole process; a
+    # threshold would let a smaller per-packet allocation back in. The
+    # instrument is the stats_alloc dev-dependency, which keeps the unsafe impl
+    # behind a crate boundary that unsafe_code = "forbid" does not reach, and it
+    # clears cargo deny. Ruling §13 B3 as amended 2026-07-31.
+    #
+    # The source-text guard at tests/ratelimit.rs stays as a tripwire and is
+    # still only a partial: it cannot see through a helper and misses format!,
+    # to_owned, Box::new, collect and anything allocating inside hash_one.
     Given a limiter and one hundred thousand checks from distinct prefixes
     When the checks run
     Then no allocation is made on the check path
 
-  @hostile @enforced src/ratelimit.rs:492
+  @hostile @enforced src/ratelimit.rs:823
   Scenario: Random addresses of either family never index outside the table
     # The index is `hash & (SLOTS-1)` with SLOTS a power of two. A mutant using
     # `%` with a non-power-of-two, or an unmasked hash, panics here rather than
@@ -164,7 +188,7 @@ Feature: Per-source-prefix rate limiting
     When 1000000 pseudo-random addresses of both families each send one query
     Then no query panics
 
-  @hostile @enforced src/ratelimit.rs:514
+  @hostile @enforced src/ratelimit.rs:845
   Scenario: A mixed IPv4 and IPv6 flood stays bounded and does not alias
     Given a rate limiter allowing 1 qps with a burst of 1
     When 500000 IPv4 /24s and 500000 IPv6 /56s are interleaved
@@ -173,28 +197,28 @@ Feature: Per-source-prefix rate limiting
 
   # -------------------------------------------------- BUCKET SEMANTICS
 
-  @happy @enforced src/ratelimit.rs:206
+  @happy @enforced src/ratelimit.rs:486
   Scenario: A full burst is allowed before any traffic is denied
     Given a rate limiter allowing 1 qps with a burst of 3
     When one source sends 4 queries in the same instant
     Then the first 3 are allowed
     And the 4th is denied
 
-  @happy @enforced src/ratelimit.rs:218
+  @happy @enforced src/ratelimit.rs:498
   Scenario: Tokens are restored as time passes
     Given a rate limiter allowing 10 qps with a burst of 1
     When one source exhausts its bucket
     And 100 milliseconds pass
     Then the next query from that source is allowed
 
-  @boundary @enforced src/ratelimit.rs:230
+  @boundary @enforced src/ratelimit.rs:510
   Scenario: Refill is capped at the burst size no matter how long the source was idle
     Given a rate limiter allowing 100 qps with a burst of 2
     When a source that has been idle for an hour sends 3 queries in the same instant
     Then the first 2 are allowed
     And the 3rd is denied
 
-  @boundary @enforced src/ratelimit.rs:554
+  @boundary @enforced src/ratelimit.rs:885
   Scenario: A partial refill below one token does not admit a query
     # Was @gap. 1 qps, 500 ms elapsed => half a token, which must not round up to
     # an admission. The milli-token integer arithmetic makes this exact; the old
@@ -204,7 +228,7 @@ Feature: Per-source-prefix rate limiting
     And 500 milliseconds pass
     Then the next query from that source is denied
 
-  @boundary @enforced src/ratelimit.rs:567
+  @boundary @enforced src/ratelimit.rs:898
   Scenario: Exactly one token's worth of elapsed time admits exactly one query
     # The other side of the same boundary: 999 ms denies, 1000 ms admits, and the
     # query after that is denied again.
@@ -214,8 +238,12 @@ Feature: Per-source-prefix rate limiting
     Then the next query from that source is allowed
     And the query after it is denied
 
-  @hostile @enforced src/ratelimit.rs:243
+  @hostile @enforced src/ratelimit.rs:531
   Scenario: A clock reading that moves backwards does not grant extra tokens
+    # The step back must stay under STALE_MAX = 60 s. A 32-bit stored timestamp
+    # cannot tell "moved backwards by X" from "idle for 2^32 - X", so beyond that
+    # band the reading is correctly granted a full bucket and this scenario would
+    # pass for the opposite reason. Ruling §4.3, §13 C1 as amended.
     # A monotonic-clock regression here would hand an attacker a free refill on
     # every query.
     Given a rate limiter allowing 1 qps with a burst of 1
@@ -223,7 +251,7 @@ Feature: Per-source-prefix rate limiting
     And the same source is checked with a clock reading of T minus 5 seconds
     Then the query is denied
 
-  @empty @enforced src/ratelimit.rs:590
+  @empty @enforced src/ratelimit.rs:921
   Scenario: An untouched slot means a full bucket, not an empty one
     # Ruling §3.2: the table is one calloc, so the all-zero word must mean "full,
     # never touched". Storing tokens rather than the DEFICIT would make a zero
@@ -236,7 +264,7 @@ Feature: Per-source-prefix rate limiting
     Then all 5 are allowed
     And the 6th is denied
 
-  @hostile @enforced src/ratelimit.rs:617
+  @hostile @enforced src/ratelimit.rs:948
   Scenario: Two prefixes that land on the same slot share the bucket and never reset it
     # The table never fills, so "full" is unrepresentable: collisions SHARE,
     # silently, exactly as Knot's fixed table does. Sharing is always
@@ -249,7 +277,7 @@ Feature: Per-source-prefix rate limiting
     When 4096 previously unseen prefixes each send their first query
     Then at least one of them is denied on its very first query
 
-  @hostile @enforced src/ratelimit.rs:659
+  @hostile @enforced src/ratelimit.rs:990
   Scenario: Which prefixes share a slot differs between processes
     # VEGA-020's acceptance criterion, moved. DefaultHasher has a documented
     # fixed zero seed: 62,664 addresses were found offline in 8.7 ms that all
@@ -262,7 +290,7 @@ Feature: Per-source-prefix rate limiting
     When the set of prefixes that collide with a fixed victim set is measured in each
     Then the two sets are substantially different
 
-  @hostile @enforced tests/ratelimit.rs:143
+  @hostile @enforced src/ratelimit.rs:1045
   Scenario: A denied query does not write to its slot
     # Under a flood the denial path IS the hot path. A write-back per dropped
     # packet is a cache line bounced between every core for no semantic gain,
@@ -273,18 +301,74 @@ Feature: Per-source-prefix rate limiting
     When another query from that prefix is denied
     Then the slot word is byte-identical before and after
 
-  @hostile @enforced src/ratelimit.rs:706
-  Scenario: A gap longer than the wrap guard grants no refill
-    # last_ms is 32 bits of milliseconds and wraps every 49.71 days. Elapsed is a
-    # wrapping subtraction, so a gap past the wrap is garbage. The single guard —
-    # elapsed >= 2^31 (24.86 days) is treated as 0 — answers conservatively in
-    # both directions: a genuinely ancient slot is denied rather than handed a
-    # refill it cannot prove it earned. Ruling §4.3, §13 C6.
-    Given a rate limiter allowing 1 qps with a burst of 1
-    When a source exhausts its bucket and returns 25 days later
-    Then the query is denied
+  @boundary @enforced src/ratelimit.rs:1073
+  Scenario: No write ever touches the two reserved slot bits
+    # Bits 63..62 of every slot are reserved for VEGA-041's SLIP counter and MUST
+    # be written as zero. What guarantees it is the MAX_RATE clamp: burst is
+    # capped at 1,000,000, so capacity_milli is 1.0e9 and the deficit cannot
+    # reach 2^30. Asserted at the largest legal configuration, where the field is
+    # closest to overflowing. Ruling §3.2, §12.
+    Given a rate limiter built with the largest legal qps and burst
+    When the bucket is filled to the brim one query at a time
+    Then no slot word ever sets either reserved bit
 
-  @boundary @enforced src/ratelimit.rs:724
+  @hostile @enforced src/ratelimit.rs:1117
+  Scenario: A reading that moved backwards grants nothing and stores nothing
+    # REWRITTEN with the ruling's 2026-07-31 amendment, which also rewrote C6.
+    # This scenario used to say "a gap longer than the wrap guard grants no
+    # refill" and stepped 25 days FORWARD. That rule could not work: the denied
+    # path stores nothing, so a slot denied by the guard never advanced last_ms,
+    # recomputed the same out-of-range gap for ever, and stayed denied for up to
+    # 24.86 days — not the 2 seconds the ruling claimed. A forward gap of 25 days
+    # is now a long idle and is granted a full bucket; see the next scenario.
+    #
+    # What survives is the half that was always sound. last_ms is 32 bits of
+    # milliseconds and wraps every 49.71 days, so "moved backwards by X" and
+    # "idle for 2^32 - X" are the same bit pattern and the ambiguity is
+    # irreducible. Inside STALE_MAX = 60 s the backwards reading is the
+    # overwhelmingly more likely one: no refill, and no store either, because
+    # storing would drag the slot's clock back and inflate the next reader's gap.
+    # Ruling §4.3 as amended, §13 C6.
+    Given a rate limiter allowing 1 qps with a burst of 1
+    When a source exhausts its bucket and a reading 30 seconds earlier arrives
+    Then the query is denied
+    And the slot word is byte-identical before and after
+
+  @hostile @enforced src/ratelimit.rs:1165
+  Scenario: A genuinely long idle slot is full, not stuck
+    # THE CRITERION THAT PINS THE AMENDMENT (C8, new 2026-07-31). An apparent gap
+    # in [2^31, 2^32 - 60_000) — idle 24.86 to 46.6 days — reads as a long idle,
+    # so the bucket is full and the query is ALLOWED. Because it is allowed it
+    # stores its timestamp through the ordinary path, which is what gets the slot
+    # out of the ambiguous window. Nothing is added to the denied path, so C5
+    # stands unchanged and §5.3 step 6's rationale is untouched.
+    #
+    # Granting a full bucket concedes nothing: §4.2 proves a slot idle past
+    # T_full is indistinguishable from one never touched, and an untouched slot
+    # is full — the same grant is free from any unused prefix. The second and
+    # third queries are what matter: under the superseded rule the first is
+    # denied and so is every one after it, for up to 24.86 days, and because
+    # VEGA-004 drops rather than REFUSEs on UDP the symptom is a legitimate
+    # resolver's whole /24 silently dropped for three and a half weeks with
+    # nothing in the logs but dns_rate_limited_total ticking. Ruling §4.3.1.
+    Given a rate limiter allowing 1 qps with a burst of 1
+    When a source empties its bucket and returns 30 days later
+    Then the query is allowed
+    And the next query one second later is also allowed
+
+  @boundary @enforced src/ratelimit.rs:1208
+  Scenario: A backwards step beyond the stale window is read as a long idle
+    # The other side of the split, and what pins where it sits: 30 seconds back
+    # is denied, 90 seconds back is granted a full bucket. Either alone leaves
+    # STALE_MAX free to drift; together they bracket it. This is also why a
+    # backwards-clock test must inject a delta under a minute (C1) — a later
+    # "strengthening" to a month-long step would start passing for the opposite
+    # reason. Ruling §4.3, §13 C8.
+    Given a rate limiter allowing 1 qps with a burst of 1
+    When a source empties its bucket and a reading 90 seconds earlier arrives
+    Then the query is allowed
+
+  @boundary @enforced src/ratelimit.rs:1232
   Scenario: A gap just short of the wrap guard still refills normally
     # 24 days is under the 24.86-day guard, so the arithmetic is trusted and the
     # bucket refills to the burst. A mutant that clamps too eagerly — say at
@@ -293,7 +377,7 @@ Feature: Per-source-prefix rate limiting
     When a source exhausts its bucket and returns 24 days later
     Then the query is allowed
 
-  @malformed @enforced src/ratelimit.rs:745
+  @malformed @enforced src/ratelimit.rs:1253
   Scenario: A zero qps and a zero burst are clamped rather than panicking
     # `assert!(qps > 0 && burst > 0)` is unreachable today because config.rs
     # rejects it — but `panic = "abort"` in release means one slipped invariant
@@ -305,7 +389,7 @@ Feature: Per-source-prefix rate limiting
     And the first query is allowed
     And the second is denied
 
-  @malformed @enforced src/ratelimit.rs:762
+  @malformed @enforced src/ratelimit.rs:1270
   Scenario: A qps and burst of u32::MAX are clamped rather than overflowing
     # capacity_milli must stay inside the 30-bit field with bits 63..62 reserved
     # zero for VEGA-041. MAX_RATE = 1,000,000 keeps burst*1000 under 2^30.
@@ -316,7 +400,7 @@ Feature: Per-source-prefix rate limiting
 
   # ------------------------------------------------------- CONCURRENCY
 
-  @hostile @enforced src/ratelimit.rs:792
+  @hostile @enforced src/ratelimit.rs:1300
   Scenario: Concurrent checks never hand out more than the burst
     # RELAXED from "exactly burst" to "at most burst" by ruling §13 D1: the CAS
     # loop is bounded at 8 attempts and FAILS CLOSED, so extreme contention may
@@ -329,7 +413,7 @@ Feature: Per-source-prefix rate limiting
     Then at most 500 queries are allowed
     And at least one query is denied
 
-  @happy @enforced src/ratelimit.rs:845
+  @happy @enforced src/ratelimit.rs:1353
   Scenario: A single-threaded run hands out exactly the burst
     # The other half of the pair above. This is where the token arithmetic is
     # pinned; the concurrent test only pins the safety direction.
@@ -337,7 +421,7 @@ Feature: Per-source-prefix rate limiting
     When one prefix sends 700 queries at one frozen instant on one thread
     Then exactly 500 are allowed
 
-  @boundary @enforced src/ratelimit.rs:861
+  @boundary @enforced src/ratelimit.rs:1369
   Scenario: Two threads at a barrier still hand out exactly the burst
     # Two writers is enough to exercise the CAS retry and not enough to exhaust
     # the 8-attempt bound, so the exact count must survive.
@@ -345,7 +429,7 @@ Feature: Per-source-prefix rate limiting
     When 2 threads each send 400 queries from one prefix at one frozen instant
     Then exactly 500 are allowed
 
-  @hostile @enforced src/ratelimit.rs:905
+  @hostile @enforced src/ratelimit.rs:1413
   Scenario: A sustained storm against a single slot completes in bounded time
     # CLAUDE.md bounds every loop on the query path, and a CAS loop is the
     # classic place that rule is broken. A mutant that removes the 8-attempt cap
@@ -355,7 +439,7 @@ Feature: Per-source-prefix rate limiting
     Then the run completes within 60 seconds
     And at most 1 query is allowed
 
-  @hostile @enforced src/ratelimit.rs:961
+  @hostile @enforced src/ratelimit.rs:1469
   Scenario: Concurrent checks across many distinct prefixes all land
     # SUPERSEDES "Many distinct sources are tracked without loss across shards",
     # which counted `tracked()` — an accessor VEGA-003 deletes, over addresses
@@ -368,7 +452,7 @@ Feature: Per-source-prefix rate limiting
 
   # ------------------------------------ DELETIONS AND NON-REGRESSIONS
 
-  @hostile @enforced tests/ratelimit.rs:179
+  @hostile @enforced tests/ratelimit.rs:100
   Scenario: Pruning and the janitor cannot come back
     # A structural guard, in the style of VEGA-046's. `prune`, `prune_at`,
     # `tracked`, DEFAULT_IDLE_TTL, JANITOR_INTERVAL and `spawn_janitor` are
@@ -446,7 +530,7 @@ Feature: Per-source-prefix rate limiting
     When a client sends 40 queries in quick succession
     Then dns_rate_limited_total is greater than 0
 
-  @happy @enforced tests/ratelimit.rs:226
+  @happy @enforced tests/ratelimit.rs:142
   Scenario: The limiter exposes a constant slot count and a live occupancy gauge
     # `dns_ratelimit_tracked` as requested by VEGA-043 is UNIMPLEMENTABLE after
     # this change — nothing is tracked, source cardinality is deliberately not
@@ -461,6 +545,15 @@ Feature: Per-source-prefix rate limiting
     Then dns_ratelimit_slots is present and constant
     And dns_ratelimit_active is present and no greater than dns_ratelimit_slots
 
+  @empty @enforced tests/ratelimit.rs:212
+  Scenario: The limiter gauges are absent when rate limiting is off
+    # Rate limiting is off unless configured, and there is then no table. A
+    # series reporting 262,144 slots for a limiter that does not exist would have
+    # an operator alerting on a saturation that cannot happen. Ruling §8.
+    Given a server with no rate limiter configured
+    When the metrics are rendered
+    Then no dns_ratelimit series is present
+
   @hostile @gap
   Scenario: A scrape concurrent with sustained queries neither deadlocks nor corrupts the exposition
     # The occupancy walk is 262,144 relaxed loads over 2 MiB on the admin scrape
@@ -473,7 +566,7 @@ Feature: Per-source-prefix rate limiting
 
   # ------------------------------------ OPERATIONAL BREAKING CHANGE
 
-  @hostile @enforced src/ratelimit.rs:1016
+  @hostile @enforced src/ratelimit.rs:1524
   Scenario: The configured qps applies to a whole /24, not to each host inside it
     # THE BREAKING CHANGE, stated so nobody discovers it in production. `qps` used
     # to mean per source ADDRESS; it now means per /24 or per /56. An operator
