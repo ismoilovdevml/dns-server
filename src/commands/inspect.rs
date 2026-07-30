@@ -363,10 +363,10 @@ fn flags(authoritative: bool, truncated: bool, recursion_available: bool) -> Str
         set.push(ui::warn("tc"));
     }
     if recursion_available {
-        set.push(ui::muted("ra").to_string());
+        set.push(ui::muted("ra"));
     }
     if set.is_empty() {
-        ui::muted("none").to_string()
+        ui::muted("none")
     } else {
         set.join(" ")
     }

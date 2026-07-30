@@ -50,7 +50,7 @@ pub fn show(config: Option<&Path>, as_json: bool) -> Result<()> {
         "soa serial",
         editor
             .serial()
-            .map_or_else(|| ui::muted("unset"), |s| ui::accent(s).to_string()),
+            .map_or_else(|| ui::muted("unset"), ui::accent),
         14,
     );
     ui::field("names", names.len(), 14);
@@ -225,7 +225,7 @@ pub fn check(config: &Config, config_path: Option<&Path>, as_json: bool) -> Resu
         if config.zone.builtins {
             ui::good("enabled")
         } else {
-            ui::muted("disabled").to_string()
+            ui::muted("disabled")
         },
         16,
     );
@@ -236,7 +236,7 @@ pub fn check(config: &Config, config_path: Option<&Path>, as_json: bool) -> Resu
     ui::field(
         "admin",
         config.admin_listen.map_or_else(
-            || ui::muted("disabled").to_string(),
+            || ui::muted("disabled"),
             |a| {
                 if a.ip().is_loopback() {
                     ui::good(a)
@@ -263,7 +263,7 @@ pub fn check(config: &Config, config_path: Option<&Path>, as_json: bool) -> Resu
         if config.admin_token.is_some() {
             ui::good("set")
         } else {
-            ui::muted("unset (reload restricted to loopback)").to_string()
+            ui::muted("unset (reload restricted to loopback)")
         },
         16,
     );
@@ -280,7 +280,7 @@ pub fn resolve(path: Option<&Path>) -> Result<PathBuf> {
 
 fn join<T: ToString>(items: &[T]) -> String {
     if items.is_empty() {
-        return ui::muted("none").to_string();
+        return ui::muted("none");
     }
     items
         .iter()

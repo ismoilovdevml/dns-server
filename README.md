@@ -394,23 +394,12 @@ you just want a look, `status` renders the same data:
 
 ## How it works
 
-```text
-                    UDP :53        TCP :53
-                       │              │
-                       └──────┬───────┘
-                              ▼
-                   ┌────────────────────┐
-                   │  per-IP rate limit │  token bucket, sharded
-                   └─────────┬──────────┘
-                             ▼
-                   ┌────────────────────┐
-                   │   request handler  │  validate → resolve → build
-                   └─────────┬──────────┘
-                             ▼
-                    ┌───────────────┐         ┌──────────────┐
-                    │  zone (Arc)   │◀────────│ POST /reload │
-                    └───────────────┘  swap   └──────────────┘
-```
+<img src="assets/architecture.png" alt="Architecture: the query path from listeners through the rate limiter and handler to the zone, and the control plane from the CLI through the config file and admin API back into a zone swap" width="1180">
+
+The zone is the only thing shared between the two halves, and it is swapped
+atomically — a reload never blocks a query, and a query never sees a half-applied
+zone.
+
 
 | Module | |
 |---|---|
