@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, ValueEnum};
 use serde::Deserialize;
 
@@ -456,12 +456,18 @@ impl Config {
                 stage: LoadStage::Read,
                 error,
             })?;
-        toml::from_str(&raw)
-            .with_context(|| format!("parsing config file {}", path.display()))
-            .map_err(|error| LoadError {
-                stage: LoadStage::Parse,
-                error,
-            })
+        toml::from_str(&raw).map_err(|error| LoadError {
+            stage: LoadStage::Parse,
+            // Flattened to a string on purpose, rather than kept as a `source`:
+            // anyhow prints the whole chain for `{:#}` and `{:?}`, so a surviving
+            // `toml::de::Error` anywhere in it re-introduces the snippet at the
+            // first thing that renders this error (VEGA-082).
+            error: anyhow!(
+                "parsing config file {}: {}",
+                path.display(),
+                describe_parse_error(&error, &raw)
+            ),
+        })
     }
 
     fn merge(cli: &GlobalArgs, file: FileConfig) -> Result<Self> {
@@ -682,6 +688,52 @@ fn shutdown_drain(cli: &GlobalArgs, file: Option<i64>) -> Result<Duration> {
         Some(secs) => Ok(Duration::from_secs(secs)),
         None => Err(refuse(&secs)),
     }
+}
+
+/// Render a TOML parse failure for an operator without quoting the file back.
+///
+/// `toml`'s own `Display` prints the offending source line under the position,
+/// with a caret beneath it. That is a good error message for a compiler and a
+/// disclosure for a name server: the line that fails to parse is very often
+/// `admin_token = "…`, and this string reaches a `/reload` response body and a
+/// WARN log that ships to whatever aggregates container stdout (VEGA-082). So
+/// the position and the parser's own description are kept — they are what makes
+/// the message actionable — and the source snippet is dropped.
+///
+/// The two ingredients are safe by construction, not by inspection: the position
+/// is a pair of integers, and `Error::message()` is the parser's description of
+/// what it expected, assembled from grammar literals rather than from input.
+fn describe_parse_error(error: &toml::de::Error, raw: &str) -> String {
+    let Some(span) = error.span() else {
+        return error.message().to_owned();
+    };
+    let (line, column) = position(raw, span.start);
+    format!(
+        "TOML parse error at line {line}, column {column}: {}",
+        error.message()
+    )
+}
+
+/// A byte offset into `raw` as the one-based line and column `toml` would report.
+///
+/// Same arithmetic as `toml`'s own `translate_position`, so the numbers an
+/// operator sees do not move: columns count characters, not bytes.
+fn position(raw: &str, offset: usize) -> (usize, usize) {
+    // The span comes from a parser reading this very string, so it is already a
+    // character boundary and in range. Clamped and floored anyway, because
+    // `/reload` reaches this from the network and `panic = "abort"` turns one
+    // slice panic into a full outage. Both loops below are bounded: the floor
+    // steps back at most three bytes (UTF-8's longest encoding) since offset 0 is
+    // always a boundary.
+    let mut offset = offset.min(raw.len());
+    while offset > 0 && !raw.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let head = &raw[..offset];
+    let line_start = head.rfind('\n').map_or(0, |newline| newline + 1);
+    let line = head[..line_start].matches('\n').count() + 1;
+    let column = head[line_start..].chars().count() + 1;
+    (line, column)
 }
 
 fn reject_duplicates(what: &str, addrs: &[SocketAddr]) -> Result<()> {
@@ -1099,6 +1151,174 @@ mod tests {
         // a reload of an unchanged minimal file reports no drift at all.
         let resolved = Config::resolve(&cli(&[])).expect("defaults resolve");
         assert_eq!(resolved.stated, FileSettings::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // VEGA-082. A config failure is rendered for an operator, never by quoting
+    // the file back: the offending line is the secret when the key is
+    // `server.admin_token`. All three stages, because all three reach a
+    // `/reload` response body and a WARN log line.
+    // -----------------------------------------------------------------------
+
+    /// The secret used by every leak test below. Distinctive enough that a
+    /// substring search cannot match anything the renderer legitimately emits.
+    const SECRET: &str = "SUPER-SECRET-TOKEN-1";
+
+    /// Resolve `toml` from a real file and return the failure.
+    fn resolve_failure(bytes: &[u8]) -> LoadError {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("vega.toml");
+        std::fs::write(&path, bytes).expect("file writes");
+        Config::resolve(&GlobalArgs {
+            config: Some(path),
+            ..cli(&[])
+        })
+        .expect_err("this config cannot resolve")
+    }
+
+    /// A parse failure keeps its position and its message — the positive
+    /// control for the redaction below. Without this, "redact everything"
+    /// passes and the operator is left with an error they cannot act on.
+    #[test]
+    fn a_parse_failure_still_names_the_line_the_column_and_what_was_expected() {
+        // `log_level = "oops` is 17 characters, so the unterminated string is
+        // reported at line 2, column 18 — the position an editor's gutter shows.
+        let failure = resolve_failure(b"[server]\nlog_level = \"oops\n");
+        assert_eq!(failure.stage, LoadStage::Parse);
+        let rendered = failure.to_string();
+        for needle in ["line 2", "column 18", "invalid basic string"] {
+            assert!(
+                rendered.contains(needle),
+                "a redacted parse error still has to be actionable; {needle:?} is missing \
+                 from: {rendered}"
+            );
+        }
+    }
+
+    /// Scenario: A startup failure does not echo the admin_token line
+    /// features/config-precedence.feature:462
+    #[test]
+    fn a_parse_failure_on_the_admin_token_line_does_not_echo_the_token() {
+        let toml = format!("[server]\nadmin_token = \"{SECRET}\nudp = [\"127.0.0.1:5300\"]\n");
+        let failure = resolve_failure(toml.as_bytes());
+
+        assert_eq!(failure.stage, LoadStage::Parse);
+        // The exact position `toml` itself reported for this input before the
+        // redaction: proof that reimplementing the offset-to-position arithmetic
+        // did not move the numbers an operator reads.
+        assert!(
+            failure.to_string().contains("line 2, column 36"),
+            "{failure}"
+        );
+        assert!(
+            !failure.to_string().contains(SECRET),
+            "toml's own Display quotes the offending source line, so an unterminated \
+             string on the admin_token line puts the secret into the /reload body and \
+             the WARN log: {failure}"
+        );
+        assert!(
+            !format!("{:?}", failure.error).contains(SECRET),
+            "the Debug form must not carry it either: a `source` chain holding the raw \
+             toml error leaks through anyhow's `{{:?}}`"
+        );
+    }
+
+    /// Scenario: A duplicated admin_token key does not echo either value
+    /// features/live-reload.feature:354
+    #[test]
+    fn a_duplicate_admin_token_key_does_not_echo_either_value() {
+        let toml = format!("[server]\nadmin_token = \"{SECRET}\"\nadmin_token = \"{SECRET}\"\n");
+        let failure = resolve_failure(toml.as_bytes());
+
+        assert_eq!(failure.stage, LoadStage::Parse);
+        let rendered = failure.to_string();
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(
+            rendered.contains("duplicate key"),
+            "the operator still has to be told what is wrong: {rendered}"
+        );
+    }
+
+    /// Every shape of parse failure we could reach with the secret on the
+    /// `admin_token` line, not only the two the audit reproduced.
+    ///
+    /// The claim being defended is stronger than "those two inputs are fixed":
+    /// nothing the parser or serde says about `server.admin_token` can contain
+    /// its value. It holds because the field is a `String` — every TOML string
+    /// deserializes into it, so the only failures reachable on that key are
+    /// positional ones, and the position is a pair of integers. What serde does
+    /// still quote is *key names*, *unknown enum variants* and *values of the
+    /// wrong type for a typed field*; none of the three can be reached by a
+    /// well-formed token sitting where a token belongs.
+    #[test]
+    fn no_parse_failure_shape_echoes_the_value_of_admin_token() {
+        let shapes = [
+            format!("[server]\nadmin_token = \"{SECRET}\n"),
+            format!("[server]\nadmin_token = '{SECRET}\n"),
+            format!("[server]\nadmin_token = \"{SECRET}\" trailing\n"),
+            format!("[server]\nadmin_token = {{ inner = \"{SECRET}\" }}\n"),
+            format!("[server\nadmin_token = \"{SECRET}\"\n"),
+            format!("[server]\nadmin_token = \"{SECRET}\"\n[[zone.records]\n"),
+            format!("[server]\nadmin_token = \"{SECRET}\"\nadmin_token = \"other\"\n"),
+            format!("[server]\nadmin_token = \"{SECRET}\"\nudp = \"not-a-list\"\n"),
+        ];
+
+        for toml in shapes {
+            let failure = resolve_failure(toml.as_bytes());
+            assert_eq!(failure.stage, LoadStage::Parse, "{toml:?}");
+            assert!(
+                !failure.to_string().contains(SECRET),
+                "{toml:?} leaked the token: {failure}"
+            );
+            assert!(
+                failure.to_string().contains("TOML parse error at line"),
+                "{toml:?} lost the position: {failure}"
+            );
+        }
+    }
+
+    /// The read stage reads the file whole before decoding it, so a file that is
+    /// not UTF-8 fails *after* the bytes are in hand. The io error must describe
+    /// the decode, not the content.
+    #[test]
+    fn a_read_failure_on_undecodable_bytes_does_not_echo_them() {
+        let mut bytes = format!("[server]\nadmin_token = \"{SECRET}\"\n").into_bytes();
+        bytes.push(0xff);
+        let failure = resolve_failure(&bytes);
+
+        assert_eq!(failure.stage, LoadStage::Read);
+        assert!(!failure.to_string().contains(SECRET), "{failure}");
+    }
+
+    /// The validate stage never sees the file's bytes — only parsed values — and
+    /// `merge` copies `admin_token` without ever formatting it. Asserted rather
+    /// than assumed: a future `bail!` that quotes a rejected value would land
+    /// here.
+    #[test]
+    fn a_validate_failure_does_not_echo_the_admin_token_beside_it() {
+        let toml = format!("[server]\nadmin_token = \"{SECRET}\"\n[zone]\ndefault_ttl = 0\n");
+        let failure = resolve_failure(toml.as_bytes());
+
+        assert_eq!(failure.stage, LoadStage::Validate);
+        assert!(!failure.to_string().contains(SECRET), "{failure}");
+        assert!(failure.to_string().contains("default_ttl"), "{failure}");
+    }
+
+    /// The position we report is the position `toml` would have reported: an
+    /// operator comparing our message with their editor's gutter must not find
+    /// an off-by-one.
+    #[test]
+    fn a_byte_offset_becomes_the_same_one_based_line_and_column_toml_uses() {
+        let raw = "a\nbcd\nz";
+        assert_eq!(position(raw, 0), (1, 1));
+        assert_eq!(position(raw, 2), (2, 1));
+        assert_eq!(position(raw, 4), (2, 3));
+        assert_eq!(position(raw, 6), (3, 1));
+        // Past the end (the parser reports EOF this way) and inside a multi-byte
+        // character: neither may panic, because /reload reaches this from the
+        // network and `panic = "abort"` makes one panic an outage.
+        assert_eq!(position(raw, 99), (3, 2));
+        assert_eq!(position("héllo", 2), (1, 2));
     }
 
     #[test]

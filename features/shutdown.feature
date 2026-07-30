@@ -290,6 +290,21 @@ Feature: Shutdown drain
     And the exit code is 3
     And an ERROR names the deadline and the phase it was stuck in
 
+  @hostile @enforced tests/shutdown.rs:1750
+  Scenario: A half-open admin connection does not cost the shutdown its exit code
+    # VEGA-079, a consequence VEGA-046 created: `Closing` awaits the admin task,
+    # axum's graceful shutdown waits for every accepted connection, and the admin
+    # server has no header-read timeout (VEGA-019). Three unauthenticated
+    # connections that begin a request header and stop then push every shutdown
+    # past the hard deadline, so each rollout reports Error and a real wedge
+    # stops being distinguishable from a routine one.
+    Given a running server with a drain window of 0 seconds
+    And three connections to the admin port whose request headers are never terminated
+    When the process is sent SIGTERM
+    Then the process exits 0 within the admin close budget
+    And the log records shutdown complete
+    And a warning says a client held a connection open and it was abandoned
+
   # ---------------------------------------------------- REGRESSION GUARDS
 
   @hostile @enforced tests/shutdown.rs:1715

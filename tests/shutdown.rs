@@ -1737,6 +1737,74 @@ async fn a_wedged_shutdown_exits_three_within_the_watchdog_grace() {
     );
 }
 
+/// Scenario: a half-open admin connection does not cost the shutdown its exit code
+/// features/shutdown.feature:294
+///
+/// VEGA-079, and a consequence VEGA-046 created: before it nothing awaited the
+/// admin task, so a client's connection state could not reach the exit code.
+/// Three unauthenticated connections that send part of a request header and stop
+/// are enough — axum's graceful shutdown waits for each one, the hard deadline
+/// fires, and every rollout then looks like a wedge. Which is how a real wedge
+/// gets ignored.
+#[tokio::test]
+async fn half_open_admin_connections_do_not_cost_the_shutdown_its_exit_code() {
+    let mut server = Server::start(&Spawn::with_admin().with_drain_env(0));
+    server.wait_ready().await;
+    let admin = server.admin();
+
+    // Held open for the whole shutdown: headers begun and never terminated, so
+    // hyper is still waiting to read a request that will never arrive.
+    let mut held = Vec::new();
+    for index in 0..3 {
+        let mut stream = TcpStream::connect(admin)
+            .await
+            .unwrap_or_else(|e| panic!("connection {index} to the admin port: {e}"));
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("connection {index} writing a partial header: {e}"));
+        held.push(stream);
+    }
+    // Long enough for all three to be accepted and parked in hyper's read.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let t0 = Instant::now();
+    server.must_signal("TERM");
+
+    // D = drain (0) + stop budget (5s). A clean exit here is immediate; the
+    // admin close budget is the only thing that may be spent, so 3s is generous
+    // and still well inside the deadline this test exists to protect.
+    let (status, elapsed) = server
+        .wait_exit(t0, Duration::from_secs(8))
+        .await
+        .unwrap_or_else(|| panic!("the process never exited.\nlog:\n{}", server.log()));
+
+    let log = server.log();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "an unauthenticated caller must not be able to turn every shutdown into an \
+         overrun: exit 3 makes Kubernetes record Error on each rollout and fires any \
+         alert keyed on the deadline. It exited after {elapsed:?}.\nlog:\n{log}"
+    );
+    assert!(
+        log.contains("shutdown complete"),
+        "the shutdown machine finished, so it must say so: .github/workflows/docker.yml \
+         greps the logs for exactly this line.\nlog:\n{log}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the shutdown took {elapsed:?}; a held connection may cost the admin close \
+         budget, not the whole hard deadline.\nlog:\n{log}"
+    );
+    assert!(
+        line_with(&log, &["admin", "abandon"]).is_some(),
+        "an operator seeing a slower shutdown needs to know a client caused it.\nlog:\n{log}"
+    );
+
+    drop(held);
+}
+
 // ========================================================= REGRESSION GUARDS
 
 /// Read a source file of the crate under test.

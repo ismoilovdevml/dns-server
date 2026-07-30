@@ -458,6 +458,18 @@ Feature: Configuration precedence and validation
     When the CLI definition is asserted
     Then it is internally consistent
 
+  @hostile @enforced tests/cli.rs:366
+  Scenario: A startup failure does not echo the admin_token line
+    # VEGA-082's reproduction was this path, not /reload: `vega serve` on a
+    # config whose admin_token line will not parse printed the line, secret and
+    # all, to the terminal and the journal. Both renderings are covered — prose
+    # on stderr and --json on stdout — because each is a separate way out.
+    Given a config file whose admin_token line is not valid TOML
+    When `vega serve`, `vega serve --json` or `vega check` runs
+    Then the process exits non-zero
+    And the output does not contain the token
+    And the output still names the line the parser stopped at
+
   @hostile @gap
   Scenario: The admin token is never printed in help output
     # hide_env_values = true on --admin-token. Nothing asserts a secret cannot

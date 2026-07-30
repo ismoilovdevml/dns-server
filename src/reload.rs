@@ -221,6 +221,12 @@ pub fn reload(ctx: &ReloadContext) -> Result<ReloadOutcome, ReloadError> {
                 LoadStage::Parse => ReloadErrorCode::ConfigParseFailed,
                 LoadStage::Validate => ReloadErrorCode::ConfigInvalid,
             },
+            // Safe to render whole only because `Config::resolve` builds its
+            // parse failures already redacted: `toml`'s own Display quotes the
+            // offending source line, and that line is the operator's secret when
+            // the key is `server.admin_token`. This string goes into the response
+            // body and into `admin.rs`'s WARN. See `config::describe_parse_error`
+            // (VEGA-082), and do not re-wrap a raw `toml::de::Error` here.
             format!("{:#}", failure.error),
         )
     })?;
@@ -984,6 +990,48 @@ mod tests {
                 "{code} replaced the serving zone"
             );
             assert_eq!(gauge(&fixture.metrics), 3, "{code} moved the gauge");
+        }
+    }
+
+    /// Scenario: A refused reload never echoes the admin_token line
+    /// features/live-reload.feature:339
+    ///
+    /// The counterpart to `drift`'s rule three lines above its body: the key
+    /// path is reportable, the value never is. `drift` honoured it and this
+    /// path did not (VEGA-082) — the failure detail goes into the `/reload`
+    /// response body *and* into `admin.rs`'s WARN line, which ships as JSON to
+    /// stdout under the shipped k8s manifest.
+    #[test]
+    fn a_refused_reload_reports_where_the_parse_failed_and_never_the_line_itself() {
+        const SECRET: &str = "SUPER-SECRET-TOKEN-1";
+        let broken =
+            format!("[server]\nadmin_token = \"{SECRET}\n[zone]\norigin = \"example.test\"\n");
+        let duplicated = format!(
+            "[server]\nadmin_token = \"{SECRET}\"\nadmin_token = \"{SECRET}\"\n\
+             [zone]\norigin = \"example.test\"\n"
+        );
+
+        for toml in [broken, duplicated] {
+            let fixture = Fixture::start(&zone_toml("example.test", 1, ""), &[]);
+            fixture.write(&toml);
+
+            let error = fixture.reload().expect_err("broken TOML is refused");
+            assert_eq!(error.code, ReloadErrorCode::ConfigParseFailed);
+            assert!(
+                !error.detail.contains(SECRET),
+                "the detail is rendered into the response body and the WARN log: {}",
+                error.detail
+            );
+            assert!(
+                error.detail.contains("line 2") || error.detail.contains("line 3"),
+                "an operator still needs to be sent to the offending line: {}",
+                error.detail
+            );
+            assert!(
+                error.detail.contains("column"),
+                "an operator still needs the column: {}",
+                error.detail
+            );
         }
     }
 

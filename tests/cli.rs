@@ -355,6 +355,46 @@ fn check_fails_on_a_broken_config() {
     );
 }
 
+/// Scenario: A startup failure does not echo the admin_token line
+/// features/config-precedence.feature:462
+///
+/// The reproduction in VEGA-082 was this path, not `/reload`: an operator types
+/// one unterminated quote, and the token is on their terminal and in the
+/// journal. `serve` fails before it binds anything, so this stays a pure
+/// command-line test.
+#[test]
+fn a_startup_failure_does_not_echo_the_admin_token_line() {
+    const SECRET: &str = "SUPER-SECRET-TOKEN-1";
+    let broken = [
+        format!("[server]\nadmin_token = \"{SECRET}\n[zone]\norigin = \"example.com\"\n"),
+        format!(
+            "[server]\nadmin_token = \"{SECRET}\"\nadmin_token = \"{SECRET}\"\n\
+             [zone]\norigin = \"example.com\"\n"
+        ),
+    ];
+
+    for toml in broken {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("vega.toml"), &toml).unwrap();
+
+        // Both renderings: `report` writes prose to stderr and JSON to stdout,
+        // and each one is a separate way for the secret to leave the process.
+        for args in [vec!["serve"], vec!["serve", "--json"], vec!["check"]] {
+            let output = run(dir.path(), &args);
+            assert!(!output.status.success(), "{args:?} must fail to start");
+            let combined = format!("{}{}", stdout(&output), stderr(&output));
+            assert!(
+                !combined.contains(SECRET),
+                "{args:?} echoed the offending config line back, secret and all: {combined}"
+            );
+            assert!(
+                combined.contains("line 2") || combined.contains("line 3"),
+                "{args:?} must still say where the file is broken: {combined}"
+            );
+        }
+    }
+}
+
 #[test]
 fn zone_export_emits_zone_file_syntax() {
     let dir = workspace();

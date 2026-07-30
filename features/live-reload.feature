@@ -335,6 +335,32 @@ Feature: Live zone reload without restarting
     And the body code is "config_parse_failed"
     And a query for "www.example.test." still holds 203.0.113.10
 
+  @hostile @enforced tests/reload.rs:1345
+  Scenario: A refused reload never echoes the admin_token line
+    # VEGA-082. toml's own Display renders the offending source line under the
+    # position, and that line is very often `admin_token = "...`. The detail
+    # reaches the /reload response body *and* the WARN line beside it, which the
+    # shipped k8s manifest and Dockerfile emit as JSON to stdout — so the token
+    # lands wherever pod logs are aggregated. One operator typo is enough; no
+    # attacker is needed.
+    Given a running server serving "www" as 203.0.113.10
+    When the config file is edited so the admin_token line will not parse and a reload is requested
+    Then the response status is 400
+    And the body code is "config_parse_failed"
+    And neither the body nor the log contains the token
+    And the error still names the line and the column
+
+  @hostile @enforced tests/reload.rs:1345
+  Scenario: A duplicated admin_token key does not echo either value
+    # The same leak reached by a different parse failure: a duplicated key is
+    # reported at the second occurrence, whose line carries the value.
+    Given a running server serving "www" as 203.0.113.10
+    When the config file declares admin_token twice and a reload is requested
+    Then the response status is 400
+    And the body code is "config_parse_failed"
+    And neither the body nor the log contains the token
+    And the error still says "duplicate key"
+
   @malformed @enforced tests/reload.rs:1257
   Scenario: A semantically invalid config is refused
     # Rejected by Config::merge rather than by the parser: empty origin, zero

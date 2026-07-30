@@ -59,6 +59,15 @@ const QUIESCE_POLL: Duration = Duration::from_millis(5);
 /// knob for the drain is enough for an operator to reason about.
 const STOP_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long `Closing` waits for the admin server to finish its own shutdown.
+///
+/// Well inside [`STOP_BUDGET`], because the thing being waited for is not our
+/// work: axum's graceful shutdown holds until every accepted connection is done,
+/// and a connection that has sent half a request header is never done. The cost
+/// of giving up is one abandoned HTTP connection on a process that is exiting;
+/// the cost of waiting is the whole hard deadline and exit 3 (VEGA-079).
+const ADMIN_CLOSE_BUDGET: Duration = Duration::from_secs(1);
+
 /// Grace on top of the hard deadline before the OS-thread watchdog exits.
 const WATCHDOG_GRACE: Duration = Duration::from_secs(2);
 
@@ -642,9 +651,31 @@ impl Shutdown<'_> {
         self.lifecycle.enter(Phase::Closing);
         info!("shutdown: closing — DNS is down, the admin listener goes last");
         self.admin.cancel();
-        if let Some(task) = self.admin_task {
+        if let Some(mut task) = self.admin_task {
+            // Bounded, because axum's graceful shutdown does not return until
+            // every accepted connection has finished, and the admin server has no
+            // header-read timeout: a caller who sends half a request header and
+            // stops is waited for forever. Unbounded, three such connections put
+            // every shutdown over the hard deadline and exited 3 — an
+            // unauthenticated client deciding what a rollout looks like
+            // (VEGA-079). The clean fix is hyper's `http1_header_read_timeout`
+            // plus a connection cap, which is VEGA-019's; this bounds the damage
+            // to the last second of the shutdown either way.
+            //
+            // `&mut task` rather than `task`, so the handle survives the timeout
+            // and the leftover connections are aborted rather than detached.
             // The admin task's own errors are already logged by the task.
-            let _ = task.await;
+            if tokio::time::timeout(ADMIN_CLOSE_BUDGET, &mut task)
+                .await
+                .is_err()
+            {
+                warn!(
+                    budget_secs = ADMIN_CLOSE_BUDGET.as_secs(),
+                    "the admin listener did not close within its budget; a client is holding a \
+                     connection open — abandoning it and exiting"
+                );
+                task.abort();
+            }
         }
     }
 

@@ -424,13 +424,25 @@ impl Vega {
     /// Wait for a log line mentioning `needle`; the log arrives over a pipe, so it
     /// can lag the HTTP response it was written next to.
     async fn wait_for_log(&self, needle: &str) {
+        self.wait_for_nth_log(needle, 1).await;
+    }
+
+    /// Wait for the `count`th line mentioning `needle`.
+    ///
+    /// A test that drives the same refusal twice cannot use `wait_for_log`: the
+    /// first round's line is already there, so the wait returns immediately and
+    /// the assertion races the second round's write.
+    async fn wait_for_nth_log(&self, needle: &str, count: usize) {
         for _ in 0..150u32 {
-            if self.logs().contains(needle) {
+            if self.logs().matches(needle).count() >= count {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        panic!("no log line mentioned {needle}:\n{}", self.logs());
+        panic!(
+            "fewer than {count} log lines mentioned {needle}:\n{}",
+            self.logs()
+        );
     }
 }
 
@@ -1318,6 +1330,82 @@ async fn a_reload_of_unparseable_toml_is_config_parse_failed() {
     assert_eq!(
         a_values(&vega.ask("www.example.test.", RecordType::A).await),
         vec!["203.0.113.10".to_owned()]
+    );
+}
+
+/// Scenario: A refused reload never echoes the admin_token line
+/// features/live-reload.feature:339
+///
+/// The whole point of doing this end to end: the leak had two exits, the
+/// response body and the WARN line `admin.rs` writes next to it, and only a real
+/// process shows both. The shipped k8s manifest and Dockerfile set
+/// `log_format = "json"` to stdout, so that WARN reaches whatever aggregates pod
+/// logs — a far wider audience than the token holders (VEGA-082).
+#[tokio::test]
+async fn a_refused_reload_puts_the_admin_token_in_neither_the_body_nor_the_log() {
+    const SECRET: &str = "SUPER-SECRET-TOKEN-1";
+
+    // Every stage of Config::resolve, each with the secret sitting in the file:
+    // a syntactically broken token line, a duplicated token key, and a value the
+    // merge rejects with the token beside it.
+    let cases = [
+        (
+            "config_parse_failed",
+            format!("[server]\nadmin_token = \"{SECRET}\n[zone]\norigin = \"example.test\"\n"),
+        ),
+        (
+            "config_parse_failed",
+            format!(
+                "[server]\nadmin_token = \"{SECRET}\"\nadmin_token = \"{SECRET}\"\n\
+                 [zone]\norigin = \"example.test\"\n"
+            ),
+        ),
+        (
+            "config_invalid",
+            config_file(
+                Some("example.test"),
+                "",
+                &format!("admin_token = \"{SECRET}\"\n"),
+                "203.0.113.10",
+            )
+            .replace("default_ttl = 300", "default_ttl = 0"),
+        ),
+    ];
+
+    let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
+        .token("the-running-token")
+        .start()
+        .await;
+
+    for (round, (code, toml)) in cases.into_iter().enumerate() {
+        vega.write_config(&toml);
+        let (status, body) = vega.reload().await;
+
+        assert_eq!(status, 400, "round {round}: {body}");
+        assert_code(&body, code);
+        assert!(
+            !body.to_string().contains(SECRET),
+            "round {round}: the reload response body carries the operator's token: {body}"
+        );
+
+        // The WARN arrives over a pipe, so it can lag the HTTP response it was
+        // written beside; wait for this round's line rather than the last one's.
+        vega.wait_for_nth_log("reload rejected", round + 1).await;
+        let logs = vega.logs();
+        assert!(
+            !logs.contains(SECRET),
+            "round {round}: the token reached the log:\n{logs}"
+        );
+        assert!(
+            logs.contains("column") || round == 2,
+            "round {round}: a redacted parse error must still carry the position:\n{logs}"
+        );
+    }
+
+    assert_eq!(
+        a_values(&vega.ask("www.example.test.", RecordType::A).await),
+        vec!["203.0.113.10".to_owned()],
+        "none of these edits may take the zone down"
     );
 }
 
