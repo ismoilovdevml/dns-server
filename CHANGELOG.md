@@ -7,6 +7,47 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`SIGTERM` did not drain.** 0.2.0 claimed below that "readiness flips to 503
+  while draining" and that shutdown "drains in-flight queries". Neither was
+  true: the signal cancelled the DNS listeners directly and the process exited
+  about 1.3 ms later, so `/readyz` went from `200` straight to connection
+  refused, in-flight TCP queries were dropped unanswered, and
+  `terminationGracePeriodSeconds` was decorative. Every rolling update was a
+  short resolution failure for whichever clients still had the old endpoint —
+  invisible in our own metrics, because those queries never arrived.
+
+  `SIGTERM` now marks the process unready *first*, keeps answering DNS for
+  `shutdown_drain_secs` (default 15 s) while `/readyz` reports `503`, then
+  closes the DNS listeners and the admin server last. `SIGINT` uses a
+  zero-length window. See "Shutdown and draining" in the README.
+
+### Changed
+
+- **Deployment timings now derive from the drain instead of being guesses.**
+  Kubernetes `terminationGracePeriodSeconds` 20 → 30, liveness
+  `periodSeconds` 15 → 10 and `timeoutSeconds` 3 → 2 (so
+  `10 × 3 = 30 s` still exceeds the 20 s hard deadline and the kubelet cannot
+  restart a draining pod), readiness `periodSeconds` 5 → 2, `timeoutSeconds`
+  3 → 1, `initialDelaySeconds` 1 → 0 so the `503` is observed well inside the
+  window. systemd `TimeoutStopSec` 45 → 30 with `KillMode=mixed` and an
+  explicit `SendSIGKILL=yes`. Compose gains `stop_grace_period: 30s`, because
+  its 10 s default would `SIGKILL` mid-drain. The image declares
+  `STOPSIGNAL SIGTERM` explicitly rather than inheriting it.
+- **No `preStop` hook**, deliberately: it runs before `SIGTERM`, when `/readyz`
+  is still `200`, so it cannot serve the `503` — and it stacks with the drain
+  into a guaranteed `SIGKILL`.
+
+### Added
+
+- `shutdown_drain_secs` / `--shutdown-drain-secs` / `VEGA_SHUTDOWN_DRAIN_SECS`,
+  `0..=300`, default 15.
+- `deploy/check-shutdown-invariants.sh`, run by CI: the shutdown timings across
+  the Kubernetes manifest, the systemd unit, the Dockerfile, Compose and the
+  image smoke test are only correct relative to each other, so they are checked
+  mechanically rather than remembered.
+
 ## [0.2.0] - 2026-07-30
 
 A rewrite. 0.1.0 was a demonstration of the Hickory API with four hard-coded

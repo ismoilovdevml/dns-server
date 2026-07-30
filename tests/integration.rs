@@ -885,27 +885,75 @@ async fn queries_keep_being_answered_across_a_zone_reload() {
     assert_eq!(seen_a + seen_b, 20_000);
 }
 
+/// The single A value the installed zone currently answers `name` with.
+fn installed_a_value(handler: &DnsHandler, name: &hickory_proto::rr::LowerName) -> String {
+    match handler.zone().lookup(name, RecordType::A) {
+        vega::zone::Answer::Records(records) => match records.first().map(|r| &r.data) {
+            Some(RData::A(a)) => a.0.to_string(),
+            other => panic!("expected one A record, got {other:?}"),
+        },
+        other => panic!("expected records, got {other:?}"),
+    }
+}
+
+/// Scenario: A config whose zone will not build is refused
+/// features/live-reload.feature:321
+///
+/// VEGA-027. The previous version of this test never attempted a reload: it
+/// asserted the fixture was broken and then asserted the handler was unchanged,
+/// which passes against a `replace_zone` gutted to do nothing. It now performs a
+/// real swap first — so gutting `replace_zone` fails it — and only then attempts
+/// the swap that must not happen. The end-to-end version, through the real
+/// `reload_hook` and `POST /reload`, is
+/// `tests/reload.rs::a_reload_that_cannot_build_the_zone_is_zone_build_failed`.
 #[tokio::test]
 async fn a_failing_reload_leaves_the_previous_zone_in_place() {
-    // `reload_hook` builds the new zone before swapping, so a config that does
-    // not parse must be a no-op rather than a half-applied zone.
     let cfg = zone_config(vec![spec("www", "A", &["203.0.113.10"])]);
     let zone = Arc::new(Zone::from_config(&cfg).expect("zone builds"));
     let handler = DnsHandler::new(zone, &cfg, Arc::new(Metrics::new()), None);
-
-    let broken = zone_config(vec![spec("bad", "A", &["not-an-ip"])]);
-    assert!(
-        Zone::from_config(&broken).is_err(),
-        "the fixture must actually be broken"
-    );
-
-    assert_eq!(handler.zone().record_count(), 1);
     let name =
         hickory_proto::rr::LowerName::from(format!("www.{ZONE}.").parse::<Name>().expect("name"));
-    assert!(matches!(
-        handler.zone().lookup(&name, RecordType::A),
-        vega::zone::Answer::Records(_)
-    ));
+
+    // The ordering `reload_hook` must follow: build the whole zone first, and
+    // swap only if that succeeded, so a zone that does not build never reaches
+    // the ArcSwap.
+    let build_then_swap = |candidate: &vega::config::ZoneConfig| -> Result<(), String> {
+        let fresh = Zone::from_config(candidate).map_err(|e| format!("{e:#}"))?;
+        handler.replace_zone(Arc::new(fresh), candidate.builtins);
+        Ok(())
+    };
+
+    let updated = zone_config(vec![
+        spec("www", "A", &["198.51.100.7"]),
+        spec("api", "A", &["198.51.100.8"]),
+    ]);
+    build_then_swap(&updated).expect("a good config reloads");
+    assert_eq!(
+        handler.zone().record_count(),
+        2,
+        "the good reload did not land"
+    );
+    assert_eq!(installed_a_value(&handler, &name), "198.51.100.7");
+
+    // Now the reload that must not happen. `www` is also changed, so a
+    // half-applied zone would be visible as well as a wholly replaced one.
+    let broken = zone_config(vec![
+        spec("www", "A", &["203.0.113.99"]),
+        spec("bad", "A", &["not-an-ip"]),
+    ]);
+    let error = build_then_swap(&broken).expect_err("a broken config must be refused");
+    assert!(error.contains("invalid A record value"), "{error}");
+
+    assert_eq!(
+        handler.zone().record_count(),
+        2,
+        "a refused reload replaced the serving zone"
+    );
+    assert_eq!(
+        installed_a_value(&handler, &name),
+        "198.51.100.7",
+        "a refused reload half-applied its records"
+    );
 }
 
 #[tokio::test]

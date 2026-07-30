@@ -9,16 +9,17 @@
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{ConnectInfo, State},
-    http::{header, HeaderMap, StatusCode},
-    response::IntoResponse,
+    extract::{ConnectInfo, Request, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -26,7 +27,17 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::metrics::Metrics;
+use crate::{
+    lifecycle::{Lifecycle, Phase},
+    metrics::Metrics,
+};
+
+/// Header carrying the lifecycle phase on every admin response.
+///
+/// The status code is the contract and the body is for humans; this is for the
+/// operator who has one `curl -i` and needs to know whether a 503 means "never
+/// came up" or "going away".
+const PHASE_HEADER: HeaderName = HeaderName::from_static("x-vega-phase");
 
 /// What a successful reload changed. Returned to the caller so `vega
 /// reload` can print something more useful than "ok".
@@ -36,20 +47,155 @@ pub struct ReloadOutcome {
     pub origin: String,
     /// Number of records now loaded.
     pub records: usize,
+    /// TOML key paths the file changed that a running process cannot apply.
+    ///
+    /// Reported rather than applied, and never empty of meaning: an operator must
+    /// not be able to read a 200 and conclude that a restart-only edit took
+    /// effect. Bounded by the fixed half of the VEGA-005 partition table, and
+    /// never contains a secret's value — only its key path.
+    pub ignored: Vec<&'static str>,
 }
 
-/// A reload hook. Returns a description of the new state, or an error message
-/// safe to hand back over HTTP.
+/// Why a reload was refused.
 ///
-/// Boxed as a closure so this module stays independent of the handler and zone
-/// types it would otherwise have to know about.
-pub type ReloadFn = Arc<dyn Fn() -> Result<ReloadOutcome, String> + Send + Sync>;
+/// Stable and machine-readable: scripts, runbooks and (via VEGA-049) alert labels
+/// key on these, never on the prose, which is free to improve. The set is closed
+/// — `features/live-reload.feature` enumerates it, and adding a variant without a
+/// scenario is a spec gap, not a detail.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReloadErrorCode {
+    /// The config file could not be read: deleted, unreadable, mid-rename.
+    ConfigReadFailed,
+    /// The config file is not valid TOML.
+    ConfigParseFailed,
+    /// The config parsed but was rejected: empty origin, zero TTL, …
+    ConfigInvalid,
+    /// The zone would not build from the new records.
+    ZoneBuildFailed,
+    /// The file resolves to a different zone origin. A restart, not a reload.
+    OriginChanged,
+    /// Another reload holds the lock. Retry; the winner completes normally.
+    ReloadInProgress,
+    /// The process is draining. The next instance reads the file at startup.
+    ShuttingDown,
+    /// The server was started without a config file, so there is nothing to
+    /// re-read.
+    NotConfigured,
+    /// The caller is neither on loopback nor holding the admin token.
+    Forbidden,
+    /// The hook itself failed — in practice only a panic in a debug build.
+    Internal,
+}
+
+impl ReloadErrorCode {
+    /// The wire form. Exhaustive on purpose: a new variant fails to compile here
+    /// and in the test that enumerates them, instead of reaching an operator as
+    /// an unknown string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigReadFailed => "config_read_failed",
+            Self::ConfigParseFailed => "config_parse_failed",
+            Self::ConfigInvalid => "config_invalid",
+            Self::ZoneBuildFailed => "zone_build_failed",
+            Self::OriginChanged => "origin_changed",
+            Self::ReloadInProgress => "reload_in_progress",
+            Self::ShuttingDown => "shutting_down",
+            Self::NotConfigured => "not_configured",
+            Self::Forbidden => "forbidden",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The HTTP status this code answers with.
+    ///
+    /// 400 means "your edit is broken, fix the file and retry"; 409 (RFC 9110
+    /// §15.5.10) means "this cannot be applied by a reload, it needs a restart"
+    /// or "retry, someone else is mid-reload". Different runbooks, so different
+    /// statuses.
+    fn status(self) -> StatusCode {
+        match self {
+            Self::ConfigReadFailed
+            | Self::ConfigParseFailed
+            | Self::ConfigInvalid
+            | Self::ZoneBuildFailed => StatusCode::BAD_REQUEST,
+            Self::OriginChanged | Self::ReloadInProgress => StatusCode::CONFLICT,
+            Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NotConfigured => StatusCode::NOT_IMPLEMENTED,
+            Self::Forbidden => StatusCode::FORBIDDEN,
+            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl std::fmt::Display for ReloadErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A refused reload: a stable code plus prose an operator can act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReloadError {
+    /// What kind of refusal this is. Automation reads this.
+    pub code: ReloadErrorCode,
+    /// Operator-facing prose, safe to return over HTTP. Never holds a secret.
+    pub detail: String,
+    /// The origin still being served. Populated only for
+    /// [`ReloadErrorCode::OriginChanged`].
+    pub running_origin: Option<String>,
+    /// The origin the file asked for. Populated only for
+    /// [`ReloadErrorCode::OriginChanged`].
+    pub requested_origin: Option<String>,
+}
+
+impl ReloadError {
+    /// A refusal with no origins attached.
+    pub fn new(code: ReloadErrorCode, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
+            running_origin: None,
+            requested_origin: None,
+        }
+    }
+
+    /// Attach the two origins an `origin_changed` refusal is about.
+    #[must_use]
+    pub fn with_origins(
+        mut self,
+        running: impl Into<String>,
+        requested: impl Into<String>,
+    ) -> Self {
+        self.running_origin = Some(running.into());
+        self.requested_origin = Some(requested.into());
+        self
+    }
+}
+
+impl std::fmt::Display for ReloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for ReloadError {}
+
+/// A reload hook. Returns a description of the new state, or a structured
+/// refusal safe to hand back over HTTP.
+///
+/// Boxed as a closure so this module stays independent of the handler, config and
+/// zone types it would otherwise have to know about: the admin surface is
+/// transport, and holds no configuration or precedence knowledge of its own.
+pub type ReloadFn = Arc<dyn Fn() -> Result<ReloadOutcome, ReloadError> + Send + Sync>;
 
 /// Shared state for the admin endpoints.
 #[derive(Clone)]
 pub struct AdminState {
     metrics: Arc<Metrics>,
-    ready: Arc<AtomicBool>,
+    /// The one published phase. Every endpoint answers from a single `Acquire`
+    /// load of it, so two probes landing in the same instant cannot disagree
+    /// about whether this process is going away.
+    lifecycle: Arc<Lifecycle>,
     reloads: Arc<AtomicU64>,
     reload: Option<ReloadFn>,
     token: Option<Arc<str>>,
@@ -58,7 +204,7 @@ pub struct AdminState {
 impl std::fmt::Debug for AdminState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdminState")
-            .field("ready", &self.is_ready())
+            .field("phase", &self.lifecycle.phase())
             .field("reload_enabled", &self.reload.is_some())
             .field("token_configured", &self.token.is_some())
             .finish_non_exhaustive()
@@ -70,11 +216,22 @@ impl AdminState {
     pub fn new(metrics: Arc<Metrics>) -> Self {
         Self {
             metrics,
-            ready: Arc::new(AtomicBool::new(false)),
+            lifecycle: Arc::new(Lifecycle::new()),
             reloads: Arc::new(AtomicU64::new(0)),
             reload: None,
             token: None,
         }
+    }
+
+    /// Answer from the process-wide lifecycle instead of a private one.
+    ///
+    /// `serve` owns the phase because it owns the ordering — the admin endpoints
+    /// only report it. Without this the shutdown sequence would be publishing
+    /// transitions nothing could observe.
+    #[must_use]
+    pub fn with_lifecycle(mut self, lifecycle: Arc<Lifecycle>) -> Self {
+        self.lifecycle = lifecycle;
+        self
     }
 
     /// Enable `POST /reload`, backed by `hook`.
@@ -92,17 +249,17 @@ impl AdminState {
     }
 
     /// Flip `/readyz` to 200. Call this once the DNS sockets are bound.
+    ///
+    /// A thin wrapper over the phase, kept because "ready" is the word every
+    /// caller and every probe uses. It cannot un-drain a process: the transition
+    /// is monotonic, so a `Serving` arriving after a signal is refused.
     pub fn mark_ready(&self) {
-        self.ready.store(true, Ordering::Release);
+        self.lifecycle.enter(Phase::Serving);
     }
 
-    /// Flip `/readyz` back to 503, e.g. while draining during shutdown.
+    /// Flip `/readyz` back to 503 by entering the draining phase.
     pub fn mark_unready(&self) {
-        self.ready.store(false, Ordering::Release);
-    }
-
-    fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.lifecycle.enter(Phase::Draining);
     }
 
     /// Whether a caller from `peer` presenting `headers` may mutate state.
@@ -148,14 +305,50 @@ pub fn router(state: AdminState) -> Router {
         .route("/metrics", get(metrics))
         .route("/version", get(version))
         .route("/reload", post(reload))
+        // Applied to the fallback as well, so even a 404 carries the phase.
+        .layer(middleware::from_fn_with_state(state.clone(), phase_header))
         .with_state(state)
 }
 
-/// Bind and serve the admin endpoints until `shutdown` is cancelled.
-pub async fn serve(addr: SocketAddr, state: AdminState, shutdown: CancellationToken) -> Result<()> {
-    let listener = TcpListener::bind(addr)
+/// Stamp `X-Vega-Phase` on every response.
+///
+/// Read before the handler runs, so the header describes the phase the response
+/// was computed in rather than one it may have advanced to while a body was
+/// being rendered.
+async fn phase_header(State(state): State<AdminState>, request: Request, next: Next) -> Response {
+    let phase = state.lifecycle.phase();
+    let mut response = next.run(request).await;
+    // Infallible for the five lowercase-ASCII phase names, but done fallibly
+    // anyway: this runs on a network-reachable path, and `panic = "abort"` makes
+    // one panic here a full outage.
+    if let Ok(value) = HeaderValue::from_str(phase.as_str()) {
+        response.headers_mut().insert(PHASE_HEADER, value);
+    }
+    response
+}
+
+/// Bind the admin listener.
+///
+/// Separate from [`serve`] so `serve` in `main.rs` can fail *at startup* when
+/// the port is taken (VEGA-044). Binding inside the spawned task instead meant
+/// the process reported itself ready, then lost its admin endpoint moments
+/// later, with the failure visible to nothing.
+pub async fn bind(addr: SocketAddr) -> Result<TcpListener> {
+    TcpListener::bind(addr)
         .await
-        .with_context(|| format!("binding admin listener on {addr}"))?;
+        .with_context(|| format!("binding admin listener on {addr}"))
+}
+
+/// Serve the admin endpoints on `listener` until `shutdown` is cancelled.
+///
+/// `shutdown` is the admin server's own token, never the DNS server's: they are
+/// cancelled at opposite ends of the shutdown sequence so that a probe still
+/// gets an answer after the DNS listeners have gone.
+pub async fn serve(
+    listener: TcpListener,
+    state: AdminState,
+    shutdown: CancellationToken,
+) -> Result<()> {
     let local = listener
         .local_addr()
         .context("reading admin listener address")?;
@@ -185,37 +378,56 @@ pub async fn serve(addr: SocketAddr, state: AdminState, shutdown: CancellationTo
 }
 
 /// Liveness: the process is up and the async runtime is scheduling tasks.
+///
+/// **200 in every phase, including the whole drain, and the body stays exactly
+/// `ok\n`.** Liveness answers "is this process alive"; a draining process is
+/// alive by definition. Returning 503 here is the mistake that gets a container
+/// restarted mid-drain on any `SIGTERM` that does not accompany a delete, and
+/// Docker's `HEALTHCHECK` has the same shape. The phase goes in the header, in
+/// `/version` and in a metric — not in this body, which operators grep.
 async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
-/// Readiness: the DNS listeners are bound and serving.
+/// Readiness: whether to send this process traffic. The only traffic gate.
+///
+/// The 503 body distinguishes "never came up" from "going away", which is the
+/// first question an operator asks at 3am.
 async fn readyz(State(state): State<AdminState>) -> impl IntoResponse {
-    if state.is_ready() {
-        (StatusCode::OK, "ready\n")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready\n")
+    match state.lifecycle.phase() {
+        Phase::Serving => (StatusCode::OK, "ready\n"),
+        Phase::Starting => (StatusCode::SERVICE_UNAVAILABLE, "not ready\n"),
+        Phase::Draining | Phase::Stopping | Phase::Closing => {
+            (StatusCode::SERVICE_UNAVAILABLE, "draining\n")
+        }
     }
 }
 
 /// Prometheus exposition endpoint.
+///
+/// 200 throughout, including `Closing`: a scrape that catches the drain is the
+/// only record we will ever have of it.
 async fn metrics(State(state): State<AdminState>) -> impl IntoResponse {
+    let mut body = state.metrics.render_prometheus();
+    state.lifecycle.render_prometheus(&mut body);
     (
         StatusCode::OK,
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        state.metrics.render_prometheus(),
+        body,
     )
 }
 
 /// Build identity, for humans and for deploy scripts.
 async fn version(State(state): State<AdminState>) -> impl IntoResponse {
+    let phase = state.lifecycle.phase();
     let body = serde_json::json!({
         "name": crate::NAME,
         "version": crate::VERSION,
-        "ready": state.is_ready(),
+        "phase": phase.as_str(),
+        "ready": phase == Phase::Serving,
         "uptime_seconds": state.metrics.uptime().as_secs(),
         "reloads": state.reloads.load(Ordering::Relaxed),
     });
@@ -240,33 +452,64 @@ async fn reload(
         )
     };
 
-    let Some(hook) = state.reload.clone() else {
-        return json(
-            StatusCode::NOT_IMPLEMENTED,
-            serde_json::json!({
-                "error": "reload is not available: the server was started without a config file",
-            }),
-        );
+    let refused = |error: &ReloadError| {
+        let mut body = serde_json::json!({
+            "status": "unchanged",
+            "code": error.code.as_str(),
+            "error": error.detail,
+        });
+        // Present only where they mean something, so a consumer never has to
+        // decide what a null origin would be saying.
+        if let Some(map) = body.as_object_mut() {
+            if let Some(running) = &error.running_origin {
+                map.insert("running_origin".to_owned(), running.as_str().into());
+            }
+            if let Some(requested) = &error.requested_origin {
+                map.insert("requested_origin".to_owned(), requested.as_str().into());
+            }
+        }
+        json(error.code.status(), body)
     };
+
+    let Some(hook) = state.reload.clone() else {
+        return refused(&ReloadError::new(
+            ReloadErrorCode::NotConfigured,
+            "reload is not available: the server was started without a config file",
+        ));
+    };
+
+    // The drain gate comes before the hook is ever reached, and deliberately
+    // before the authorisation check: swapping the zone in a process that is
+    // seconds from exiting cannot help anything, and this is the exact window in
+    // which a blocking reload can wedge the drain (ruling §9.1). The counter not
+    // moving is what proves the hook was never invoked.
+    if state.lifecycle.is_draining() {
+        return refused(&ReloadError::new(
+            ReloadErrorCode::ShuttingDown,
+            "draining: the process is shutting down; the next instance reads the file at startup",
+        ));
+    }
 
     if !state.may_mutate(peer, &headers) {
         warn!(%peer, "rejected unauthorised reload");
-        return json(
-            StatusCode::FORBIDDEN,
-            serde_json::json!({
-                "error": "forbidden: set --admin-token, or call /reload from loopback",
-            }),
-        );
+        return refused(&ReloadError::new(
+            ReloadErrorCode::Forbidden,
+            "forbidden: set --admin-token, or call /reload from loopback",
+        ));
     }
 
     // The hook does file I/O and zone parsing. It is short, but it is blocking,
     // so keep it off the async worker.
     match tokio::task::spawn_blocking(move || hook()).await {
         Ok(Ok(outcome)) => {
+            // Only a success moves the counter: VEGA-049 alerts on this series,
+            // and a counter that also moves on failure makes "reloads are
+            // succeeding" unfalsifiable.
             let count = state.reloads.fetch_add(1, Ordering::Relaxed) + 1;
             info!(
                 origin = %outcome.origin,
                 records = outcome.records,
+                ignored = outcome.ignored.len(),
                 reloads = count,
                 "configuration reloaded"
             );
@@ -277,22 +520,22 @@ async fn reload(
                     "origin": outcome.origin,
                     "records": outcome.records,
                     "reloads": count,
+                    "ignored": outcome.ignored,
                 }),
             )
         }
         Ok(Err(error)) => {
             // The old zone is still serving; a bad edit does not take the server
             // down, it just fails to apply.
-            warn!(%error, "reload rejected, keeping the previous zone");
-            json(
-                StatusCode::BAD_REQUEST,
-                serde_json::json!({ "error": error, "status": "unchanged" }),
-            )
+            warn!(code = error.code.as_str(), detail = %error.detail, "reload rejected, keeping the previous zone");
+            refused(&error)
         }
-        Err(error) => json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({ "error": format!("reload task failed: {error}") }),
-        ),
+        // Only reachable in a debug build: the release profile sets
+        // `panic = "abort"`, so a panicking hook takes the process with it.
+        Err(error) => refused(&ReloadError::new(
+            ReloadErrorCode::Internal,
+            format!("reload task failed: {error}"),
+        )),
     }
 }
 
@@ -314,6 +557,7 @@ mod tests {
             Ok(ReloadOutcome {
                 origin: "example.com".to_owned(),
                 records: 3,
+                ignored: Vec::new(),
             })
         })
     }
@@ -482,7 +726,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_reload_reports_the_error_and_keeps_serving() {
-        let hook: ReloadFn = Arc::new(|| Err("invalid A record value \"nope\"".to_owned()));
+        let hook: ReloadFn = Arc::new(|| {
+            Err(ReloadError::new(
+                ReloadErrorCode::ZoneBuildFailed,
+                "invalid A record value \"nope\"",
+            ))
+        });
         let state = state().with_reload(hook);
 
         let response = send(state, Method::POST, "/reload", "127.0.0.1:1", None).await;
@@ -513,6 +762,386 @@ mod tests {
         let state = state().with_reload(ok_hook());
         let response = send(state, Method::GET, "/reload", "127.0.0.1:1", None).await;
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    // -----------------------------------------------------------------------
+    // VEGA-005 acceptance. Scenarios in features/live-reload.feature.
+    // -----------------------------------------------------------------------
+
+    /// Scenario: Reload is unavailable when the server was started without a config file
+    /// features/live-reload.feature:407
+    #[tokio::test]
+    async fn reload_without_a_hook_names_the_not_configured_code() {
+        let response = send(state(), Method::POST, "/reload", "127.0.0.1:1", None).await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        let body = body_text(response).await;
+        assert!(
+            body.contains("\"code\":\"not_configured\""),
+            "an automation must key on a stable code, never on the prose: {body}"
+        );
+    }
+
+    /// Scenario: Every reload error body carries a code from the documented set
+    /// features/live-reload.feature:368
+    #[tokio::test]
+    async fn an_unauthorised_reload_names_the_forbidden_code() {
+        let state = state().with_reload(ok_hook());
+        let response = send(state, Method::POST, "/reload", "203.0.113.7:1", None).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body = body_text(response).await;
+        assert!(body.contains("\"code\":\"forbidden\""), "{body}");
+    }
+
+    /// Scenario: A failed reload does not increment the reload counter
+    /// features/live-reload.feature:315
+    #[tokio::test]
+    async fn a_failing_reload_does_not_increment_the_reload_counter() {
+        // VEGA-049 is about to alert on this series. A counter that moves on
+        // failure makes "reloads are succeeding" unfalsifiable.
+        let hook: ReloadFn =
+            Arc::new(|| Err(ReloadError::new(ReloadErrorCode::ZoneBuildFailed, "nope")));
+        let state = state().with_reload(hook);
+
+        let failed = send(state.clone(), Method::POST, "/reload", "127.0.0.1:1", None).await;
+        assert_eq!(failed.status(), StatusCode::BAD_REQUEST);
+
+        let version = get_path(state, "/version").await;
+        let body = body_text(version).await;
+        assert!(body.contains("\"reloads\":0"), "{body}");
+    }
+
+    /// Scenario: A reload hook that panics is reported as a server error rather than killing the process
+    /// features/live-reload.feature:415
+    #[tokio::test]
+    async fn a_panicking_hook_is_reported_as_500_and_a_later_reload_still_succeeds() {
+        // Debug builds only: the release profile sets `panic = "abort"`, so this
+        // arm is unreachable there. It is still worth pinning, because the
+        // recovery path (an un-poisoned reload mutex) is what keeps reload
+        // working for the rest of the process's life.
+        let calls = Arc::new(AtomicU64::new(0));
+        let hook: ReloadFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move || {
+                assert!(
+                    calls.fetch_add(1, Ordering::Relaxed) > 0,
+                    "the first reload panics"
+                );
+                Ok(ReloadOutcome {
+                    origin: "example.com".to_owned(),
+                    records: 3,
+                    ignored: Vec::new(),
+                })
+            })
+        };
+        let state = state().with_reload(hook);
+
+        let panicked = send(state.clone(), Method::POST, "/reload", "127.0.0.1:1", None).await;
+        assert_eq!(panicked.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let recovered = send(state.clone(), Method::POST, "/reload", "127.0.0.1:1", None).await;
+        assert_eq!(
+            recovered.status(),
+            StatusCode::OK,
+            "a panic must not brick reload for the rest of the process's life"
+        );
+        let body = body_text(recovered).await;
+        assert!(body.contains("\"reloads\":1"), "{body}");
+    }
+
+    /// Scenario: Every reload error body carries a code from the documented set
+    /// features/live-reload.feature:368
+    #[test]
+    fn every_reload_error_code_has_a_wire_form_and_a_status() {
+        // Enumerated by `match`, not by a list: a variant added without a wire
+        // form, a status and a scenario fails to compile rather than reaching an
+        // operator as an unknown string. The expected strings are spelled out
+        // here so a rename is a deliberate, visible API break.
+        let all = [
+            ReloadErrorCode::ConfigReadFailed,
+            ReloadErrorCode::ConfigParseFailed,
+            ReloadErrorCode::ConfigInvalid,
+            ReloadErrorCode::ZoneBuildFailed,
+            ReloadErrorCode::OriginChanged,
+            ReloadErrorCode::ReloadInProgress,
+            ReloadErrorCode::ShuttingDown,
+            ReloadErrorCode::NotConfigured,
+            ReloadErrorCode::Forbidden,
+            ReloadErrorCode::Internal,
+        ];
+
+        for code in all {
+            let (wire, status) = match code {
+                ReloadErrorCode::ConfigReadFailed => ("config_read_failed", 400),
+                ReloadErrorCode::ConfigParseFailed => ("config_parse_failed", 400),
+                ReloadErrorCode::ConfigInvalid => ("config_invalid", 400),
+                ReloadErrorCode::ZoneBuildFailed => ("zone_build_failed", 400),
+                ReloadErrorCode::OriginChanged => ("origin_changed", 409),
+                ReloadErrorCode::ReloadInProgress => ("reload_in_progress", 409),
+                ReloadErrorCode::ShuttingDown => ("shutting_down", 503),
+                ReloadErrorCode::NotConfigured => ("not_configured", 501),
+                ReloadErrorCode::Forbidden => ("forbidden", 403),
+                ReloadErrorCode::Internal => ("internal", 500),
+            };
+            assert_eq!(code.as_str(), wire);
+            assert_eq!(code.to_string(), wire);
+            assert_eq!(code.status().as_u16(), status, "{wire}");
+        }
+    }
+
+    /// Scenario: A reload that would change the origin is refused
+    /// features/live-reload.feature:162
+    #[tokio::test]
+    async fn an_origin_change_answers_409_with_both_origins() {
+        let hook: ReloadFn = Arc::new(|| {
+            Err(
+                ReloadError::new(ReloadErrorCode::OriginChanged, "refusing to reload")
+                    .with_origins("example.com", "example.net"),
+            )
+        });
+        let state = state().with_reload(hook);
+
+        let response = send(state, Method::POST, "/reload", "127.0.0.1:1", None).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let body = body_text(response).await;
+        assert!(body.contains("\"code\":\"origin_changed\""), "{body}");
+        assert!(
+            body.contains("\"running_origin\":\"example.com\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("\"requested_origin\":\"example.net\""),
+            "{body}"
+        );
+    }
+
+    /// Scenario: A reload with nothing drifted reports an empty ignored array
+    /// features/live-reload.feature:279
+    #[tokio::test]
+    async fn the_ignored_array_is_always_present_and_carries_the_key_paths() {
+        let empty = state().with_reload(ok_hook());
+        let response = send(empty, Method::POST, "/reload", "127.0.0.1:1", None).await;
+        let body = body_text(response).await;
+        assert!(body.contains("\"ignored\":[]"), "{body}");
+
+        let hook: ReloadFn = Arc::new(|| {
+            Ok(ReloadOutcome {
+                origin: "example.com".to_owned(),
+                records: 3,
+                ignored: vec!["server.udp", "server.rate_limit.qps"],
+            })
+        });
+        let drifted = state().with_reload(hook);
+        let response = send(drifted, Method::POST, "/reload", "127.0.0.1:1", None).await;
+        let body = body_text(response).await;
+        assert!(
+            body.contains("\"ignored\":[\"server.udp\",\"server.rate_limit.qps\"]"),
+            "{body}"
+        );
+    }
+
+    /// A refusal that names no origin must not invent one.
+    #[tokio::test]
+    async fn a_refusal_without_origins_omits_those_fields_entirely() {
+        let hook: ReloadFn =
+            Arc::new(|| Err(ReloadError::new(ReloadErrorCode::ConfigReadFailed, "gone")));
+        let state = state().with_reload(hook);
+
+        let response = send(state, Method::POST, "/reload", "127.0.0.1:1", None).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(response).await;
+        assert!(!body.contains("running_origin"), "{body}");
+        assert!(!body.contains("requested_origin"), "{body}");
+    }
+
+    // -----------------------------------------------------------------------
+    // VEGA-046 acceptance. Scenarios in features/shutdown.feature; the status
+    // table is §4.2 of the ruling.
+    // -----------------------------------------------------------------------
+
+    /// A state sharing `lifecycle`, as `serve` wires it in production.
+    fn state_in(lifecycle: &Arc<Lifecycle>) -> AdminState {
+        AdminState::new(Arc::new(Metrics::new())).with_lifecycle(Arc::clone(lifecycle))
+    }
+
+    /// Scenario: healthz stays 200 for the whole drain
+    /// features/shutdown.feature:61
+    #[tokio::test]
+    async fn healthz_is_200_ok_in_every_phase_including_closing() {
+        // The mutation this kills: `/healthz` reporting 503 "for symmetry" with
+        // `/readyz` during the drain. That is what gets the container restarted
+        // mid-drain, turning a clean drain into a hard kill.
+        for phase in [
+            Phase::Starting,
+            Phase::Serving,
+            Phase::Draining,
+            Phase::Stopping,
+            Phase::Closing,
+        ] {
+            let lifecycle = Arc::new(Lifecycle::new());
+            lifecycle.enter(phase);
+            let response = get_path(state_in(&lifecycle), "/healthz").await;
+            assert_eq!(response.status(), StatusCode::OK, "{phase}");
+            assert_eq!(body_text(response).await, "ok\n", "{phase}");
+        }
+    }
+
+    /// Scenario: readyz reports 503 while DNS is still answering
+    /// features/shutdown.feature:35
+    #[tokio::test]
+    async fn readyz_distinguishes_never_came_up_from_going_away() {
+        for (phase, status, body) in [
+            (
+                Phase::Starting,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "not ready\n",
+            ),
+            (Phase::Serving, StatusCode::OK, "ready\n"),
+            (
+                Phase::Draining,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "draining\n",
+            ),
+            (
+                Phase::Stopping,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "draining\n",
+            ),
+            (
+                Phase::Closing,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "draining\n",
+            ),
+        ] {
+            let lifecycle = Arc::new(Lifecycle::new());
+            lifecycle.enter(phase);
+            let response = get_path(state_in(&lifecycle), "/readyz").await;
+            assert_eq!(response.status(), status, "{phase}");
+            assert_eq!(body_text(response).await, body, "{phase}");
+        }
+    }
+
+    /// Scenario: The draining phase is observable
+    /// features/shutdown.feature:70
+    #[tokio::test]
+    async fn every_response_carries_the_phase_header_including_a_404() {
+        let lifecycle = Arc::new(Lifecycle::new());
+        lifecycle.enter(Phase::Draining);
+
+        for path in ["/healthz", "/readyz", "/metrics", "/version", "/nope"] {
+            let response = get_path(state_in(&lifecycle), path).await;
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-vega-phase")
+                    .and_then(|value| value.to_str().ok()),
+                Some("draining"),
+                "{path} answered without the phase header"
+            );
+        }
+    }
+
+    /// Scenario: The draining phase is observable
+    /// features/shutdown.feature:70
+    #[tokio::test]
+    async fn metrics_and_version_report_the_phase() {
+        let lifecycle = Arc::new(Lifecycle::new());
+        let state = state_in(&lifecycle);
+        lifecycle.enter(Phase::Serving);
+
+        let body = body_text(get_path(state.clone(), "/metrics").await).await;
+        assert!(body.contains("dns_shutdown_phase 1"), "{body}");
+        assert!(
+            !body.contains("dns_shutdown_deadline_seconds "),
+            "the deadline gauge must not appear before a signal arms it: {body}"
+        );
+
+        lifecycle.enter(Phase::Stopping);
+        let body = body_text(get_path(state.clone(), "/metrics").await).await;
+        assert!(body.contains("dns_shutdown_phase 3"), "{body}");
+
+        let body = body_text(get_path(state, "/version").await).await;
+        assert!(body.contains("\"phase\":\"stopping\""), "{body}");
+        assert!(body.contains("\"ready\":false"), "{body}");
+    }
+
+    /// Scenario: A reload during the drain is refused and the hook is never invoked
+    /// features/shutdown.feature:214
+    #[tokio::test]
+    async fn a_reload_once_draining_is_refused_and_never_reaches_the_hook() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let hook: ReloadFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(ReloadOutcome {
+                    origin: "example.com".to_owned(),
+                    records: 3,
+                    ignored: Vec::new(),
+                })
+            })
+        };
+        let lifecycle = Arc::new(Lifecycle::new());
+        let state = state_in(&lifecycle).with_reload(hook);
+        lifecycle.enter(Phase::Serving);
+
+        let ok = send(state.clone(), Method::POST, "/reload", "127.0.0.1:1", None).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        lifecycle.enter(Phase::Draining);
+        let refused = send(state.clone(), Method::POST, "/reload", "127.0.0.1:1", None).await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_text(refused).await;
+        assert!(body.contains("\"code\":\"shutting_down\""), "{body}");
+        assert!(body.contains("draining"), "{body}");
+        assert!(body.contains("unchanged"), "{body}");
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the hook ran during the drain; the counter not moving is the only \
+             thing that proves it did not"
+        );
+        let version = body_text(get_path(state, "/version").await).await;
+        assert!(version.contains("\"reloads\":1"), "{version}");
+    }
+
+    /// The gate is the phase, not the caller: an authorised operator cannot
+    /// reload a process that is going away either.
+    #[tokio::test]
+    async fn even_an_authorised_reload_is_refused_once_draining() {
+        let lifecycle = Arc::new(Lifecycle::new());
+        let state = state_in(&lifecycle)
+            .with_reload(ok_hook())
+            .with_token(Some("s3cret".to_owned()));
+        lifecycle.enter(Phase::Stopping);
+
+        let response = send(
+            state,
+            Method::POST,
+            "/reload",
+            "127.0.0.1:1",
+            Some("s3cret"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn marking_ready_after_the_drain_has_started_cannot_re_advertise_us() {
+        // A slow startup racing a fast SIGTERM. The monotonic phase is what makes
+        // this impossible; without it `/readyz` would flip back to 200 and a load
+        // balancer would send traffic to a process that is closing its sockets.
+        let lifecycle = Arc::new(Lifecycle::new());
+        let state = state_in(&lifecycle);
+        lifecycle.enter(Phase::Draining);
+
+        state.mark_ready();
+        let response = get_path(state, "/readyz").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(lifecycle.phase(), Phase::Draining);
     }
 
     #[test]

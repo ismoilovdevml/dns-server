@@ -187,20 +187,51 @@ pub async fn reload_server(addr: SocketAddr, token: Option<&str>, as_json: bool)
             ),
             None => println!("{} reloaded {}", ui::tick(), ui::muted(addr)),
         }
+        // An operator who never reads the JSON must still see what the file asked
+        // for and the running process could not do.
+        let ignored = ignored_keys(&parsed);
+        if !ignored.is_empty() {
+            println!(
+                "{} not applied (restart to change): {}",
+                ui::cross(),
+                ui::bad(ignored.join(", "))
+            );
+        }
     } else {
         let detail = parsed
             .get("error")
             .and_then(serde_json::Value::as_str)
             .map_or_else(|| response.body.trim().to_owned(), str::to_owned);
+        // The code is the stable half: 400 means "fix the file", 409 means "this
+        // needs a restart". Print it so a runbook can be followed from the
+        // terminal, not just from --json.
+        let code = parsed
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("error");
         println!(
-            "{} reload refused by {} (HTTP {}): {}",
+            "{} reload refused by {} (HTTP {} {}): {}",
             ui::cross(),
             ui::muted(addr),
             response.status,
+            code,
             ui::bad(detail)
         );
     }
     Ok(response.is_success())
+}
+
+/// The TOML key paths a reload reported as not applied.
+fn ignored_keys(body: &serde_json::Value) -> Vec<&str> {
+    body.get("ignored")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn maybe_bump(editor: &mut ConfigEditor, requested: bool, change: Change) -> Result<Option<u32>> {

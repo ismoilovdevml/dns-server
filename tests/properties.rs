@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use hickory_proto::rr::{LowerName, Name, RData, RecordType};
+use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use proptest::prelude::*;
 use vega::{
     config::{RecordSpec, SoaSpec, ZoneConfig},
@@ -352,6 +352,439 @@ proptest! {
         prop_assert_eq!(zone.record_count(), expected);
     }
 
+}
+
+// ---------------------------------------------------------------------------
+// VEGA-065 — the wildcard parent walk, differentially.
+//
+// Spec: features/wildcards.feature, "The bounded walk agrees with the naive
+// walk on every zone and every name".
+// Ruling: .claude/backlog/decisions/VEGA-065-bounded-wildcard-walk.md, §B.
+//
+// VEGA-065 replaces an O(labels²) `base_name()` walk with a bounded probe over
+// a `u128` bitmap of wildcard depths. The ruling's acceptance criterion is that
+// the replacement is *strictly behaviour-preserving*: same `Answer`, same
+// records, for every input — including the three ways today's walk violates
+// RFC 4592, which are VEGA-006/009/010's to fix and not this issue's.
+//
+// "Behaviour-preserving" is not something example tests can establish, so the
+// naive walk is transcribed below as a reference implementation and the real
+// `Zone::lookup` is diffed against it over generated zones and names. A
+// hand-built 22-case version of this harness is what caught the rejected
+// patch's `num_labels()` bug; this one generalises it.
+// ---------------------------------------------------------------------------
+
+/// Labels that generated wildcard parents and generated query names both draw
+/// from, so a random query actually lands on a random wildcard.
+///
+/// `*` is deliberately in the alphabet. RFC 4592 §2.1.3 removed RFC 1035
+/// §4.3.3's ban on further asterisks inside a wildcard's owner name, and an
+/// asterisk that is not leftmost is an ordinary literal label. Names shaped
+/// like `*.dev.example.test.` and `x.*.dev.example.test.` are exactly the ones
+/// `LowerName::num_labels()` miscounts, so leaving them out would make this
+/// property blind to the bug it exists to catch.
+fn walk_label() -> impl Strategy<Value = String> {
+    prop::sample::select(vec!["a", "b", "dev", "*"]).prop_map(str::to_owned)
+}
+
+/// A record type/value pair, minus CNAME.
+///
+/// The CNAME chase is a different branch of `Zone::resolve` and VEGA-065 does
+/// not touch it; modelling it here would put a second, unrelated
+/// transcription in the reference and blur what a disagreement means.
+fn walk_typed_value() -> impl Strategy<Value = (String, String)> {
+    prop_oneof![
+        (0u8..=255, 0u8..=255).prop_map(|(a, b)| ("A".to_owned(), format!("203.0.{a}.{b}"))),
+        (0u16..=0xffff).prop_map(|a| ("AAAA".to_owned(), format!("2001:db8::{a:x}"))),
+        prop::sample::select(vec!["hello", "x"])
+            .prop_map(|t| ("TXT".to_owned(), format!("\"{t}\""))),
+        (1u16..100).prop_map(|p| ("MX".to_owned(), format!("{p} mail.{ORIGIN}."))),
+    ]
+}
+
+/// A wildcard entry whose parent lands somewhere in `[ℓ(O), ℓ(O) + 6]`.
+fn walk_wildcard_spec() -> impl Strategy<Value = RecordSpec> {
+    (
+        prop::collection::vec(walk_label(), 0..7),
+        walk_typed_value(),
+        prop::option::of(1u32..7200),
+    )
+        .prop_map(|(labels, (record_type, value), ttl)| RecordSpec {
+            name: if labels.is_empty() {
+                "*".to_owned()
+            } else {
+                format!("*.{}", labels.join("."))
+            },
+            record_type,
+            ttl,
+            values: vec![value],
+        })
+}
+
+/// An ordinary entry, so `names.contains` — the check that stops the walk from
+/// running at all — is exercised alongside the wildcards.
+fn walk_exact_spec() -> impl Strategy<Value = RecordSpec> {
+    (
+        prop::collection::vec(walk_label(), 0..4),
+        walk_typed_value(),
+        prop::option::of(1u32..7200),
+    )
+        .prop_map(|(labels, (record_type, value), ttl)| RecordSpec {
+            name: if labels.is_empty() {
+                "@".to_owned()
+            } else {
+                labels.join(".")
+            },
+            record_type,
+            ttl,
+            values: vec![value],
+        })
+}
+
+fn walk_zone_config() -> impl Strategy<Value = ZoneConfig> {
+    (
+        prop::collection::vec(walk_wildcard_spec(), 0..5),
+        prop::collection::vec(walk_exact_spec(), 0..4),
+    )
+        .prop_map(|(wildcards, exacts)| {
+            let mut records = wildcards;
+            records.extend(exacts);
+            ZoneConfig {
+                origin: ORIGIN.to_owned(),
+                default_ttl: 300,
+                builtins: false,
+                soa: None,
+                records,
+            }
+        })
+}
+
+/// A query name, in the six shapes the ruling calls out.
+///
+/// The deep arms are sized against RFC 1035 §2.3.4's 255 octets: under
+/// `example.test.` (14 octets) a single-character label costs 2, so 120 of them
+/// give a 254-octet, 122-label name — the longest that can reach `Zone::resolve`
+/// in this zone.
+fn walk_query_name() -> impl Strategy<Value = String> {
+    prop_oneof![
+        // In-zone, short, from the shared alphabet: lands on wildcards often.
+        4 => prop::collection::vec(walk_label(), 0..7).prop_map(|ls| if ls.is_empty() {
+            format!("{ORIGIN}.")
+        } else {
+            format!("{}.{ORIGIN}.", ls.join("."))
+        }),
+        // Leftmost label is an asterisk: the shape num_labels() undercounts.
+        3 => prop::collection::vec(walk_label(), 0..6).prop_map(|ls| if ls.is_empty() {
+            format!("*.{ORIGIN}.")
+        } else {
+            format!("*.{}.{ORIGIN}.", ls.join("."))
+        }),
+        // Deep, up to the octet limit.
+        2 => (0usize..=120).prop_map(|n| {
+            let mut s = String::with_capacity(n * 2 + 14);
+            for _ in 0..n {
+                s.push_str("a.");
+            }
+            s.push_str(ORIGIN);
+            s.push('.');
+            s
+        }),
+        // Deep, but ending on labels a wildcard parent could match.
+        2 => (0usize..=100, prop::collection::vec(walk_label(), 1..4)).prop_map(|(n, tail)| {
+            let mut s = String::with_capacity(n * 2 + 32);
+            for _ in 0..n {
+                s.push_str("a.");
+            }
+            s.push_str(&tail.join("."));
+            s.push('.');
+            s.push_str(ORIGIN);
+            s.push('.');
+            s
+        }),
+        1 => Just(format!("{ORIGIN}.")),
+        1 => Just(".".to_owned()),
+        1 => prop::collection::vec(walk_label(), 1..3)
+            .prop_map(|ls| format!("{}.example.invalid.", ls.join("."))),
+    ]
+}
+
+fn walk_query_type() -> impl Strategy<Value = RecordType> {
+    prop::sample::select(vec![
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::TXT,
+        RecordType::MX,
+        RecordType::NS,
+    ])
+}
+
+/// A transcription of `Zone`'s build and lookup as they stand *before*
+/// VEGA-065, restricted to the non-CNAME, non-ANY path.
+///
+/// This is the "before" side of the differential. It must not be updated to
+/// match a new implementation: the moment it is, the property stops testing
+/// anything. If the real `Zone` and this disagree, one of them is wrong and the
+/// ruling says it is the real one.
+struct NaiveZone {
+    origin: LowerName,
+    exact: std::collections::HashMap<(LowerName, RecordType), Vec<Record>>,
+    wildcard: std::collections::HashMap<(LowerName, RecordType), Vec<Record>>,
+    names: std::collections::HashSet<LowerName>,
+}
+
+impl NaiveZone {
+    /// `None` when the config would not build; the real `Zone` is skipped too.
+    fn build(cfg: &ZoneConfig) -> Option<Self> {
+        let mut origin: Name = cfg.origin.parse().ok()?;
+        origin.set_fqdn(true);
+        let lower_origin = LowerName::from(origin.clone());
+
+        let mut zone = Self {
+            origin: lower_origin.clone(),
+            exact: std::collections::HashMap::new(),
+            wildcard: std::collections::HashMap::new(),
+            names: std::collections::HashSet::new(),
+        };
+
+        for spec in &cfg.records {
+            let record_type: RecordType = spec.record_type.to_uppercase().parse().ok()?;
+            let label = spec.name.trim();
+            let is_wildcard = label == "*" || label.starts_with("*.");
+            let owner_label = if is_wildcard {
+                label
+                    .strip_prefix('*')
+                    .unwrap_or("")
+                    .trim_start_matches('.')
+            } else {
+                label
+            };
+            let owner = if owner_label.is_empty() || owner_label == "@" {
+                origin.clone()
+            } else {
+                Name::parse(owner_label, Some(&origin)).ok()?
+            };
+
+            let ttl = spec.ttl.unwrap_or(cfg.default_ttl);
+            let mut records = Vec::with_capacity(spec.values.len());
+            for value in &spec.values {
+                let rdata = RData::try_from_str(record_type, value).ok()?;
+                records.push(Record::from_rdata(owner.clone(), ttl, rdata));
+            }
+
+            let lower = LowerName::from(owner);
+            let key = (lower.clone(), record_type);
+            if is_wildcard {
+                zone.wildcard.entry(key).or_default().extend(records);
+            } else {
+                zone.names.insert(lower);
+                zone.exact.entry(key).or_default().extend(records);
+            }
+        }
+
+        zone.names.insert(lower_origin);
+        Some(zone)
+    }
+
+    fn lookup(&self, name: &LowerName, record_type: RecordType) -> Answer {
+        if !self.origin.zone_of(name) {
+            return Answer::NxDomain;
+        }
+        if let Some(records) = self.exact.get(&(name.clone(), record_type)) {
+            return Answer::Records(records.clone());
+        }
+        if self.names.contains(name) {
+            return Answer::NoData;
+        }
+        if !self.wildcard.is_empty() {
+            // Verbatim src/zone.rs:294-312 as of the VEGA-065 ruling.
+            let mut parent = name.base_name();
+            loop {
+                if let Some(records) = self.wildcard.get(&(parent.clone(), record_type)) {
+                    let qname = Name::from(name.clone());
+                    return Answer::Records(
+                        records
+                            .iter()
+                            .map(|r| Record::from_rdata(qname.clone(), r.ttl, r.data.clone()))
+                            .collect(),
+                    );
+                }
+                if parent == self.origin || parent.is_root() {
+                    break;
+                }
+                parent = parent.base_name();
+            }
+        }
+        Answer::NxDomain
+    }
+}
+
+/// Canonical form of an answer, for comparison. Records are compared as a
+/// multiset of (owner, type, ttl, rdata) so `HashMap` iteration order cannot
+/// make this flap.
+fn canonical(answer: &Answer) -> (u8, Vec<String>) {
+    match answer {
+        Answer::NxDomain => (0, Vec::new()),
+        Answer::NoData => (1, Vec::new()),
+        Answer::Records(records) => {
+            let mut rendered: Vec<String> = records
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{} {} {} {}",
+                        r.name.to_string().to_lowercase(),
+                        r.record_type(),
+                        r.ttl,
+                        r.data
+                    )
+                })
+                .collect();
+            rendered.sort();
+            (2, rendered)
+        }
+    }
+}
+
+/// The upstream fact the VEGA-065 ruling rests on, pinned so a hickory upgrade
+/// cannot quietly invalidate it.
+///
+/// `Name::num_labels()` is documented as returning the label count *discounting
+/// `*`*, while `Name::trim_to` indexes by the raw `label_ends` count. Mixing the
+/// two shifts a wildcard probe one label off for every name whose leftmost label
+/// is an asterisk. That is why `num_labels` is banned in `src/zone.rs` and label
+/// counts come from `name.iter().len()` instead — `LabelIter` is an
+/// `ExactSizeIterator`, so the raw count is a field read.
+///
+/// This test lives here rather than in `src/zone.rs` precisely so that
+/// `grep num_labels src/zone.rs` stays empty and the ban is greppable.
+#[test]
+fn hickorys_num_labels_discounts_a_leading_asterisk_but_trim_to_does_not() {
+    for (name, num_labels, raw) in [
+        ("example.test.", 2u8, 2usize),
+        ("*.example.test.", 2, 3),
+        ("*.dev.example.test.", 3, 4),
+        ("*.*.dev.example.test.", 4, 5),
+        ("a.*.dev.example.test.", 5, 5),
+    ] {
+        let n = lower(name);
+        assert_eq!(
+            n.num_labels(),
+            num_labels,
+            "{name}: num_labels() changed; the VEGA-065 ruling's arithmetic must be rechecked"
+        );
+        assert_eq!(
+            n.iter().len(),
+            raw,
+            "{name}: raw label count changed; the wildcard depth bitmap indexes by this"
+        );
+    }
+
+    // And the index space `trim_to` uses is the raw one: the last `k` raw
+    // labels, asterisks counted like any other label.
+    let deep = Name::from(lower("*.*.dev.example.test."));
+    assert_eq!(
+        deep.trim_to(4).to_string(),
+        "*.dev.example.test.",
+        "trim_to indexes raw labels; a wildcard key at raw depth 4 is only \
+         reachable by probing 4, never by probing num_labels() == 3"
+    );
+    assert_eq!(deep.trim_to(2).to_string(), "example.test.");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// INVARIANT (VEGA-065): bounding the wildcard parent walk changes its cost,
+    /// never its answer. For every zone and every query name, `Zone::lookup`
+    /// must return the same `Answer` — same variant, same owner names, same
+    /// TTLs, same rdata — as a naive `base_name()` walk over the same zone.
+    ///
+    /// This is the property that would have rejected the proposed patch: it
+    /// derived probe depths from `LowerName::num_labels()`, which discounts a
+    /// leading asterisk, while probing with `Name::trim_to`, which does not, so
+    /// it answered NXDOMAIN for four shapes the naive walk answers. The
+    /// generators put asterisks in both the zone and the query on purpose.
+    #[test]
+    fn the_wildcard_walk_agrees_with_a_naive_base_name_walk(
+        cfg in walk_zone_config(),
+        name in walk_query_name(),
+        qtype in walk_query_type(),
+    ) {
+        let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
+        let Some(naive) = NaiveZone::build(&cfg) else { return Ok(()); };
+        let queried = lower(&name);
+
+        let actual = zone.lookup(&queried, qtype);
+        let expected = naive.lookup(&queried, qtype);
+
+        prop_assert_eq!(
+            canonical(&actual),
+            canonical(&expected),
+            "{} {} disagreed with the naive walk\n  zone: {:?}\n  got:      {:?}\n  expected: {:?}",
+            name,
+            qtype,
+            cfg.records.iter().map(|r| format!("{} {}", r.name, r.record_type)).collect::<Vec<_>>(),
+            actual,
+            expected
+        );
+    }
+
+    /// INVARIANT (VEGA-065): the walk's cost is a property of the zone, not of
+    /// the query. Two query names that differ only in how many labels are
+    /// stacked above the wildcard's parent must get the same answer, modulo the
+    /// owner-name rewrite — so no bound on the walk may be derived from the
+    /// query name's depth.
+    ///
+    /// Stated separately from the differential because it is the specific thing
+    /// a `deepest = num_labels(qname) - 1` clamp gets wrong: it silently drops
+    /// the probe entirely once the query is shallow enough.
+    #[test]
+    fn adding_labels_above_a_covered_name_does_not_change_whether_it_is_covered(
+        cfg in walk_zone_config(),
+        tail in prop::collection::vec(walk_label(), 0..5),
+        extra in 0usize..40,
+        qtype in walk_query_type(),
+    ) {
+        let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
+
+        let base = if tail.is_empty() {
+            format!("{ORIGIN}.")
+        } else {
+            format!("{}.{ORIGIN}.", tail.join("."))
+        };
+        let mut deeper = String::new();
+        for _ in 0..extra {
+            deeper.push_str("z.");
+        }
+        deeper.push_str(&base);
+
+        let shallow = zone.lookup(&lower(&base), qtype);
+        let deep = zone.lookup(&lower(&deeper), qtype);
+
+        // A name that exists exactly, or is the apex, is answered without the
+        // walk; only the synthesised case is comparable.
+        prop_assume!(extra > 0);
+        if let Answer::Records(records) = &shallow {
+            // The shallow name was synthesised from a wildcard iff its answer
+            // is rewritten to it and the zone holds no exact set there.
+            let synthesised = records
+                .iter()
+                .all(|r| r.name.to_string().to_lowercase() == base.to_lowercase())
+                && !cfg.records.iter().any(|s| {
+                    !is_wildcard(&s.name) && qualify(&s.name).to_lowercase() == base.to_lowercase()
+                });
+            if synthesised {
+                prop_assert!(
+                    matches!(deep, Answer::Records(_)),
+                    "{} is covered but {} ({} labels deeper) is not: the walk is \
+                     bounded by the query name instead of by the zone\n  zone: {:?}",
+                    base,
+                    deeper,
+                    extra,
+                    cfg.records.iter().map(|r| format!("{} {}", r.name, r.record_type)).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -45,6 +45,11 @@ Feature: Admin HTTP API
     Then the process exits non-zero
 
   # -------------------------------------------------------------- READYZ
+  #
+  # The per-phase status codes of /healthz, /readyz, /metrics, /version and
+  # /reload during a shutdown drain are specified in features/shutdown.feature
+  # (VEGA-046). Do not re-specify them here: this file owns the endpoints at
+  # rest, that one owns them while the process is going away.
 
   @happy @enforced src/admin.rs:363
   Scenario: readyz answers 503 before the DNS listeners are bound

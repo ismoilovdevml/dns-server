@@ -109,6 +109,20 @@ Feature: Configuration precedence and validation
     When the configuration is resolved
     Then the effective origin is "from-env.test"
 
+  @hostile @enforced tests/reload.rs:624
+  Scenario: A reload keeps an origin supplied by the environment
+    # The env tier must survive a reload for the same reason the CLI tier must.
+    # Re-reading std::env at reload would be a fiction anyway: editing a systemd
+    # EnvironmentFile does not touch a live process's environment, and calling
+    # setenv from a worker thread is the data race Rust marks unsafe — which
+    # `unsafe_code = "forbid"` rules out regardless. The already-parsed GlobalArgs
+    # is frozen instead.
+    Given a config file setting zone origin to "from-the-file.test"
+    And the environment sets VEGA_DOMAIN to "from-the-env.test"
+    When a loopback caller posts to /reload
+    Then the response status is 200
+    And the effective origin is still "from-the-env.test"
+
   @boundary @gap
   Scenario: A CLI flag overrides an environment variable
     Given the environment sets VEGA_DOMAIN to "from-env.test"
@@ -145,6 +159,45 @@ Feature: Configuration precedence and validation
     When tracing is initialised
     Then the trace filter is used
     And a warning notes that RUST_LOG overrides --log-level
+
+  # -------------------------------------- ONE PRECEDENCE IMPLEMENTATION
+  #
+  # VEGA-005 group B. `reload_hook` must hold no precedence logic of its own: it
+  # calls Config::load against the frozen startup invocation — the same function
+  # serve_command calls — and then compares. One precedence implementation, or the
+  # two paths drift again, which is exactly how VEGA-005 happened. These are the
+  # structural guarantees; the behavioural ones live in features/live-reload.feature.
+
+  @hostile @enforced tests/reload.rs:676
+  Scenario: A reloaded server and a freshly started server resolve the same config
+    # Differential, not tautological: one process is reloaded and the other is
+    # started fresh from the identical invocation and file, and the two are then
+    # compared through every channel the effective config is observable on. A
+    # precedence rule added to only one path changes one of them and fails this.
+    Given an invocation and a config file that disagree about every setting
+    When one server is started from them and reloaded
+    And a second server is started from them and not reloaded
+    Then the two resolve the same origin, records, built-ins, token and answers
+
+  @hostile @enforced tests/reload.rs:733
+  Scenario: No serving code resolves a configuration from a default invocation
+    # GlobalArgs::default() is not a neutral element. Config::merge treats an
+    # absent CLI value as "fall through to the file, then to the hardcoded
+    # default" at src/config.rs:338, so feeding it default() does not merely lose
+    # the flags — it silently selects a different zone. Test code may build one;
+    # serving code may not.
+    Given the serving code under src/, with its #[cfg(test)] modules excluded
+    When it is scanned for GlobalArgs::default()
+    Then there is no occurrence
+
+  @boundary @enforced tests/reload.rs:761
+  Scenario: Every configuration field is classified reloadable or fixed
+    # The ruling's partition table, made executable. The test destructures Config
+    # exhaustively, so adding a field is a compile error until it is classified
+    # and a reload scenario covers it.
+    Given the Config struct
+    When every field is enumerated
+    Then each one is reloadable, fixed for the process lifetime, or not operator-settable
 
   # ------------------------------------------------ FILE BEATS DEFAULT
 

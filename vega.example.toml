@@ -22,6 +22,14 @@ admin_listen = "127.0.0.1:9100"
 # Close TCP connections that go idle. Guards against slow-loris style hoarding.
 tcp_timeout_secs = 10
 
+# On SIGTERM, keep answering DNS for this long while /readyz reports 503, so a
+# load balancer or kube-proxy can take this instance out of rotation before it
+# stops answering. 0..=300; 0 means "no window", which is right for tests and
+# wrong in production. Keep it at or above tcp_timeout_secs, and keep your
+# supervisor's stop timeout at least 7s above it — 30s for the default 15s
+# (TimeoutStopSec, terminationGracePeriodSeconds, stop_grace_period).
+shutdown_drain_secs = 15
+
 # "pretty" for a terminal, "json" for log shipping.
 log_format = "json"
 log_level = "info"

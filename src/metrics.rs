@@ -138,6 +138,25 @@ impl Metrics {
         self.queries_total.load(Ordering::Relaxed)
     }
 
+    /// Best-effort count of requests currently being handled.
+    ///
+    /// Entry (`query`) and exit (`observe_latency`) are already counted on every
+    /// path, so this costs the query path *nothing*: the alternative — an
+    /// `AtomicUsize` incremented and decremented per request — is exactly the
+    /// single contended hot atomic the performance budget forbids, on a path
+    /// whose p99 is microseconds.
+    ///
+    /// The writers stay `Relaxed`, so a sample can be skewed either way: a stale
+    /// `queries_total` with a fresh count (hence `saturating_sub`), or a fresh
+    /// total with a stale count, which over-reports and therefore errs toward
+    /// waiting. Both are safe because the only caller — the `Stopping` phase —
+    /// caps how long it will wait. Read during shutdown only.
+    pub fn in_flight(&self) -> u64 {
+        self.queries_total
+            .load(Ordering::Acquire)
+            .saturating_sub(self.latency_count.load(Ordering::Acquire))
+    }
+
     /// Seconds since the process started serving.
     pub fn uptime(&self) -> Duration {
         self.started.elapsed()
@@ -420,6 +439,29 @@ mod tests {
         let text = m.render_prometheus();
         assert!(text.contains("dns_rate_limited_total 2"), "{text}");
         assert!(text.contains("dns_send_errors_total 1"), "{text}");
+    }
+
+    /// Scenario: A query received in the final 50 milliseconds of the window is answered
+    /// features/shutdown.feature:162
+    #[test]
+    fn in_flight_is_entries_minus_exits_and_never_underflows() {
+        let m = Metrics::new();
+        assert_eq!(m.in_flight(), 0);
+
+        m.query(Transport::Udp);
+        m.query(Transport::Tcp);
+        assert_eq!(m.in_flight(), 2, "two entered, neither has exited");
+
+        m.observe_latency(Duration::from_micros(10));
+        assert_eq!(m.in_flight(), 1);
+        m.observe_latency(Duration::from_micros(10));
+        assert_eq!(m.in_flight(), 0);
+
+        // The counters are Relaxed and read separately, so a sample can see more
+        // exits than entries. Saturating is what keeps that from becoming a
+        // gigantic in-flight count that would burn the whole quiesce cap.
+        m.observe_latency(Duration::from_micros(10));
+        assert_eq!(m.in_flight(), 0);
     }
 
     #[test]

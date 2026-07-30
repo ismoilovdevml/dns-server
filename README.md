@@ -43,7 +43,7 @@ vega query www.example.com A
 |---|---|
 | **Records** | A, AAAA, CNAME, TXT, MX, NS, SRV, CAA, SOA and anything else Hickory parses, in zone-file syntax |
 | **DNS correctness** | authoritative answers, wildcards, in-zone CNAME chasing, NODATA vs NXDOMAIN, SOA in the authority section, EDNS(0), TCP fallback |
-| **Operations** | live zone reload with no dropped queries, graceful `SIGTERM` drain, `/healthz` `/readyz` `/metrics` `/version` |
+| **Operations** | live zone reload with no dropped queries, a [`SIGTERM` drain](#shutdown-and-draining) that keeps answering while `/readyz` reports 503, `/healthz` `/readyz` `/metrics` `/version` |
 | **Protection** | per-source-IP token bucket, `REFUSED` for out-of-zone queries, no dynamic UPDATE surface |
 | **Observability** | Prometheus metrics, structured JSON logs, per-query latency histogram |
 | **Deployment** | static musl binaries, distroless container, systemd unit, Compose and Kubernetes manifests |
@@ -248,6 +248,7 @@ udp = ["0.0.0.0:53", "[::]:53"]
 tcp = ["0.0.0.0:53", "[::]:53"]
 admin_listen = "127.0.0.1:9100"    # unauthenticated — keep it private
 tcp_timeout_secs = 10
+shutdown_drain_secs = 15           # keep answering this long after SIGTERM
 log_format = "json"                # or "pretty"
 log_level = "info"
 
@@ -289,6 +290,7 @@ values = ["203.0.113.10", "203.0.113.11"]
 | `--rate-limit-qps N` | `VEGA_RATE_LIMIT_QPS` | per-IP queries per second; `0` disables |
 | `--rate-limit-burst N` | `VEGA_RATE_LIMIT_BURST` | bucket size |
 | `--tcp-timeout-secs N` | `VEGA_TCP_TIMEOUT_SECS` | TCP idle timeout |
+| `--shutdown-drain-secs N` | `VEGA_SHUTDOWN_DRAIN_SECS` | seconds to keep answering after `SIGTERM` while `/readyz` is 503; `0..=300`, default `15` |
 | `--no-builtins` | `VEGA_NO_BUILTINS` | disable the diagnostic sub-zones |
 | `--log-format FMT` | `VEGA_LOG_FORMAT` | `pretty` or `json` |
 | `--log-level FILTER` | `VEGA_LOG_LEVEL` | `RUST_LOG` syntax |
@@ -333,6 +335,10 @@ no shell, no package manager, runs as uid 65532. Binding `:53` as a non-root use
 needs exactly `NET_BIND_SERVICE` and nothing else. `HEALTHCHECK` works because
 the binary probes its own `/healthz` — no curl in the image.
 
+Stop it with `docker stop -t 30 vega`: the default 10 s timeout would `SIGKILL`
+the container part way through the 15 s drain described
+[below](#shutdown-and-draining).
+
 Or use [`deploy/docker-compose.yml`](deploy/docker-compose.yml):
 
 ```bash
@@ -353,7 +359,9 @@ journalctl -u vega -f
 The [unit](deploy/systemd/vega.service) runs as a dedicated user with
 `CAP_NET_BIND_SERVICE` as its entire capability set, `ProtectSystem=strict`, a
 seccomp filter, and `MemoryDenyWriteExecute=yes`. `ExecStartPre` validates the
-config, so a typo fails the start instead of half-starting.
+config, so a typo fails the start instead of half-starting. `TimeoutStopSec=30`
+with `KillMode=mixed` gives the [drain](#shutdown-and-draining) room to finish
+before systemd escalates to `SIGKILL`.
 
 > **`Address already in use` on :53?** `systemd-resolved` usually owns it.
 > `sudo systemctl disable --now systemd-resolved`, or listen on another port.
@@ -369,6 +377,93 @@ probes against the admin port, a `PodDisruptionBudget`, and
 `externalTrafficPolicy: Local` so the client IP survives — without it `myip.` and
 the per-source rate limiter both see the node instead of the caller.
 
+The rollout is `maxUnavailable: 0`, so a new pod is Ready before an old one is
+told to stop, and the old one then [drains](#shutdown-and-draining) for 15 s
+inside a 30 s grace period. `externalTrafficPolicy: Local` makes node removal
+depend on your cloud load balancer's own health check, which is usually slower
+than kube-proxy — if yours needs longer than 15 s, raise `shutdown_drain_secs`
+and `terminationGracePeriodSeconds` together.
+
+### Shutdown and draining
+
+Stopping a name server is the risky part of every deploy: a process that exits
+the instant it is asked to still holds a load balancer's endpoint, an anycast
+route, or a resolver's cached address for seconds afterwards, and every query
+that arrives in that gap is lost silently — you never receive it, so it never
+appears in your own metrics.
+
+`SIGTERM` therefore starts a **drain** rather than an exit:
+
+| Phase | `/healthz` | `/readyz` | DNS | |
+|---|---|---|---|---|
+| `Serving` | 200 | 200 | answering | normal operation |
+| `Draining` | 200 | **503** | **still answering** | `shutdown_drain_secs`, default 15s |
+| `Stopping` | 200 | 503 | finishing in-flight | up to 1s |
+| `Closing` | 200 | 503 | closed | admin server last, so probes stay answerable |
+
+Readiness is the only traffic gate. `/healthz` stays 200 for the whole drain on
+purpose: a draining process is alive, and a liveness probe that fails during a
+drain gets the container restarted in the middle of it. Every admin response
+carries `X-Vega-Phase`, and `/metrics` exports `dns_shutdown_phase` plus
+`dns_shutdown_deadline_seconds` once a signal has arrived. `SIGINT` runs the
+same sequence with a zero-length window, so Ctrl-C is still instant. A second
+`SIGTERM` collapses the remaining window; `SIGKILL` remains the way to stop the
+process immediately.
+
+The timings are a system, not a set of independent knobs:
+
+```text
+W  = shutdown_drain_secs = 15s   drain window
+S  = 5s                          stop budget (quiesce + socket close), fixed
+D  = W + S = 20s                 hard deadline; exceeding it exits 3
+Wd = D + 2 = 22s                 in-process watchdog, the guaranteed death
+```
+
+Every supervisor's grace period must therefore be **above 22 s**, and any
+liveness probe must not be able to declare the process dead inside 20 s:
+
+| | |
+|---|---|
+| Kubernetes | `terminationGracePeriodSeconds: 30`, liveness `periodSeconds 10 × failureThreshold 3 = 30s > 20s`, readiness `2s × 2` so the endpoint is withdrawn about 5 s into the drain |
+| systemd | `TimeoutStopSec=30`, `KillMode=mixed`, `SendSIGKILL=yes` |
+| Docker | `STOPSIGNAL SIGTERM`, `docker stop -t 30`, `stop_grace_period: 30s` in Compose (the 10 s default would `SIGKILL` mid-drain) |
+
+There is deliberately **no `preStop` hook** in the Kubernetes manifest. `preStop`
+runs *before* `SIGTERM`, so the process is still fully ready throughout it and
+it cannot serve the 503 that actually removes the pod from rotation; it also
+stacks with the in-process drain into a guaranteed `SIGKILL`. If your external
+load balancer is slower than the drain — a cloud NLB health-checking every 10 s
+is — raise `shutdown_drain_secs` and raise the grace period by the same amount.
+
+`deploy/check-shutdown-invariants.sh` enforces all of these relationships and
+runs in CI, so raising one number without the others fails the build rather
+than a rollout:
+
+```bash
+./deploy/check-shutdown-invariants.sh
+```
+
+**Alerting.** A drain is a normal event, so alert on the drain that goes wrong,
+not on the drain. Vega ships no alert rules — these are the two worth adding,
+and both are quiet during a healthy rollout:
+
+```promql
+# A drain that is not going to finish: still draining with the hard deadline
+# nearly spent, so the watchdog is about to exit(3) with queries in flight.
+dns_shutdown_phase >= 2 and dns_shutdown_deadline_seconds < 2
+
+# The zone is not being answered by anyone. This is the SLO — it stays quiet
+# through a rollout, because a draining instance is still answering.
+sum(rate(dns_queries_total[2m])) == 0        # for: 5m
+
+# Restart loop: more resets than a rollout can explain.
+resets(dns_uptime_seconds[15m]) > 2          # for: 5m
+```
+
+If you already alert on readiness (`kube_pod_status_ready == 0`) or on scrape
+failure, give it a `for:` longer than the drain plus the grace period — 45 s at
+these defaults — or every deploy pages you.
+
 ### Metrics
 
 `GET /metrics` on the admin port, in Prometheus text format:
@@ -383,6 +478,8 @@ the per-source rate limiter both see the node instead of the caller.
 | `dns_send_errors_total` | counter | failures writing a response |
 | `dns_zone_records` | gauge | records currently loaded |
 | `dns_uptime_seconds` | gauge | since start |
+| `dns_shutdown_phase` | gauge | `0` starting, `1` serving, `2` draining, `3` stopping, `4` closing |
+| `dns_shutdown_deadline_seconds` | gauge | seconds left before the hard deadline, once a signal has arrived |
 | `dns_build_info{version}` | gauge | always 1 |
 
 The pod annotations in the Kubernetes manifest already mark it for scraping. If

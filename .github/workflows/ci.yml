@@ -118,6 +118,9 @@ jobs:
       - name: shellcheck install.sh
         run: shellcheck --shell=sh install.sh
 
+      - name: shellcheck the deployment scripts
+        run: shellcheck --shell=sh deploy/check-shutdown-invariants.sh
+
   manifests:
     name: Validate deployment manifests
     runs-on: ubuntu-latest
@@ -144,6 +147,28 @@ jobs:
             https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
           tar -xzf kubeconform.tar.gz kubeconform
           ./kubeconform -summary -strict deploy/kubernetes/vega.yaml
+
+      # Schema validation says the probe fields are integers. It does not say
+      # the numbers are survivable. This does: liveness must not be able to
+      # restart us mid-drain, and no grace period may end before the drain does.
+      # Every one of these values is wrong on its own and only right together.
+      - name: Check the shutdown-drain invariants
+        run: ./deploy/check-shutdown-invariants.sh
+
+      # A gate that cannot fail is decoration. Break one value in a scratch copy
+      # and prove the check catches it.
+      - name: Prove the invariant check can fail
+        run: |
+          set -eu
+          scratch="$(mktemp -d)"
+          git archive HEAD | tar -x -C "$scratch"
+          sed -i 's/periodSeconds: 10/periodSeconds: 5/' \
+            "$scratch/deploy/kubernetes/vega.yaml"
+          if ./deploy/check-shutdown-invariants.sh "$scratch"; then
+            echo "::error::the invariant check passed a manifest whose liveness probe restarts the pod mid-drain"
+            exit 1
+          fi
+          echo "the check rejects a bad manifest, as it must"
 
   # A single required check, so branch protection does not need updating every
   # time the matrix changes.

@@ -25,6 +25,15 @@ data:
     log_format = "json"
     log_level = "info"
 
+    # Seconds to keep answering DNS after SIGTERM while /readyz reports 503,
+    # so the EndpointSlice controller and kube-proxy can take this pod out of
+    # rotation before it stops answering. Must be less than
+    # terminationGracePeriodSeconds - 7 (drain + 5s stop budget + 2s watchdog);
+    # deploy/check-shutdown-invariants.sh enforces that relationship in CI.
+    # Requires a build newer than 0.2.0: earlier binaries reject the key at
+    # startup, so the image tag and this ConfigMap have to move together.
+    shutdown_drain_secs = 15
+
     [server.rate_limit]
     qps = 50
     burst = 100
@@ -112,24 +121,39 @@ spec:
             # Listening above 1024 means we need no capabilities at all.
             - name: VEGA_LOG_FORMAT
               value: json
-          # Liveness only asks "is the runtime scheduling tasks"; readiness is
-          # what gates traffic, and it flips to 503 while we drain on SIGTERM.
+          # Liveness asks one question only: is this process alive and
+          # scheduling tasks. A draining process is alive, so /healthz stays 200
+          # for the whole drain — if it did not, a SIGTERM that does not
+          # accompany a pod delete would get the container restarted mid-drain.
+          # Readiness is the only traffic gate.
+          #
+          # INVARIANT: periodSeconds x failureThreshold (30s) MUST exceed the
+          # shutdown hard deadline (drain 15s + 5s stop budget = 20s), or the
+          # kubelet restarts us part way through the drain and we drop exactly
+          # the queries the drain exists to protect.
+          # Enforced by deploy/check-shutdown-invariants.sh in CI.
           livenessProbe:
             httpGet:
               path: /healthz
               port: admin
             initialDelaySeconds: 3
-            periodSeconds: 15
-            timeoutSeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
             failureThreshold: 3
+          # /readyz turns 503 the moment SIGTERM arrives, while the DNS
+          # listeners stay bound and keep answering for shutdown_drain_secs.
+          # 2s x 2 failures = the endpoint is withdrawn ~4-5s into a 15s drain,
+          # leaving ~10s for kube-proxy and any external LB to catch up.
+          # The startupProbe covers cold start, so no initial delay here.
           readinessProbe:
             httpGet:
               path: /readyz
               port: admin
-            initialDelaySeconds: 1
-            periodSeconds: 5
-            timeoutSeconds: 3
+            initialDelaySeconds: 0
+            periodSeconds: 2
+            timeoutSeconds: 1
             failureThreshold: 2
+            successThreshold: 1
           startupProbe:
             httpGet:
               path: /healthz
@@ -152,8 +176,22 @@ spec:
             - name: config
               mountPath: /etc/vega
               readOnly: true
-      # Give in-flight queries and the load balancer time to notice /readyz.
-      terminationGracePeriodSeconds: 20
+      # = drain 15s + stop budget 5s + watchdog 2s + 8s slop.
+      # The drain is in-process, so there is deliberately NO preStop hook: a
+      # preStop sleep runs *before* SIGTERM, when the process is still fully
+      # Serving and /readyz still answers 200, so it cannot serve the 503 that
+      # actually takes us out of rotation. It also stacks — preStop 15s plus a
+      # 15s drain is exactly this grace period, i.e. a guaranteed SIGKILL while
+      # we are closing sockets — and it is not portable (the sleep action needs
+      # k8s >= 1.30, the exec form needs a `sleep` binary the distroless image
+      # does not ship, and neither exists under systemd or Docker).
+      #
+      # If your *external* load balancer is slower than the drain — a cloud NLB
+      # health-checking every 10s with 2 failures, which externalTrafficPolicy:
+      # Local makes load-bearing — raise shutdown_drain_secs in the ConfigMap
+      # and raise this by the same number of seconds. Raise the drain, not a
+      # preStop: only the drain holds /readyz at 503 for the whole window.
+      terminationGracePeriodSeconds: 30
       volumes:
         - name: config
           configMap:
