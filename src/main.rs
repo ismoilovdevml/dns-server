@@ -5,7 +5,12 @@ use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Du
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory as _, Parser as _};
-use dns_server::{
+use hickory_server::Server;
+use tokio::net::{TcpListener, UdpSocket};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+use tracing_subscriber::{fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter};
+use vega::{
     admin::{self, AdminState, ReloadOutcome},
     cli::{Cli, Command, RecordAction, ZoneAction},
     commands::{inspect, record, zone as zone_cmd},
@@ -18,16 +23,52 @@ use dns_server::{
     shutdown, ui,
     zone::Zone,
 };
-use hickory_server::Server;
-use tokio::net::{TcpListener, UdpSocket};
-use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
-use tracing_subscriber::{fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter};
 
 /// How often the rate-limiter janitor sweeps out idle buckets.
 const JANITOR_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Environment variables renamed by the `dns-server` → `vega` rebrand.
+///
+/// Kept working so an upgrade does not silently change what a running
+/// deployment listens on — the failure mode of dropping these is a name server
+/// that comes back on the wrong port, with nothing in the logs to say why.
+const RENAMED_ENV: &[(&str, &str)] = &[
+    ("DNS_CONFIG", "VEGA_CONFIG"),
+    ("DNS_UDP", "VEGA_UDP"),
+    ("DNS_TCP", "VEGA_TCP"),
+    ("DNS_ADMIN_LISTEN", "VEGA_ADMIN_LISTEN"),
+    ("DNS_ADMIN_TOKEN", "VEGA_ADMIN_TOKEN"),
+    ("DNS_DOMAIN", "VEGA_DOMAIN"),
+    ("DNS_RATE_LIMIT_QPS", "VEGA_RATE_LIMIT_QPS"),
+    ("DNS_RATE_LIMIT_BURST", "VEGA_RATE_LIMIT_BURST"),
+    ("DNS_TCP_TIMEOUT_SECS", "VEGA_TCP_TIMEOUT_SECS"),
+    ("DNS_NO_BUILTINS", "VEGA_NO_BUILTINS"),
+    ("DNS_LOG_FORMAT", "VEGA_LOG_FORMAT"),
+    ("DNS_LOG_LEVEL", "VEGA_LOG_LEVEL"),
+];
+
+/// Promote any legacy `DNS_*` variable to its `VEGA_*` name.
+///
+/// Runs before clap reads the environment. The new name always wins, so setting
+/// both is unambiguous rather than order-dependent. Warnings go to stderr
+/// because tracing is not initialised this early, and an operator running an
+/// upgrade needs to see this on the terminal regardless of log configuration.
+fn migrate_legacy_env() {
+    for (old, new) in RENAMED_ENV {
+        if std::env::var_os(new).is_some() {
+            continue;
+        }
+        if let Some(value) = std::env::var_os(old) {
+            // SAFETY-adjacent: single-threaded, before any runtime starts.
+            std::env::set_var(new, value);
+            eprintln!("warning: {old} is deprecated and will be removed; use {new}");
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    migrate_legacy_env();
+
     let cli = Cli::parse();
     ui::init(cli.global.json, cli.global.verbose);
 
@@ -45,15 +86,15 @@ fn dispatch(cli: &Cli) -> Result<ExitCode> {
     let config_path = cli.config_path();
 
     // Everything that loads a Config must see the file the search path found, not
-    // only an explicit --config. Otherwise `dns-server check` run next to a
-    // dns-server.toml would silently validate the built-in defaults instead.
+    // only an explicit --config. Otherwise `vega check` run next to a
+    // vega.toml would silently validate the built-in defaults instead.
     let global = GlobalArgs {
         config: config_path.clone(),
         ..cli.global.clone()
     };
 
     match &cli.command {
-        // `None` is the default so plain `dns-server` still starts the server.
+        // `None` is the default so plain `vega` still starts the server.
         None | Some(Command::Serve) => serve_command(&global),
 
         Some(Command::Check) => {
@@ -155,7 +196,7 @@ fn record_command(
         }
 
         RecordAction::Get { name, record_type } => {
-            // Exit non-zero when nothing matched, so `if dns-server record get …`
+            // Exit non-zero when nothing matched, so `if vega record get …`
             // works in a shell script.
             let found = record::get(config_path, name, record_type.as_deref(), json)?;
             Ok(exit_code(found))
@@ -369,13 +410,13 @@ async fn serve(config: Config) -> Result<()> {
     }
 
     info!(
-        version = dns_server::VERSION,
+        version = vega::VERSION,
         zone = %config.zone.origin,
         records = zone.record_count(),
         builtins = config.zone.builtins,
         rate_limited = config.rate_limit.is_some(),
         reloadable = config.source.is_some(),
-        "dns-server ready"
+        "vega ready"
     );
     admin_state.mark_ready();
 
@@ -468,7 +509,7 @@ fn spawn_janitor(limiter: Arc<RateLimiter>, shutdown: CancellationToken) {
 fn init_tracing(config: &Config) {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(&config.log_level))
-        .unwrap_or_else(|_| EnvFilter::new(dns_server::config::DEFAULT_LOG_FILTER));
+        .unwrap_or_else(|_| EnvFilter::new(vega::config::DEFAULT_LOG_FILTER));
 
     let registry = tracing_subscriber::registry().with(filter);
     match config.log_format {

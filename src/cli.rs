@@ -1,6 +1,6 @@
 //! The command-line surface.
 //!
-//! Two audiences share it: a human running `dns-server record add www A 1.2.3.4`,
+//! Two audiences share it: a human running `vega record add www A 1.2.3.4`,
 //! and a script or agent running the same thing with `--json` and reading the
 //! result. Every subcommand therefore has a machine-readable mode, exits
 //! non-zero on failure, and says exactly what it changed.
@@ -12,16 +12,24 @@ use clap::{Parser, Subcommand};
 use crate::config::GlobalArgs;
 
 /// Config paths tried, in order, when `--config` is not given.
-pub const CONFIG_SEARCH_PATH: [&str; 3] = [
+///
+/// The three `dns-server` entries are where this project used to look, kept as
+/// a fallback so an upgrade in place does not start serving built-in defaults
+/// against an existing installation. New paths win, so a host carrying both is
+/// unambiguous. Slated for removal in 0.5.0.
+pub const CONFIG_SEARCH_PATH: [&str; 6] = [
+    "vega.toml",
+    "/etc/vega/vega.toml",
+    "/usr/local/etc/vega/vega.toml",
     "dns-server.toml",
     "/etc/dns-server/dns-server.toml",
     "/usr/local/etc/dns-server/dns-server.toml",
 ];
 
-/// `dns-server`.
+/// `vega`.
 #[derive(Parser, Debug)]
 #[command(
-    name = "dns-server",
+    name = "vega",
     version,
     about = "Authoritative DNS server built on Hickory DNS",
     long_about = "Authoritative DNS server built on Hickory DNS.\n\n\
@@ -71,7 +79,7 @@ pub enum Command {
         /// Zone this server will be authoritative for.
         #[arg(long, default_value = "example.com")]
         origin: String,
-        /// Where to write it. Defaults to ./dns-server.toml.
+        /// Where to write it. Defaults to ./vega.toml.
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
     },
@@ -122,7 +130,7 @@ pub enum Command {
     },
 }
 
-/// `dns-server record ...`
+/// `vega record ...`
 #[derive(Subcommand, Debug)]
 pub enum RecordAction {
     /// List record sets, optionally filtered.
@@ -184,7 +192,7 @@ pub enum RecordAction {
     },
 }
 
-/// `dns-server zone ...`
+/// `vega zone ...`
 #[derive(Subcommand, Debug)]
 pub enum ZoneAction {
     /// Summarise the zone: origin, SOA, record and name counts.
@@ -211,23 +219,23 @@ mod tests {
 
     #[test]
     fn no_subcommand_means_serve() {
-        let cli = Cli::try_parse_from(["dns-server"]).unwrap();
+        let cli = Cli::try_parse_from(["vega"]).unwrap();
         assert!(cli.command.is_none());
     }
 
     #[test]
     fn global_flags_work_before_and_after_a_subcommand() {
-        let before = Cli::try_parse_from(["dns-server", "--config", "a.toml", "check"]).unwrap();
+        let before = Cli::try_parse_from(["vega", "--config", "a.toml", "check"]).unwrap();
         assert_eq!(before.global.config, Some(PathBuf::from("a.toml")));
 
-        let after = Cli::try_parse_from(["dns-server", "check", "--config", "a.toml"]).unwrap();
+        let after = Cli::try_parse_from(["vega", "check", "--config", "a.toml"]).unwrap();
         assert_eq!(after.global.config, Some(PathBuf::from("a.toml")));
     }
 
     #[test]
     fn record_add_takes_multiple_values() {
         let cli = Cli::try_parse_from([
-            "dns-server",
+            "vega",
             "record",
             "add",
             "www",
@@ -262,13 +270,13 @@ mod tests {
 
     #[test]
     fn record_add_requires_at_least_one_value() {
-        assert!(Cli::try_parse_from(["dns-server", "record", "add", "www", "A"]).is_err());
+        assert!(Cli::try_parse_from(["vega", "record", "add", "www", "A"]).is_err());
     }
 
     #[test]
     fn record_delete_collects_repeated_value_flags() {
         let cli = Cli::try_parse_from([
-            "dns-server",
+            "vega",
             "record",
             "delete",
             "www",
@@ -291,7 +299,7 @@ mod tests {
 
     #[test]
     fn query_defaults_to_an_a_lookup() {
-        let cli = Cli::try_parse_from(["dns-server", "query", "www.example.com"]).unwrap();
+        let cli = Cli::try_parse_from(["vega", "query", "www.example.com"]).unwrap();
         let Some(Command::Query {
             record_type,
             use_tcp,
@@ -306,13 +314,13 @@ mod tests {
 
     #[test]
     fn json_flag_is_accepted_on_subcommands() {
-        let cli = Cli::try_parse_from(["dns-server", "record", "list", "--json"]).unwrap();
+        let cli = Cli::try_parse_from(["vega", "record", "list", "--json"]).unwrap();
         assert!(cli.global.json);
     }
 
     #[test]
     fn explicit_config_wins_over_the_search_path() {
-        let cli = Cli::try_parse_from(["dns-server", "--config", "/tmp/custom.toml"]).unwrap();
+        let cli = Cli::try_parse_from(["vega", "--config", "/tmp/custom.toml"]).unwrap();
         assert_eq!(cli.config_path(), Some(PathBuf::from("/tmp/custom.toml")));
     }
 }

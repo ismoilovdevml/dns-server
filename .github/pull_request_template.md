@@ -13,7 +13,7 @@
 - [ ] `cargo test --all-features`
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings`
 - [ ] `cargo fmt --all --check`
-- [ ] Tried it against a running server (`dns-server query …`)
+- [ ] Tried it against a running server (`vega query …`)
 - [ ] New behaviour has tests
 
 ## Anything reviewers should know?

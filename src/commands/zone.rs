@@ -1,4 +1,4 @@
-//! `dns-server zone …` and `dns-server check` — inspect and validate the zone as
+//! `vega zone …` and `vega check` — inspect and validate the zone as
 //! a whole, plus `init` for a first config file.
 
 use std::{
@@ -132,7 +132,7 @@ pub fn bump_serial(config: Option<&Path>, as_json: bool) -> Result<u32> {
 
 /// `init` — write a starter config file.
 pub fn init(output: Option<&Path>, origin: &str, as_json: bool) -> Result<bool> {
-    let path = output.map_or_else(|| PathBuf::from("dns-server.toml"), Path::to_path_buf);
+    let path = output.map_or_else(|| PathBuf::from("vega.toml"), Path::to_path_buf);
     let created = ConfigEditor::init(&path, origin)?;
 
     if as_json {
@@ -317,7 +317,7 @@ values = ["example.com."]
 
     fn fixture() -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("dns-server.toml");
+        let path = dir.path().join("vega.toml");
         fs::write(&path, BASE).unwrap();
         (dir, path)
     }
@@ -355,7 +355,7 @@ values = ["example.com."]
     #[test]
     fn init_creates_then_refuses_to_clobber() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("dns-server.toml");
+        let path = dir.path().join("vega.toml");
 
         assert!(init(Some(&path), "example.org", true).unwrap());
         assert!(!init(Some(&path), "other.test", true).unwrap());
@@ -368,7 +368,7 @@ values = ["example.com."]
     #[test]
     fn init_output_is_a_valid_config() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("dns-server.toml");
+        let path = dir.path().join("vega.toml");
         init(Some(&path), "example.org", true).unwrap();
 
         // The generated file must parse as a real config and build a real zone.

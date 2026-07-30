@@ -366,4 +366,142 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Regression tests from mutation testing.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_latency_exactly_on_a_bucket_boundary_lands_in_that_bucket() {
+        // Kills `secs <= upper` -> `secs < upper`. The existing histogram test
+        // used 80us, which sits between two boundaries, so the comparison could
+        // be flipped without any assertion noticing.
+        let m = Metrics::new();
+        m.observe_latency(Duration::from_micros(100)); // exactly 0.0001s
+        let text = m.render_prometheus();
+        assert!(
+            text.contains("dns_query_duration_seconds_bucket{le=\"0.0001\"} 1"),
+            "an observation equal to the bucket bound belongs in it:\n{text}"
+        );
+        assert!(text.contains("dns_query_duration_seconds_bucket{le=\"0.00005\"} 0"));
+    }
+
+    #[test]
+    fn the_latency_sum_is_reported_in_seconds() {
+        // Kills `as_f64 -> 0.0 / 1.0 / -1.0` on the sum path.
+        let m = Metrics::new();
+        m.observe_latency(Duration::from_millis(1_500));
+        let text = m.render_prometheus();
+        assert!(
+            text.contains("dns_query_duration_seconds_sum 1.5"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_zone_record_gauge_reports_what_was_stored() {
+        // Kills `set_zone_records with ()`, `gauge with ()` and
+        // `as_f64 -> 0.0 / 1.0 / -1.0`.
+        let m = Metrics::new();
+        assert!(m.render_prometheus().contains("dns_zone_records 0"));
+        m.set_zone_records(4242);
+        let text = m.render_prometheus();
+        assert!(text.contains("dns_zone_records 4242"), "{text}");
+        assert!(text.contains("# TYPE dns_zone_records gauge"), "{text}");
+    }
+
+    #[test]
+    fn rate_limited_and_send_error_counters_move() {
+        // Kills `rate_limited with ()` and `send_error with ()`.
+        let m = Metrics::new();
+        m.rate_limited();
+        m.rate_limited();
+        m.send_error();
+        let text = m.render_prometheus();
+        assert!(text.contains("dns_rate_limited_total 2"), "{text}");
+        assert!(text.contains("dns_send_errors_total 1"), "{text}");
+    }
+
+    #[test]
+    fn uptime_advances_with_the_clock() {
+        // Kills `uptime -> Duration::default()`.
+        let m = Metrics::new();
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            m.uptime() >= Duration::from_millis(15),
+            "uptime was {:?}",
+            m.uptime()
+        );
+        assert!(!m.render_prometheus().contains("dns_uptime_seconds 0\n"));
+    }
+
+    #[test]
+    fn counters_reconcile_under_a_thread_storm() {
+        // Every counter is Relaxed, which is fine for independent counters —
+        // but the totals still have to add up exactly.
+        use std::sync::{Arc, Barrier};
+
+        const THREADS: usize = 12;
+        const PER_THREAD: usize = 5_000;
+
+        let m = Arc::new(Metrics::new());
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let (m, barrier) = (Arc::clone(&m), Arc::clone(&barrier));
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..PER_THREAD {
+                    m.query(match t % 3 {
+                        0 => Transport::Udp,
+                        1 => Transport::Tcp,
+                        _ => Transport::Other,
+                    });
+                    m.response(if t % 2 == 0 {
+                        ResponseCode::NoError
+                    } else {
+                        ResponseCode::NXDomain
+                    });
+                    m.observe_latency(Duration::from_micros(1));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker finishes");
+        }
+
+        let total = THREADS * PER_THREAD;
+        assert_eq!(usize::try_from(m.queries()).expect("fits"), total);
+        let text = m.render_prometheus();
+        assert!(
+            text.contains(&format!("dns_queries_total {total}")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("dns_query_duration_seconds_count {total}")),
+            "{text}"
+        );
+
+        // Per-transport counters must sum back to the grand total.
+        let sum: usize = ["udp", "tcp", "other"]
+            .iter()
+            .map(|label| {
+                let needle = format!("dns_queries_by_transport_total{{transport=\"{label}\"}} ");
+                text.lines()
+                    .find_map(|l| l.strip_prefix(needle.as_str()))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or_default()
+            })
+            .sum();
+        assert_eq!(sum, total, "transport counters must sum to the total");
+
+        // Same for the response-code counters.
+        let rcodes: usize = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("dns_responses_total{"))
+            .filter_map(|l| l.split_once("} "))
+            .filter_map(|(_, v)| v.parse::<usize>().ok())
+            .sum();
+        assert_eq!(rcodes, total, "rcode counters must sum to the total");
+    }
 }

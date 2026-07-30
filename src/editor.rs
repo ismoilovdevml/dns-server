@@ -1,4 +1,4 @@
-//! Format-preserving edits to the config file, so `dns-server record add` can be
+//! Format-preserving edits to the config file, so `vega record add` can be
 //! scripted without destroying an operator's comments and layout.
 //!
 //! Everything goes through [`toml_edit`], which keeps the original document and
@@ -78,7 +78,7 @@ impl ConfigEditor {
         }
 
         let contents = format!(
-            "# dns-server configuration. See dns-server.example.toml for every option.\n\
+            "# vega configuration. See vega.example.toml for every option.\n\
              \n\
              [server]\n\
              udp = [\"0.0.0.0:53\"]\n\
@@ -366,11 +366,11 @@ fn write_atomically(path: &Path, contents: &str) -> Result<()> {
         Some(dir) => dir.join(format!(
             ".{}.tmp",
             path.file_name().map_or_else(
-                || "dns-server.toml".to_owned(),
+                || "vega.toml".to_owned(),
                 |n| n.to_string_lossy().into_owned(),
             )
         )),
-        None => PathBuf::from(".dns-server.toml.tmp"),
+        None => PathBuf::from(".vega.toml.tmp"),
     };
 
     {
@@ -495,7 +495,7 @@ values = ["203.0.113.10"]
 
     fn editor(contents: &str) -> (TempDir, ConfigEditor) {
         let dir = TempDir::new().expect("temp dir");
-        let path = dir.path().join("dns-server.toml");
+        let path = dir.path().join("vega.toml");
         fs::write(&path, contents).expect("write fixture");
         let editor = ConfigEditor::open(&path).expect("open fixture");
         (dir, editor)
@@ -705,7 +705,7 @@ values = ["203.0.113.10"]
             .unwrap();
         editor.save().unwrap();
 
-        let reopened = ConfigEditor::open(dir.path().join("dns-server.toml")).unwrap();
+        let reopened = ConfigEditor::open(dir.path().join("vega.toml")).unwrap();
         assert_eq!(reopened.records().len(), 2);
         assert!(reopened.to_toml().contains("# A comment we must not lose."));
 
@@ -722,7 +722,7 @@ values = ["203.0.113.10"]
     #[test]
     fn init_creates_a_usable_config_and_never_clobbers() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("nested").join("dns-server.toml");
+        let path = dir.path().join("nested").join("vega.toml");
 
         assert!(ConfigEditor::init(&path, "example.org").unwrap());
         let editor = ConfigEditor::open(&path).unwrap();
@@ -738,7 +738,7 @@ values = ["203.0.113.10"]
 
     #[test]
     fn open_reports_a_missing_file_clearly() {
-        let error = ConfigEditor::open("/nonexistent/dns-server.toml").unwrap_err();
+        let error = ConfigEditor::open("/nonexistent/vega.toml").unwrap_err();
         assert!(error.to_string().contains("reading"), "{error}");
     }
 
@@ -750,5 +750,173 @@ values = ["203.0.113.10"]
         fs::write(&path, "[zone\norigin =").unwrap();
         let error = ConfigEditor::open(&path).unwrap_err();
         assert!(error.to_string().contains("parsing"), "{error}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests from mutation testing.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn adding_the_same_value_with_a_new_ttl_retimes_the_set() {
+        // Kills `ttl.is_some() && current_ttl != ttl` -> `||` and -> `==`, plus
+        // `set_ttl with ()` and `ttl_of -> None`. Nothing covered the TTL side
+        // of a non-replacing add.
+        let (_dir, mut editor) = editor(BASE);
+        assert_eq!(editor.records()[0].ttl, None);
+
+        let change = editor
+            .add("www", "A", &vals(&["203.0.113.10"]), Some(60), false)
+            .unwrap();
+        assert_eq!(change, Change::Extended, "a new TTL is a change");
+        assert_eq!(editor.records()[0].ttl, Some(60));
+        assert_eq!(
+            editor.records()[0].values,
+            vals(&["203.0.113.10"]),
+            "re-timing must not duplicate the value"
+        );
+
+        // Same value, same TTL: nothing to do.
+        let change = editor
+            .add("www", "A", &vals(&["203.0.113.10"]), Some(60), false)
+            .unwrap();
+        assert_eq!(change, Change::Unchanged);
+
+        // No TTL given: the existing one is left alone rather than cleared.
+        let change = editor
+            .add("www", "A", &vals(&["203.0.113.10"]), None, false)
+            .unwrap();
+        assert_eq!(change, Change::Unchanged);
+        assert_eq!(editor.records()[0].ttl, Some(60));
+    }
+
+    #[test]
+    fn replacing_with_no_ttl_removes_an_existing_one() {
+        // Kills `set_ttl with ()` on the replace path.
+        let (_dir, mut editor) = editor(BASE);
+        editor
+            .add("www", "A", &vals(&["203.0.113.10"]), Some(60), true)
+            .unwrap();
+        assert_eq!(editor.records()[0].ttl, Some(60));
+
+        let change = editor
+            .add("www", "A", &vals(&["203.0.113.10"]), None, true)
+            .unwrap();
+        assert_eq!(change, Change::Replaced);
+        assert_eq!(editor.records()[0].ttl, None);
+        // `default_ttl = 300` lives in [zone]; only a bare `ttl =` key is ours.
+        assert!(
+            !editor.to_toml().contains("\nttl ="),
+            "{}",
+            editor.to_toml()
+        );
+    }
+
+    #[test]
+    fn the_saved_file_is_reopenable_and_keeps_its_comments() {
+        // An atomic replace only works when the temp file is on the same
+        // filesystem as the target, which in practice means the same
+        // directory. A rename across devices fails at runtime, on the
+        // operator's machine, part-way through a config write.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vega.toml");
+        fs::write(&path, BASE).unwrap();
+        let mut editor = ConfigEditor::open(&path).unwrap();
+        editor
+            .add("api", "A", &vals(&["203.0.113.20"]), None, false)
+            .unwrap();
+        editor.save().unwrap();
+
+        assert_eq!(ConfigEditor::open(&path).unwrap().records().len(), 2);
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("# A comment we must not lose."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "BUG: an atomic write drops the config's permission bits, exposing admin_token (0640 -> 0644)"]
+    fn saving_preserves_the_config_file_permissions() {
+        // `write_atomically` creates a brand new temp file with
+        // `fs::File::create` — mode 0666 & ~umask, so 0644 under the usual
+        // umask 022 — and renames it over the original. The original's mode is
+        // discarded.
+        //
+        // That matters because vega.toml holds `admin_token`, the shared
+        // secret guarding the mutating `/reload` endpoint, and install.sh
+        // deliberately sets the file to 0640 and its directory to 0750. Any
+        // subsequent `vega record add` silently widens it to 0644 and the
+        // token becomes readable by every local user.
+        //
+        // Reproduced with the release binary:
+        //   chmod 600 c.toml && vega -c c.toml record add www A 203.0.113.10
+        //   -> "OK created", and the file is left -rw-r--r--
+        //
+        // The fix is to stat the target first and re-apply its mode to the temp
+        // file before the rename.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vega.toml");
+        fs::write(&path, BASE).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut editor = ConfigEditor::open(&path).unwrap();
+        editor
+            .add("api", "A", &vals(&["203.0.113.20"]), None, false)
+            .unwrap();
+        editor.save().unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "saving widened the config from 0600 to {mode:o}; it may hold admin_token"
+        );
+    }
+
+    #[test]
+    #[ignore = "BUG: write_atomically uses a fixed temp filename, so two concurrent writers to the same config corrupt each other"]
+    fn two_concurrent_writers_do_not_corrupt_the_config() {
+        // `write_atomically` derives the temp path purely from the target name
+        // (`.vega.toml.tmp`), with no pid, no randomness and no O_EXCL.
+        // Two `vega record add` processes editing the same file therefore
+        // open, truncate and write the *same* temp file concurrently: one
+        // truncates the other mid-write, then both rename it into place. The
+        // survivor can be a torn document, and it is not even guaranteed to be
+        // either writer's intended content.
+        use std::sync::{Arc, Barrier};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("vega.toml");
+        fs::write(&path, BASE).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for worker in 0..2 {
+            let (path, barrier) = (path.clone(), Arc::clone(&barrier));
+            handles.push(std::thread::spawn(move || {
+                // A big payload widens the window between create and rename.
+                let values: Vec<String> = (0..400)
+                    .map(|i| format!("203.0.{worker}.{}", i % 256))
+                    .collect();
+                barrier.wait();
+                for _ in 0..40 {
+                    let mut e = ConfigEditor::open(&path).unwrap();
+                    e.add(&format!("host{worker}"), "A", &values, None, true)
+                        .unwrap();
+                    e.save().unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker finishes");
+        }
+
+        let raw = fs::read_to_string(&path).unwrap();
+        raw.parse::<toml_edit::DocumentMut>()
+            .unwrap_or_else(|e| panic!("config was corrupted by concurrent writers: {e}\n{raw}"));
+        assert!(
+            raw.contains("# A comment we must not lose."),
+            "the original document was lost:\n{raw}"
+        );
     }
 }

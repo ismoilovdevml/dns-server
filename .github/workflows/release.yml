@@ -97,23 +97,23 @@ jobs:
       - name: Build
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.target }} --bin dns-server
+            cross build --release --locked --target ${{ matrix.target }} --bin vega
           else
-            cargo build --release --locked --target ${{ matrix.target }} --bin dns-server
+            cargo build --release --locked --target ${{ matrix.target }} --bin vega
           fi
 
       - name: Package
         id: package
         run: |
           set -euo pipefail
-          name="dns-server-${{ needs.verify.outputs.version }}"
-          archive="dns-server-v${{ needs.verify.outputs.version }}-${{ matrix.target }}.tar.gz"
+          name="vega-${{ needs.verify.outputs.version }}"
+          archive="vega-v${{ needs.verify.outputs.version }}-${{ matrix.target }}.tar.gz"
 
           staging="$(mktemp -d)"
-          cp "target/${{ matrix.target }}/release/dns-server" "$staging/"
-          cp README.md LICENSE dns-server.example.toml "$staging/"
+          cp "target/${{ matrix.target }}/release/vega" "$staging/"
+          cp README.md LICENSE vega.example.toml "$staging/"
 
-          # Flat archive: install.sh expects ./dns-server at the root.
+          # Flat archive: install.sh expects ./vega at the root.
           tar -czf "$archive" -C "$staging" .
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
           echo "name=$name" >> "$GITHUB_OUTPUT"
@@ -160,7 +160,7 @@ jobs:
           set -euo pipefail
           version="${{ needs.verify.outputs.version }}"
           {
-            echo "## dns-server v$version"
+            echo "## vega v$version"
             echo
             echo "### Install"
             echo

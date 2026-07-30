@@ -40,7 +40,7 @@ pub fn require_config(path: Option<&Path>) -> Result<PathBuf> {
     match path {
         Some(path) => Ok(path.to_path_buf()),
         None => anyhow::bail!(
-            "no config file found (looked for {}); pass --config PATH or run `dns-server init`",
+            "no config file found (looked for {}); pass --config PATH or run `vega init`",
             CONFIG_SEARCH_PATH.join(", ")
         ),
     }
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn missing_config_error_lists_the_search_path() {
         let error = require_config(None).unwrap_err().to_string();
-        assert!(error.contains("dns-server.toml"), "{error}");
+        assert!(error.contains("vega.toml"), "{error}");
         assert!(error.contains("--config"), "{error}");
     }
 

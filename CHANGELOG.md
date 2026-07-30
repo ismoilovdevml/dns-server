@@ -24,7 +24,7 @@ list|get|add|delete`, `zone show|export|bump-serial`, `query`, `status`, `reload
 exit code, so scripts and agents drive it the same way a person does. Config edits
 preserve comments and are written atomically.
 
-**Live reload.** `dns-server reload`, or `record add --reload`, swaps the zone
+**Live reload.** `vega reload`, or `record add --reload`, swaps the zone
 behind an atomic pointer with no lock on the query path and no dropped queries. An
 invalid config is refused and the previous zone keeps serving. `POST /reload`
 requires the `--admin-token` bearer token, or a loopback source when no token is
@@ -59,7 +59,7 @@ UDP and TCP sockets, and end-to-end tests that run the real binary.
 
 ### Changed
 
-- **Migrated from `trust-dns-server` 0.22 to `hickory-server` 0.26.** trust-dns
+- **Migrated from `trust-vega` 0.22 to `hickory-server` 0.26.** trust-dns
   was renamed and 0.22 no longer receives fixes.
 - **Out-of-zone queries answer `REFUSED`** instead of an error. Claiming a name
   does not exist in a namespace we know nothing about is a lie.
@@ -68,12 +68,12 @@ UDP and TCP sockets, and end-to-end tests that run the real binary.
 - **Release profile targets throughput, not size**: `opt-level = 3` instead of
   `"z"`, `codegen-units = 1`, and `panic = "abort"` so a poisoned task takes the
   process down rather than serving from a half-initialised state.
-- **The binary is named `dns-server`**, matching the crate.
+- **The binary is named `vega`**, matching the crate.
 
 ### Fixed
 
 - **The Docker image never worked.** The Dockerfile copied
-  `/code/target/release/dnsserver`, but the binary is `dns-server`, so every build
+  `/code/target/release/dnsserver`, but the binary is `vega`, so every build
   failed at the `COPY` step.
 - **The Docker workflow could not authenticate.** It referenced
   `secrets.ismoilovdev` and `secrets.dckr_pat_…` as if the token value were a
@@ -106,6 +106,6 @@ UDP and TCP sockets, and end-to-end tests that run the real binary.
 Initial version: a Hickory DNS request handler serving `hello.`, `counter.` and
 `myip.` sub-zones, as a starting point for a Rust DNS server.
 
-[Unreleased]: https://github.com/ismoilovdevml/dns-server/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/ismoilovdevml/dns-server/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/ismoilovdevml/dns-server/releases/tag/v0.1.0
+[Unreleased]: https://github.com/ismoilovdevml/vega/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ismoilovdevml/vega/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/ismoilovdevml/vega/releases/tag/v0.1.0

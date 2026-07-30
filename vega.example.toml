@@ -1,14 +1,14 @@
-# dns-server configuration.
+# vega configuration.
 #
-# Copy to /etc/dns-server/dns-server.toml and edit. Every value here can also be
+# Copy to /etc/vega/vega.toml and edit. Every value here can also be
 # set with a CLI flag or an environment variable, and those win over the file:
 #
-#   dns-server --config /etc/dns-server/dns-server.toml
-#   DNS_UDP=0.0.0.0:53 dns-server
+#   vega --config /etc/vega/vega.toml
+#   VEGA_UDP=0.0.0.0:53 vega
 #
 # Validate before restarting anything:
 #
-#   dns-server --config /etc/dns-server/dns-server.toml --check
+#   vega check --config /etc/vega/vega.toml
 
 [server]
 # Listeners. Use port 53 in production; 1053 needs no privileges for local tests.

@@ -28,7 +28,7 @@ use tracing::{info, warn};
 
 use crate::metrics::Metrics;
 
-/// What a successful reload changed. Returned to the caller so `dns-server
+/// What a successful reload changed. Returned to the caller so `vega
 /// reload` can print something more useful than "ok".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReloadOutcome {

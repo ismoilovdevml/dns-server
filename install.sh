@@ -1,7 +1,7 @@
 #!/bin/sh
-# dns-server installer.
+# vega installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/ismoilovdevml/dns-server/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/ismoilovdevml/vega/main/install.sh | sh
 #
 # Downloads the release binary for this platform, verifies its SHA-256 against
 # the published checksum file, and installs it. With --systemd it also writes a
@@ -11,18 +11,18 @@
 # Environment overrides:
 #   VERSION=v0.2.0        install a specific tag instead of the latest release
 #   INSTALL_DIR=/opt/bin  where the binary goes (default /usr/local/bin)
-#   CONFIG_DIR=/etc/x     where the config goes (default /etc/dns-server)
+#   CONFIG_DIR=/etc/x     where the config goes (default /etc/vega)
 #   NO_SUDO=1             never escalate; fail instead
 #
 # POSIX sh on purpose: this has to run on a minimal box before anything is set up.
 
 set -eu
 
-REPO="ismoilovdevml/dns-server"
-BIN_NAME="dns-server"
+REPO="ismoilovdevml/vega"
+BIN_NAME="vega"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
-CONFIG_DIR="${CONFIG_DIR:-/etc/dns-server}"
-SERVICE_USER="dns-server"
+CONFIG_DIR="${CONFIG_DIR:-/etc/vega}"
+SERVICE_USER="vega"
 WITH_SYSTEMD=0
 VERSION="${VERSION:-}"
 
@@ -226,34 +226,34 @@ if [ "$WITH_SYSTEMD" = 1 ]; then
         die "no useradd or adduser found; create the $SERVICE_USER user yourself and re-run"
     fi
 
-    info "writing $CONFIG_DIR/dns-server.toml"
+    info "writing $CONFIG_DIR/vega.toml"
     as_root mkdir -p "$CONFIG_DIR"
-    if [ -f "$CONFIG_DIR/dns-server.toml" ]; then
+    if [ -f "$CONFIG_DIR/vega.toml" ]; then
         # Never clobber a live zone.
         dim "  config already exists, leaving it alone"
     else
         as_root "$INSTALL_DIR/$BIN_NAME" init \
             --origin example.com \
-            --output "$CONFIG_DIR/dns-server.toml" >/dev/null
+            --output "$CONFIG_DIR/vega.toml" >/dev/null
         as_root chown -R "root:$SERVICE_USER" "$CONFIG_DIR"
         as_root chmod 0750 "$CONFIG_DIR"
-        as_root chmod 0640 "$CONFIG_DIR/dns-server.toml"
+        as_root chmod 0640 "$CONFIG_DIR/vega.toml"
         ok "starter config written"
     fi
 
-    info "writing /etc/systemd/system/dns-server.service"
-    fetch_stdout "https://raw.githubusercontent.com/$REPO/$VERSION/deploy/systemd/dns-server.service" \
-        > "$TMP/dns-server.service" \
+    info "writing /etc/systemd/system/vega.service"
+    fetch_stdout "https://raw.githubusercontent.com/$REPO/$VERSION/deploy/systemd/vega.service" \
+        > "$TMP/vega.service" \
         || die "could not download the systemd unit for $VERSION"
-    as_root install -m 0644 "$TMP/dns-server.service" /etc/systemd/system/dns-server.service
+    as_root install -m 0644 "$TMP/vega.service" /etc/systemd/system/vega.service
     as_root systemctl daemon-reload
     ok "unit installed"
 
     printf '\n'
     dim "The service is installed but not started. Next:"
-    printf '  1. edit   %s%s/dns-server.toml%s\n' "$C_CYAN" "$CONFIG_DIR" "$C_RESET"
-    printf '  2. verify %s%s check --config %s/dns-server.toml%s\n' "$C_CYAN" "$BIN_NAME" "$CONFIG_DIR" "$C_RESET"
-    printf '  3. start  %ssystemctl enable --now dns-server%s\n' "$C_CYAN" "$C_RESET"
+    printf '  1. edit   %s%s/vega.toml%s\n' "$C_CYAN" "$CONFIG_DIR" "$C_RESET"
+    printf '  2. verify %s%s check --config %s/vega.toml%s\n' "$C_CYAN" "$BIN_NAME" "$CONFIG_DIR" "$C_RESET"
+    printf '  3. start  %ssystemctl enable --now vega%s\n' "$C_CYAN" "$C_RESET"
     printf '\n'
     dim "Port 53 is usually already taken on Linux. If the service fails to bind,"
     dim "check systemd-resolved: systemctl status systemd-resolved"

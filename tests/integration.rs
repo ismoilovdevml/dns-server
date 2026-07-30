@@ -7,19 +7,19 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use dns_server::{
-    config::{RecordSpec, SoaSpec, ZoneConfig},
-    handler::DnsHandler,
-    metrics::Metrics,
-    ratelimit::RateLimiter,
-    zone::Zone,
-};
 use hickory_proto::{
     op::{Message, MessageType, OpCode, Query, ResponseCode},
     rr::{Name, RData, RecordType},
 };
 use hickory_server::Server;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use vega::{
+    config::{RecordSpec, SoaSpec, ZoneConfig},
+    handler::DnsHandler,
+    metrics::Metrics,
+    ratelimit::RateLimiter,
+    zone::Zone,
+};
 
 /// Wall-clock budget for a single query. Generous enough for a loaded CI runner,
 /// tight enough that a hang fails instead of stalling the suite.
@@ -331,7 +331,7 @@ async fn builtin_version_reports_the_build() {
 
     let response = ask_udp(&server, &format!("version.{ZONE}"), RecordType::TXT).await;
 
-    assert!(first_txt(&response).contains(dns_server::VERSION));
+    assert!(first_txt(&response).contains(vega::VERSION));
 }
 
 #[tokio::test]
@@ -346,8 +346,15 @@ async fn builtin_counter_increases_with_traffic() {
     assert!(second > first, "{second} should exceed {first}");
 }
 
+/// Scenario: A rate-limited UDP query is answered with silence
+/// features/rate-limiting.feature:201
+///
+/// Replying REFUSED still delivers a packet to whatever source the attacker
+/// forged, so the limiter reduced our byte count and not the victim's packet
+/// count — 500 attack packets produced 500 victim packets. Dropping is the
+/// whole point of the control.
 #[tokio::test]
-async fn rate_limited_client_gets_refused() {
+async fn a_rate_limited_udp_query_gets_no_response_at_all() {
     // Burst of exactly one, so the second query in the same instant is dropped.
     let limiter = Arc::new(RateLimiter::new(1, 1));
     let server = TestServer::start(
@@ -359,7 +366,43 @@ async fn rate_limited_client_gets_refused() {
     let first = ask_udp(&server, &format!("www.{ZONE}"), RecordType::A).await;
     assert_eq!(first.metadata.response_code, ResponseCode::NoError);
 
-    let second = ask_udp(&server, &format!("www.{ZONE}"), RecordType::A).await;
+    let request = query_message(&format!("www.{ZONE}"), RecordType::A);
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("client binds");
+    socket.connect(server.udp).await.expect("client connects");
+    socket
+        .send(&request.to_vec().expect("request encodes"))
+        .await
+        .expect("request sends");
+
+    let mut buf = vec![0u8; 4096];
+    let outcome = tokio::time::timeout(Duration::from_millis(750), socket.recv(&mut buf)).await;
+    if let Ok(read) = outcome {
+        panic!(
+            "a rate-limited UDP query must be answered with silence, got {} bytes",
+            read.unwrap_or(0)
+        );
+    }
+}
+
+/// Scenario: A rate-limited TCP query is still answered
+/// features/rate-limiting.feature:201
+///
+/// TCP completed a handshake, so the source is real and a reply cannot be
+/// reflected at a third party. Silence there would just break legitimate
+/// clients falling back from a truncated UDP answer.
+#[tokio::test]
+async fn a_rate_limited_tcp_query_is_refused_rather_than_dropped() {
+    let limiter = Arc::new(RateLimiter::new(1, 1));
+    let server = TestServer::start(
+        vec![spec("www", "A", &["203.0.113.10"])],
+        Some(Arc::clone(&limiter)),
+    )
+    .await;
+
+    let first = ask_tcp(&server, &format!("www.{ZONE}"), RecordType::A).await;
+    assert_eq!(first.metadata.response_code, ResponseCode::NoError);
+
+    let second = ask_tcp(&server, &format!("www.{ZONE}"), RecordType::A).await;
     assert_eq!(second.metadata.response_code, ResponseCode::Refused);
 }
 
@@ -423,6 +466,446 @@ async fn edns_request_gets_an_edns_response() {
         edns.max_payload() >= 512,
         "advertised payload must be at least the RFC 6891 minimum"
     );
+}
+
+/// Send a fully-formed message and read the reply, so a test can control every
+/// header bit rather than going through `query_message`.
+/// Round-trip a message and return the reply together with its wire length.
+///
+/// The byte count is the point: the amplification argument rests on how big the
+/// datagram is, and every test that asserted only on decoded fields would pass
+/// against a server emitting four kilobytes.
+async fn round_trip_measured(server: &TestServer, request: &Message) -> (usize, Message) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("client binds");
+    socket.connect(server.udp).await.expect("client connects");
+    socket
+        .send(&request.to_vec().expect("request encodes"))
+        .await
+        .expect("request sends");
+
+    let mut buf = vec![0u8; 65535];
+    let len = tokio::time::timeout(QUERY_TIMEOUT, socket.recv(&mut buf))
+        .await
+        .expect("server answers before the timeout")
+        .expect("response reads");
+    (
+        len,
+        Message::from_vec(&buf[..len]).expect("response decodes"),
+    )
+}
+
+/// Scenario: A query with no OPT record is answered within 512 bytes
+/// features/edns-and-transport.feature — RFC 1035 §4.2.1
+///
+/// Hickory sizes a non-EDNS UDP reply from its 4096-byte receive buffer, so
+/// without our own cap a 33-byte query bought a 4096-byte datagram aimed at
+/// whatever source the attacker forged.
+#[tokio::test]
+async fn a_non_edns_udp_answer_never_exceeds_512_bytes() {
+    let big = "x".repeat(200);
+    let server = TestServer::start(
+        vec![spec(
+            "big",
+            "TXT",
+            &[
+                &format!("\"{big}\""),
+                &format!("\"{big}\""),
+                &format!("\"{big}\""),
+                &format!("\"{big}\""),
+            ],
+        )],
+        None,
+    )
+    .await;
+
+    // No OPT record on the request at all.
+    let request = query_message(&format!("big.{ZONE}"), RecordType::TXT);
+    let (len, response) = round_trip_measured(&server, &request).await;
+
+    assert!(
+        len <= 512,
+        "a non-EDNS UDP answer must fit in 512 bytes, got {len}"
+    );
+    assert!(
+        response.metadata.truncation,
+        "an answer that did not fit must set TC so the client retries over TCP"
+    );
+
+    // And the TCP retry must actually deliver what UDP could not.
+    let over_tcp = ask_tcp(&server, &format!("big.{ZONE}"), RecordType::TXT).await;
+    assert!(
+        !over_tcp.metadata.truncation,
+        "TCP has room, TC must be clear"
+    );
+    assert_eq!(
+        over_tcp.answers.len(),
+        4,
+        "the TCP retry must carry the full RRset — every configured value"
+    );
+}
+
+/// Scenario: A record type with no size arm is measured, not guessed
+/// features/edns-and-transport.feature — RFC 1035 §4.2.1
+///
+/// TLSA, CAA, SVCB and friends carry operator-supplied blobs. A fixed 256-byte
+/// guess for them let a 663-byte answer out with TC clear — the cap applied to
+/// the common types and quietly did not to the rest.
+#[tokio::test]
+async fn a_large_record_of_an_unlisted_type_is_still_capped_at_512_bytes() {
+    let server = TestServer::start(
+        vec![spec(
+            "tlsa",
+            "TLSA",
+            &[&format!("3 1 1 {}", "ab".repeat(600))],
+        )],
+        None,
+    )
+    .await;
+
+    let request = query_message(&format!("tlsa.{ZONE}"), RecordType::TLSA);
+    let (len, response) = round_trip_measured(&server, &request).await;
+
+    assert!(
+        len <= 512,
+        "a non-EDNS UDP answer must fit in 512 bytes whatever the record type, got {len}"
+    );
+    assert!(
+        response.metadata.truncation,
+        "TC must be set when truncated"
+    );
+}
+
+/// Scenario: An EDNS answer never exceeds the advertised ceiling
+/// features/edns-and-transport.feature — DNS Flag Day 2020
+///
+/// The clamp is applied in two places — the OPT we advertise and the budget the
+/// encoder works to. Asserting only the advertisement leaves the mutant that
+/// clamps the number while emitting the bytes anyway, which is the one that
+/// matters.
+#[tokio::test]
+async fn an_edns_answer_never_exceeds_the_clamped_ceiling_in_bytes() {
+    let big = "x".repeat(200);
+    let values: Vec<String> = (0..20).map(|_| format!("\"{big}\"")).collect();
+    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+    let server = TestServer::start(vec![spec("huge", "TXT", &refs)], None).await;
+
+    for offered in [4096u16, 8192, u16::MAX] {
+        let mut request = query_message(&format!("huge.{ZONE}"), RecordType::TXT);
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.set_max_payload(offered);
+        request.set_edns(edns);
+
+        let (len, _) = round_trip_measured(&server, &request).await;
+        assert!(
+            len <= 1232,
+            "a client offering {offered} must still not receive more than 1232 bytes, got {len}"
+        );
+    }
+}
+
+async fn round_trip(server: &TestServer, request: &Message) -> Message {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("client binds");
+    socket.connect(server.udp).await.expect("client connects");
+    socket
+        .send(&request.to_vec().expect("request encodes"))
+        .await
+        .expect("request sends");
+
+    let mut buf = vec![0u8; 4096];
+    let len = tokio::time::timeout(QUERY_TIMEOUT, socket.recv(&mut buf))
+        .await
+        .expect("server answers before the timeout")
+        .expect("response reads");
+    Message::from_vec(&buf[..len]).expect("response decodes")
+}
+
+/// Send raw bytes and return the raw reply. `Edns::set_max_payload` clamps to
+/// 512 on the way out, so a test that wants to offer a smaller payload — which
+/// a non-Hickory client is perfectly able to do — has to build the packet.
+async fn raw_round_trip(server: &TestServer, request: &[u8]) -> Vec<u8> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("client binds");
+    socket.connect(server.udp).await.expect("client connects");
+    socket.send(request).await.expect("request sends");
+
+    let mut buf = vec![0u8; 4096];
+    let len = tokio::time::timeout(QUERY_TIMEOUT, socket.recv(&mut buf))
+        .await
+        .expect("server answers before the timeout")
+        .expect("response reads");
+    buf.truncate(len);
+    buf
+}
+
+/// The CLASS field of the first OPT record in a raw response, which is where
+/// EDNS keeps the advertised UDP payload size.
+fn opt_payload(response: &[u8]) -> u16 {
+    let message = Message::from_vec(response).expect("response decodes");
+    message
+        .edns
+        .as_ref()
+        .expect("response must carry EDNS")
+        .max_payload()
+}
+
+#[tokio::test]
+async fn a_client_that_offers_a_tiny_edns_payload_is_raised_to_512() {
+    // Kills `MIN_EDNS_PAYLOAD: 512 -> 0` and `.max(MIN) -> .min(MIN)`. The
+    // existing EDNS test offered 4096, so the clamp was never exercised, and it
+    // could not have been: `Edns::set_max_payload` raises anything below 512
+    // before it reaches the wire. A hand-built packet is the only way to
+    // present the server with the case its own clamp exists for.
+    //
+    // RFC 6891 s6.2.3: "Values lower than 512 MUST be treated as equal to 512."
+    let server = TestServer::start(vec![spec("www", "A", &["203.0.113.10"])], None).await;
+
+    for offered in [0u16, 1, 300, 511] {
+        // Header: id 0x4242, RD, QDCOUNT 1, ARCOUNT 1.
+        let mut packet: Vec<u8> = vec![0x42, 0x42, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1];
+        // Question: www.<ZONE>. A IN
+        for label in format!("www.{ZONE}").split('.') {
+            packet.push(u8::try_from(label.len()).expect("short label"));
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0);
+        packet.extend_from_slice(&1u16.to_be_bytes()); // QTYPE A
+        packet.extend_from_slice(&1u16.to_be_bytes()); // QCLASS IN
+                                                       // OPT RR: root owner, TYPE 41, CLASS = offered payload, TTL 0, RDLEN 0.
+        packet.push(0);
+        packet.extend_from_slice(&41u16.to_be_bytes());
+        packet.extend_from_slice(&offered.to_be_bytes());
+        packet.extend_from_slice(&0u32.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes());
+
+        let response = raw_round_trip(&server, &packet).await;
+        assert_eq!(
+            opt_payload(&response),
+            512,
+            "a client offering {offered} must be answered with 512, not {offered} echoed back"
+        );
+    }
+}
+
+/// Scenario: A client advertising a large payload has it clamped, not echoed
+/// features/edns-and-transport.feature:50
+///
+/// The client chooses this number, so echoing it back unclamped lets the client
+/// choose our amplification factor with it — 8192 bought a 203x answer from a
+/// 40-byte query. 1232 is the DNS Flag Day 2020 ceiling.
+#[tokio::test]
+async fn a_large_edns_payload_offer_is_clamped_to_the_flag_day_ceiling() {
+    let server = TestServer::start(vec![spec("www", "A", &["203.0.113.10"])], None).await;
+
+    for offered in [1500u16, 4096, 8192, u16::MAX] {
+        let mut request = query_message(&format!("www.{ZONE}"), RecordType::A);
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.set_max_payload(offered);
+        request.set_edns(edns);
+
+        let response = round_trip(&server, &request).await;
+        assert_eq!(
+            response
+                .edns
+                .as_ref()
+                .expect("response must carry EDNS")
+                .max_payload(),
+            1232,
+            "a client offering {offered} must be answered with 1232, not {offered} echoed back"
+        );
+    }
+}
+
+/// Scenario: A payload offer between the floor and the ceiling is honoured
+/// features/edns-and-transport.feature:50
+///
+/// The clamp must not flatten every resolver to 1232 — one that can only take
+/// 1000 bytes still gets 1000.
+#[tokio::test]
+async fn an_edns_payload_offer_inside_the_range_is_honoured() {
+    let server = TestServer::start(vec![spec("www", "A", &["203.0.113.10"])], None).await;
+
+    let mut request = query_message(&format!("www.{ZONE}"), RecordType::A);
+    let mut edns = hickory_proto::op::Edns::new();
+    edns.set_max_payload(1000);
+    request.set_edns(edns);
+
+    let response = round_trip(&server, &request).await;
+    assert_eq!(
+        response
+            .edns
+            .as_ref()
+            .expect("response must carry EDNS")
+            .max_payload(),
+        1000
+    );
+}
+
+#[tokio::test]
+async fn the_response_advertises_edns_version_zero() {
+    // Kills `edns.set_version(0) -> set_version(1)`: a resolver seeing an
+    // unknown EDNS version in a reply is entitled to drop the whole answer.
+    let server = TestServer::start(vec![spec("www", "A", &["203.0.113.10"])], None).await;
+
+    let mut request = query_message(&format!("www.{ZONE}"), RecordType::A);
+    request.set_edns(hickory_proto::op::Edns::new());
+
+    let response = round_trip(&server, &request).await;
+    assert_eq!(
+        response.edns.as_ref().expect("EDNS in the reply").version(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_query_without_edns_gets_a_reply_without_edns() {
+    let server = TestServer::start(vec![spec("www", "A", &["203.0.113.10"])], None).await;
+    let response = ask_udp(&server, &format!("www.{ZONE}"), RecordType::A).await;
+    assert!(
+        response.edns.is_none(),
+        "we must not volunteer an OPT record to a plain DNS client"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_opcodes_are_answered_notimp() {
+    // Kills `ResponseCode::NotImp -> FormErr` for a non-QUERY opcode. Nothing
+    // exercised any opcode other than QUERY, over any transport.
+    let server = TestServer::start(vec![spec("www", "A", &["203.0.113.10"])], None).await;
+
+    for op_code in [
+        OpCode::Status,
+        OpCode::Notify,
+        OpCode::Update,
+        OpCode::Unknown(3),
+        OpCode::Unknown(15),
+    ] {
+        let mut request = query_message(&format!("www.{ZONE}"), RecordType::A);
+        request.metadata.op_code = op_code;
+
+        let response = round_trip(&server, &request).await;
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::NotImp,
+            "opcode {op_code:?} must be NOTIMP, not another error code"
+        );
+        assert_eq!(
+            response.metadata.op_code, op_code,
+            "the opcode must be echoed so the client can match the reply"
+        );
+        assert!(response.answers.is_empty());
+        assert!(!response.metadata.authoritative);
+    }
+}
+
+#[tokio::test]
+async fn a_response_sent_to_the_server_is_ignored() {
+    // QR=1 means "this is an answer". Replying to it turns two name servers
+    // pointed at each other into a packet loop.
+    let server = TestServer::start(vec![spec("www", "A", &["203.0.113.10"])], None).await;
+
+    let mut request = query_message(&format!("www.{ZONE}"), RecordType::A);
+    request.metadata.message_type = MessageType::Response;
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("client binds");
+    socket.connect(server.udp).await.expect("client connects");
+    socket
+        .send(&request.to_vec().expect("encodes"))
+        .await
+        .expect("sends");
+
+    let mut buf = vec![0u8; 4096];
+    let outcome = tokio::time::timeout(Duration::from_millis(750), socket.recv(&mut buf)).await;
+    assert!(
+        outcome.is_err(),
+        "the server answered a message with QR=1: {:?}",
+        outcome.map(|r| r.map(|n| buf[..n].to_vec()))
+    );
+}
+
+#[tokio::test]
+async fn queries_keep_being_answered_across_a_zone_reload() {
+    // A reload swaps an ArcSwap under live traffic. Nothing covered the two
+    // happening at once, so a torn swap would have gone unnoticed.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let cfg = zone_config(vec![spec("www", "A", &["203.0.113.10"])]);
+    let zone = Arc::new(Zone::from_config(&cfg).expect("zone builds"));
+    let metrics = Arc::new(Metrics::new());
+    let handler = Arc::new(DnsHandler::new(zone, &cfg, Arc::clone(&metrics), None));
+
+    let alt = zone_config(vec![spec("www", "A", &["198.51.100.7"])]);
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let reloader = {
+        let (handler, alt, cfg, stop) = (
+            Arc::clone(&handler),
+            alt.clone(),
+            cfg.clone(),
+            Arc::clone(&stop),
+        );
+        tokio::task::spawn_blocking(move || {
+            let mut n = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                let next = if n.is_multiple_of(2) { &alt } else { &cfg };
+                handler.replace_zone(
+                    Arc::new(Zone::from_config(next).expect("zone builds")),
+                    next.builtins,
+                );
+                n += 1;
+            }
+            n
+        })
+    };
+
+    // Hammer the lookup path while the zone is being swapped underneath it.
+    let mut seen_a = 0u32;
+    let mut seen_b = 0u32;
+    for _ in 0..20_000 {
+        let z = handler.zone();
+        match z.lookup(
+            &hickory_proto::rr::LowerName::from(
+                format!("www.{ZONE}.").parse::<Name>().expect("name"),
+            ),
+            RecordType::A,
+        ) {
+            vega::zone::Answer::Records(records) => {
+                assert_eq!(records.len(), 1, "a reload must never yield a partial set");
+                match &records[0].data {
+                    RData::A(a) if a.0.to_string() == "203.0.113.10" => seen_a += 1,
+                    RData::A(a) if a.0.to_string() == "198.51.100.7" => seen_b += 1,
+                    other => panic!("unexpected record during a reload: {other:?}"),
+                }
+            }
+            other => panic!("a query in flight during a reload lost its answer: {other:?}"),
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let reloads = reloader.await.expect("reloader finishes");
+    assert!(reloads > 0, "the reloader never ran");
+    assert_eq!(seen_a + seen_b, 20_000);
+}
+
+#[tokio::test]
+async fn a_failing_reload_leaves_the_previous_zone_in_place() {
+    // `reload_hook` builds the new zone before swapping, so a config that does
+    // not parse must be a no-op rather than a half-applied zone.
+    let cfg = zone_config(vec![spec("www", "A", &["203.0.113.10"])]);
+    let zone = Arc::new(Zone::from_config(&cfg).expect("zone builds"));
+    let handler = DnsHandler::new(zone, &cfg, Arc::new(Metrics::new()), None);
+
+    let broken = zone_config(vec![spec("bad", "A", &["not-an-ip"])]);
+    assert!(
+        Zone::from_config(&broken).is_err(),
+        "the fixture must actually be broken"
+    );
+
+    assert_eq!(handler.zone().record_count(), 1);
+    let name =
+        hickory_proto::rr::LowerName::from(format!("www.{ZONE}.").parse::<Name>().expect("name"));
+    assert!(matches!(
+        handler.zone().lookup(&name, RecordType::A),
+        vega::zone::Answer::Records(_)
+    ));
 }
 
 #[tokio::test]

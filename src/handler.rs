@@ -8,9 +8,10 @@ use arc_swap::ArcSwap;
 use hickory_proto::{
     op::{Edns, Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode},
     rr::{
-        rdata::{A, AAAA, TXT},
-        LowerName, Name, RData, Record, RecordType,
+        rdata::{A, AAAA, HINFO, TXT},
+        DNSClass, LowerName, Name, RData, Record, RecordType,
     },
+    serialize::binary::BinEncodable as _,
 };
 use hickory_server::{
     net::{runtime::Time, xfer::Protocol},
@@ -31,6 +32,37 @@ const NO_RECORDS: &[Record] = &[];
 
 /// Minimum EDNS payload size we will advertise, per RFC 6891.
 const MIN_EDNS_PAYLOAD: u16 = 512;
+
+/// Ceiling on the EDNS payload we will honour, whatever the client advertises.
+///
+/// 1232 is the DNS Flag Day 2020 figure: it fits inside the smallest plausible
+/// path MTU without IP fragmentation. Mirroring the client's number unclamped
+/// lets an attacker choose our amplification factor — advertising 8192 turned a
+/// 40-byte query into an 8142-byte answer, 203x, before this cap existed.
+const MAX_EDNS_PAYLOAD: u16 = 1232;
+
+/// Largest UDP response we will send to a client that offered no EDNS at all.
+///
+/// RFC 1035 §4.2.1. Hickory sizes a non-EDNS UDP response from its 4096-byte
+/// receive buffer instead, which made every plain query a 124x amplifier, so we
+/// enforce the limit ourselves rather than inheriting that default.
+const MAX_UDP_NO_EDNS: usize = 512;
+
+/// DNS header, fixed size. RFC 1035 §4.1.1.
+const HEADER_SIZE: usize = 12;
+
+/// QTYPE + QCLASS following the QNAME in a question. RFC 1035 §4.1.2.
+const QUESTION_FIXED: usize = 4;
+
+/// TYPE + CLASS + TTL + RDLENGTH preceding a record's RDATA. RFC 1035 §4.1.3.
+const RECORD_FIXED: usize = 10;
+
+/// Fallback RDATA size used when a record cannot be encoded to measure it.
+///
+/// Deliberately the largest an RDATA can be. An under-count here is not a
+/// pessimisation, it is the 512-byte cap silently not applying — which is
+/// exactly how a 663-byte TLSA answer went out with TC clear when this was 256.
+const RDATA_BOUND_FALLBACK: usize = u16::MAX as usize;
 
 /// The diagnostic sub-zones. Handy for smoke-testing a deployment; disable them
 /// with `--no-builtins` if you would rather not expose server internals.
@@ -190,21 +222,34 @@ impl DnsHandler {
             return resolved;
         }
 
+        // RFC 8482: answer ANY with one synthetic HINFO rather than everything we
+        // hold at the name. Returning the whole node made ANY both the largest
+        // response we could produce and — because the old lookup scanned every
+        // RRset in the zone to assemble it — the most expensive. An attacker got
+        // to pick both with a 29-byte packet.
+        if qtype.is_any() {
+            if !zone.has_name(name) {
+                return Resolved::negative(ResponseCode::NXDomain, zone.soa());
+            }
+            // RFC 8482 §4.2 permits synthesis only when there is no CNAME at the
+            // owner name, and §4.1 names the CNAME as the RRset worth returning.
+            // Anything using ANY to discover an alias must still find it.
+            if let Answer::Records(cnames) = zone.lookup(name, RecordType::CNAME) {
+                if !cnames.is_empty() {
+                    return Resolved::found(cnames);
+                }
+            }
+            return Resolved::found(vec![minimal_any(
+                Name::from(name.clone()),
+                zone.default_ttl(),
+            )]);
+        }
+
         // A zone-level SOA (from `[zone.soa]`) is not part of the record map, so
         // answer apex SOA queries from it directly.
-        if matches!(qtype, RecordType::SOA | RecordType::ANY) && name == zone.origin() {
+        if qtype == RecordType::SOA && name == zone.origin() {
             if let Some(soa) = zone.soa() {
-                let mut answers = vec![soa.clone()];
-                if qtype == RecordType::ANY {
-                    if let Answer::Records(extra) = zone.lookup(name, RecordType::ANY) {
-                        answers.extend(
-                            extra
-                                .into_iter()
-                                .filter(|r| r.record_type() != RecordType::SOA),
-                        );
-                    }
-                }
-                return Resolved::found(answers);
+                return Resolved::found(vec![soa.clone()]);
             }
         }
 
@@ -262,32 +307,82 @@ impl DnsHandler {
     }
 
     /// Validate the request and turn it into a [`Resolved`].
-    fn dispatch(&self, request: &Request, src: IpAddr) -> Resolved {
+    ///
+    /// `None` means send nothing at all. That is only ever the rate limiter on
+    /// UDP: answering a query we have decided to drop still delivers a packet to
+    /// whatever address the attacker forged, so a limiter that replies is not an
+    /// anti-reflection control.
+    fn dispatch(&self, request: &Request, src: IpAddr) -> Option<Resolved> {
         if let Some(limiter) = &self.limiter {
             if !limiter.check(src) {
                 self.metrics.rate_limited();
-                debug!(%src, "query dropped by rate limiter");
-                return Resolved::refused();
+                if request.protocol() == Protocol::Udp {
+                    debug!(%src, "query dropped by rate limiter");
+                    return None;
+                }
+                // TCP completed a handshake, so the source is not forged and a
+                // reply cannot be reflected at a third party. Answer honestly.
+                debug!(%src, "query refused by rate limiter (tcp)");
+                return Some(Resolved::refused());
             }
         }
 
         if request.metadata.message_type != MessageType::Query {
-            return Resolved::error(ResponseCode::FormErr);
+            return Some(Resolved::error(ResponseCode::FormErr));
         }
 
         if request.metadata.op_code != OpCode::Query {
             // We are a static authoritative server: no dynamic UPDATE, no NOTIFY.
             debug!(op_code = ?request.metadata.op_code, "unsupported op code");
-            return Resolved::error(ResponseCode::NotImp);
+            return Some(Resolved::error(ResponseCode::NotImp));
+        }
+
+        // RFC 6891 §6.1.3: an OPT we do not understand is answered BADVERS with
+        // the highest version we do support, not silently treated as version 0.
+        if let Some(edns) = request.edns.as_ref() {
+            if edns.version() > 0 {
+                debug!(version = edns.version(), "unsupported EDNS version");
+                return Some(Resolved::error(ResponseCode::BADVERS));
+            }
         }
 
         // RFC 1035 allows QDCOUNT > 1 but no implementation supports it, and 0
         // makes no sense for a query.
         let [query] = request.queries.queries() else {
-            return Resolved::error(ResponseCode::FormErr);
+            return Some(Resolved::error(ResponseCode::FormErr));
         };
 
-        self.resolve(query.name(), query.query_type(), src)
+        // We hold IN data only. Answering a CHAOS or HESIOD query from it is a
+        // spec violation, and it hands an attacker four extra reflector
+        // signatures that any IDS rule keyed on QCLASS=IN will miss.
+        if query.query_class() != DNSClass::IN {
+            debug!(class = %query.query_class(), "unsupported query class");
+            return Some(Resolved::refused());
+        }
+
+        // RFC 6895 §3.1 separates QTYPEs from TYPEs. Meta types are transaction
+        // requests, not names to look up — feeding them to the zone is why AXFR
+        // used to answer NOERROR with an empty body, which every secondary reads
+        // as a broken transfer rather than a refusal.
+        match query.query_type() {
+            RecordType::AXFR | RecordType::IXFR => {
+                debug!(qtype = %query.query_type(), "zone transfer requested but not implemented");
+                return Some(Resolved::refused());
+            }
+            // OPT is only ever a pseudo-record in the additional section, TSIG
+            // only ever a transaction signature, and QTYPE 0 is reserved
+            // (RFC 6895 §3.1). None of them names anything to look up — and the
+            // CNAME substitution rule at src/zone.rs would otherwise answer all
+            // three with a CNAME whenever the owner happened to have one.
+            // Note QTYPE 0 arrives as `ZERO`, not `Unknown(0)` — hickory maps the
+            // value on decode, so matching `Unknown(0)` here would never fire.
+            RecordType::OPT | RecordType::TSIG | RecordType::ZERO => {
+                return Some(Resolved::error(ResponseCode::FormErr));
+            }
+            _ => {}
+        }
+
+        Some(self.resolve(query.name(), query.query_type(), src))
     }
 }
 
@@ -303,20 +398,43 @@ impl RequestHandler for DnsHandler {
         let transport = transport_of(request.protocol());
         self.metrics.query(transport);
 
-        let resolved = self.dispatch(request, src.ip());
+        let Some(mut resolved) = self.dispatch(request, src.ip()) else {
+            // Rate-limited on UDP: deliberately silent, so the forged source
+            // receives nothing at all.
+            self.metrics.observe_latency(started.elapsed());
+            return dropped(&request.metadata);
+        };
 
         // Mirror the request's EDNS so a resolver that offered a large UDP
-        // payload gets one, instead of a needlessly truncated answer.
+        // payload gets one — but clamp it. The client picks the number, and an
+        // unclamped mirror lets it pick our amplification factor with it.
         let resp_edns = request.edns.as_ref().map(|req| {
             let mut edns = Edns::new();
-            edns.set_max_payload(req.max_payload().max(MIN_EDNS_PAYLOAD));
+            edns.set_max_payload(req.max_payload().clamp(MIN_EDNS_PAYLOAD, MAX_EDNS_PAYLOAD));
             edns.set_version(0);
             edns
         });
 
+        // A client that offered no EDNS gets 512 bytes (RFC 1035 §4.2.1). We
+        // cannot leave this to the encoder: hickory sizes a non-EDNS UDP
+        // response from its 4096-byte receive buffer, and we must not attach an
+        // OPT record to say otherwise (RFC 6891 §6.1.1 forbids one in a reply to
+        // a query that carried none). So drop the answer section ourselves and
+        // set TC, which is what tells the client to come back over TCP.
+        let mut truncated = false;
+        if request.protocol() == Protocol::Udp
+            && resp_edns.is_none()
+            && response_size_bound(request, &resolved) > MAX_UDP_NO_EDNS
+        {
+            resolved.answers.clear();
+            resolved.authority.clear();
+            truncated = true;
+        }
+
         let mut metadata = Metadata::response_from_request(&request.metadata);
         metadata.authoritative = resolved.authoritative;
         metadata.response_code = resolved.code;
+        metadata.truncation = truncated;
 
         let mut builder = MessageResponseBuilder::from_message_request(request);
         if let Some(edns) = resp_edns.as_ref() {
@@ -333,7 +451,14 @@ impl RequestHandler for DnsHandler {
         let outcome = response_handle.send_response(response).await;
         let elapsed = started.elapsed();
         self.metrics.observe_latency(elapsed);
-        self.metrics.response(resolved.code);
+        // Record what actually went on the wire, not what we intended. An answer
+        // that fails to encode is sent as SERVFAIL, and counting our own
+        // intention here left the servfail series reading zero during exactly
+        // the attack it exists to reveal.
+        self.metrics.response(match &outcome {
+            Ok(info) => info.response_code,
+            Err(_) => ResponseCode::ServFail,
+        });
 
         let qname = request
             .queries
@@ -362,6 +487,93 @@ impl RequestHandler for DnsHandler {
             }
         }
     }
+}
+
+/// The synthetic answer to a QTYPE=ANY query, per RFC 8482 §4.1.
+///
+/// One HINFO whose CPU field names the RFC, so an operator who packet-captures
+/// this can find out in one search why they did not get the whole node.
+fn minimal_any(owner: Name, ttl: u32) -> Record {
+    Record::from_rdata(
+        owner,
+        ttl,
+        RData::HINFO(HINFO::new("RFC8482".to_owned(), String::new())),
+    )
+}
+
+/// Upper bound on the wire size of the response we are about to build.
+///
+/// Deliberately ignores name compression and rounds unknown RDATA up, because
+/// this only decides whether a non-EDNS UDP answer fits in 512 bytes. Guessing
+/// high costs a TCP retry; guessing low emits an oversized datagram at whoever
+/// the attacker named as the source.
+fn response_size_bound(request: &Request, resolved: &Resolved) -> usize {
+    let question = request
+        .queries
+        .queries()
+        .first()
+        .map_or(0, |q| q.name().len() + 1 + QUESTION_FIXED);
+
+    HEADER_SIZE
+        + question
+        + resolved
+            .answers
+            .iter()
+            .chain(resolved.authority.iter())
+            .map(record_size_bound)
+            .sum::<usize>()
+}
+
+/// Upper bound on one record's wire size, owner name uncompressed.
+fn record_size_bound(record: &Record) -> usize {
+    record.name.len() + 1 + RECORD_FIXED + rdata_size_bound(&record.data)
+}
+
+/// Upper bound on an RDATA's wire size.
+///
+/// The arms are the types a zone is mostly made of, sized arithmetically so the
+/// common path allocates nothing. Everything else is *measured* rather than
+/// guessed: TLSA, CAA, SVCB, HTTPS, NAPTR, CERT and friends all carry
+/// operator-supplied blobs that run to kilobytes, and a guess that comes in low
+/// defeats the cap entirely. Measuring costs one allocation, on the non-EDNS
+/// UDP path only, for record types most zones never serve.
+fn rdata_size_bound(rdata: &RData) -> usize {
+    match rdata {
+        RData::A(_) => 4,
+        RData::AAAA(_) => 16,
+        RData::NS(ns) => ns.0.len() + 1,
+        RData::CNAME(cname) => cname.0.len() + 1,
+        RData::PTR(ptr) => ptr.0.len() + 1,
+        // preference + exchange
+        RData::MX(mx) => 2 + mx.exchange.len() + 1,
+        // priority + weight + port + target
+        RData::SRV(srv) => 6 + srv.target.len() + 1,
+        // mname + rname + five 32-bit fields
+        RData::SOA(soa) => soa.mname.len() + 1 + soa.rname.len() + 1 + 20,
+        // each character-string carries a one-byte length prefix
+        RData::TXT(txt) => txt.txt_data.iter().map(|s| s.len() + 1).sum(),
+        RData::HINFO(hinfo) => hinfo.cpu.len() + 1 + hinfo.os.len() + 1,
+        other => other
+            .to_bytes()
+            .map_or(RDATA_BOUND_FALLBACK, |bytes| bytes.len()),
+    }
+}
+
+/// Build a [`ResponseInfo`] for a request we answered with silence.
+///
+/// `handle_request` must return one even when nothing goes on the wire.
+fn dropped(request_meta: &Metadata) -> ResponseInfo {
+    let mut metadata = Metadata::response_from_request(request_meta);
+    metadata.response_code = ResponseCode::Refused;
+    ResponseInfo::from(Header {
+        metadata,
+        counts: HeaderCounts {
+            queries: 0,
+            answers: 0,
+            authorities: 0,
+            additionals: 0,
+        },
+    })
 }
 
 /// Build a `SERVFAIL` [`ResponseInfo`] for a request we could not answer.
@@ -480,6 +692,79 @@ mod tests {
                 .collect(),
             other => panic!("expected TXT, got {other:?}"),
         }
+    }
+
+    /// Scenario: The size estimate never under-counts a record
+    /// features/edns-and-transport.feature — "A spoofable query does not receive
+    /// an answer larger than the advertised limit"
+    ///
+    /// The whole 512-byte cap rests on this bound being an *upper* one. It was
+    /// not: a fixed 256-byte fallback let a TLSA record through at 663 bytes
+    /// with TC clear, which is the amplifier the cap exists to close. Every arm
+    /// is checked against the real encoder, including a type with no arm.
+    #[test]
+    fn the_rdata_size_bound_is_never_smaller_than_the_encoded_rdata() {
+        let cases: &[(RecordType, &str)] = &[
+            (RecordType::A, "203.0.113.10"),
+            (RecordType::AAAA, "2001:db8::1"),
+            (RecordType::NS, "ns1.example.com."),
+            (RecordType::CNAME, "target.example.com."),
+            (RecordType::PTR, "host.example.com."),
+            (RecordType::MX, "10 mail.example.com."),
+            (RecordType::SRV, "10 20 5060 sip.example.com."),
+            (RecordType::TXT, "\"v=spf1 mx -all\""),
+            (
+                RecordType::TXT,
+                "\"chunk-one\" \"chunk-two\" \"chunk-three\"",
+            ),
+            (RecordType::HINFO, "\"RFC8482\" \"\""),
+            (RecordType::CAA, "0 issue \"letsencrypt.org\""),
+            // No arm in the match: must be measured, not guessed.
+            (RecordType::TLSA, &format!("3 1 1 {}", "ab".repeat(600))),
+            (
+                RecordType::SSHFP,
+                "1 1 123456789abcdef67890123456789abcdef67890",
+            ),
+        ];
+
+        for (rtype, value) in cases {
+            let rdata = RData::try_from_str(*rtype, value)
+                .unwrap_or_else(|e| panic!("{rtype} {value:?} should parse: {e}"));
+            let actual = rdata
+                .to_bytes()
+                .unwrap_or_else(|e| panic!("{rtype} should encode: {e}"))
+                .len();
+            let bound = rdata_size_bound(&rdata);
+            assert!(
+                bound >= actual,
+                "{rtype} bound {bound} under-counts the encoded {actual} bytes for {value:?}"
+            );
+        }
+    }
+
+    /// Scenario: An ANY query at a CNAME owner returns the CNAME
+    /// features/cname.feature — RFC 8482 §4.2
+    ///
+    /// Synthesis is only permitted when there is no CNAME at the owner name.
+    /// Returning the HINFO regardless hid aliases from anything that discovers
+    /// them with ANY.
+    #[test]
+    fn an_any_query_at_a_cname_owner_returns_the_cname_not_the_hinfo() {
+        let h = handler(
+            vec![
+                spec("alias", "CNAME", &["origin.example.com."]),
+                spec("origin", "A", &["203.0.113.20"]),
+            ],
+            false,
+        );
+        let r = h.resolve(&lower("alias.example.com."), RecordType::ANY, client());
+        assert_eq!(r.code, ResponseCode::NoError);
+        assert_eq!(r.answers.len(), 1, "{:?}", r.answers);
+        assert_eq!(
+            r.answers[0].record_type(),
+            RecordType::CNAME,
+            "RFC 8482 §4.2 forbids synthesising over a CNAME"
+        );
     }
 
     #[test]
@@ -629,5 +914,196 @@ mod tests {
 
         assert!(limiter.check(client()));
         assert!(!limiter.check(client()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests from mutation testing.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_apex_soa_query_returns_only_the_soa() {
+        // Kills `==` -> `!=` on the ANY check in the apex-SOA branch, which
+        // splices every other apex record into the answer to a plain SOA query.
+        let h = handler(
+            vec![
+                spec("@", "A", &["203.0.113.10"]),
+                spec("@", "MX", &["10 mail.example.com."]),
+            ],
+            false,
+        );
+        let r = h.resolve(&lower("example.com."), RecordType::SOA, client());
+        assert_eq!(r.answers.len(), 1, "{:?}", r.answers);
+        assert_eq!(r.answers[0].record_type(), RecordType::SOA);
+    }
+
+    /// Scenario: An ANY query is answered with a single synthetic HINFO
+    /// features/zone-lookup.feature:174
+    ///
+    /// RFC 8482 §4.1. This used to return the whole node — every RRset at the
+    /// name plus the SOA — which made ANY the largest answer we could produce
+    /// from the smallest query anyone could send.
+    #[test]
+    fn an_apex_any_query_is_answered_with_one_synthetic_hinfo() {
+        let h = handler(
+            vec![
+                spec("@", "A", &["203.0.113.10"]),
+                spec("@", "MX", &["10 mail.example.com."]),
+            ],
+            false,
+        );
+        let r = h.resolve(&lower("example.com."), RecordType::ANY, client());
+        assert_eq!(r.code, ResponseCode::NoError);
+        assert_eq!(r.answers.len(), 1, "{:?}", r.answers);
+        assert_eq!(r.answers[0].record_type(), RecordType::HINFO);
+        let RData::HINFO(hinfo) = &r.answers[0].data else {
+            panic!("expected HINFO, got {:?}", r.answers[0].data);
+        };
+        assert_eq!(&*hinfo.cpu, b"RFC8482");
+
+        let types: Vec<_> = r.answers.iter().map(Record::record_type).collect();
+        assert!(!types.contains(&RecordType::A), "{types:?}");
+        assert!(!types.contains(&RecordType::MX), "{types:?}");
+        assert!(!types.contains(&RecordType::SOA), "{types:?}");
+    }
+
+    /// Scenario: An ANY query for a name that does not exist is NXDOMAIN
+    /// features/zone-lookup.feature:174
+    ///
+    /// Kills a mutant that answers every ANY query with the HINFO regardless of
+    /// whether the name exists, which would make the zone claim every name in it.
+    #[test]
+    fn an_any_query_for_a_missing_name_is_nxdomain() {
+        let h = handler(vec![spec("www", "A", &["203.0.113.10"])], false);
+        let r = h.resolve(&lower("nope.example.com."), RecordType::ANY, client());
+        assert_eq!(r.code, ResponseCode::NXDomain);
+        assert!(r.answers.is_empty());
+        assert_eq!(r.authority.len(), 1, "the SOA must accompany an NXDOMAIN");
+    }
+
+    #[test]
+    fn a_soa_query_below_the_apex_is_not_answered_from_the_zone_soa() {
+        // Kills `&&` -> `||` in the apex-SOA guard, which would serve the zone
+        // SOA as the answer to an SOA query for any name in the zone.
+        let h = handler(vec![spec("www", "A", &["203.0.113.20"])], false);
+        let r = h.resolve(&lower("www.example.com."), RecordType::SOA, client());
+        assert_eq!(r.code, ResponseCode::NoError);
+        assert!(
+            r.answers.is_empty(),
+            "the SOA is only served at the apex: {:?}",
+            r.answers
+        );
+        assert_eq!(r.authority.len(), 1);
+    }
+
+    #[test]
+    fn replace_zone_swaps_the_records_being_served() {
+        // Kills `replace_zone` replaced with `()`. Nothing in the suite
+        // exercised a reload at all, so a broken swap was invisible.
+        let h = handler(vec![spec("www", "A", &["203.0.113.20"])], false);
+        let before = h.resolve(&lower("www.example.com."), RecordType::A, client());
+        assert_eq!(
+            &before.answers[0].data,
+            &RData::try_from_str(RecordType::A, "203.0.113.20").unwrap()
+        );
+
+        let cfg = zone_config(vec![spec("www", "A", &["198.51.100.7"])], false);
+        h.replace_zone(Arc::new(Zone::from_config(&cfg).unwrap()), false);
+
+        let after = h.resolve(&lower("www.example.com."), RecordType::A, client());
+        assert_eq!(
+            &after.answers[0].data,
+            &RData::try_from_str(RecordType::A, "198.51.100.7").unwrap(),
+            "a reload must be visible to the next query"
+        );
+        assert_eq!(h.zone().record_count(), 1);
+    }
+
+    #[test]
+    fn replace_zone_can_turn_builtins_on_and_off() {
+        let h = handler(vec![], false);
+        assert_eq!(
+            h.resolve(&lower("myip.example.com."), RecordType::A, client())
+                .code,
+            ResponseCode::NXDomain
+        );
+
+        let cfg = zone_config(vec![], true);
+        h.replace_zone(Arc::new(Zone::from_config(&cfg).unwrap()), true);
+        assert_eq!(
+            h.resolve(&lower("myip.example.com."), RecordType::A, client())
+                .answers
+                .len(),
+            1
+        );
+
+        h.replace_zone(Arc::new(Zone::from_config(&cfg).unwrap()), false);
+        assert_eq!(
+            h.resolve(&lower("myip.example.com."), RecordType::A, client())
+                .code,
+            ResponseCode::NXDomain
+        );
+    }
+
+    #[test]
+    fn a_builtin_answers_an_any_query_with_its_txt() {
+        // Kills `==` -> `!=` on the ANY check in txt_builtin, which turns the
+        // test into "answer TXT for everything except ANY".
+        let h = handler(vec![], true);
+        let r = h.resolve(&lower("version.example.com."), RecordType::ANY, client());
+        assert_eq!(r.answers.len(), 1);
+        assert_eq!(r.answers[0].record_type(), RecordType::TXT);
+    }
+
+    #[test]
+    fn a_builtin_returns_nodata_for_a_non_txt_type() {
+        let h = handler(vec![], true);
+        let r = h.resolve(&lower("version.example.com."), RecordType::A, client());
+        assert_eq!(r.code, ResponseCode::NoError);
+        assert!(r.answers.is_empty(), "{:?}", r.answers);
+        assert_eq!(r.authority.len(), 1);
+    }
+
+    #[test]
+    fn builtin_answers_carry_the_zone_default_ttl() {
+        // Kills `Zone::default_ttl -> 0` / `-> 1`: the built-in TTL is the only
+        // consumer of that accessor.
+        let h = handler(vec![], true);
+        for name in [
+            "version.example.com.",
+            "hello.example.com.",
+            "counter.example.com.",
+        ] {
+            let r = h.resolve(&lower(name), RecordType::TXT, client());
+            assert_eq!(r.answers[0].ttl, 300, "{name}");
+        }
+        let r = h.resolve(&lower("myip.example.com."), RecordType::A, client());
+        assert_eq!(r.answers[0].ttl, 300);
+    }
+
+    #[test]
+    fn every_noerror_answer_with_no_records_carries_the_soa() {
+        // Guards the `Answer::Records(records) if records.is_empty()` arm: a
+        // NOERROR with an empty answer section must always be cacheable, which
+        // means it must always carry the zone SOA.
+        let h = handler(vec![spec("www", "A", &["203.0.113.20"])], true);
+        for (name, qtype) in [
+            ("www.example.com.", RecordType::AAAA),
+            ("www.example.com.", RecordType::MX),
+            ("example.com.", RecordType::TXT),
+            ("myip.example.com.", RecordType::AAAA),
+            ("version.example.com.", RecordType::A),
+            ("hello.example.com.", RecordType::MX),
+            ("counter.example.com.", RecordType::SRV),
+        ] {
+            let r = h.resolve(&lower(name), qtype, client());
+            if r.code == ResponseCode::NoError && r.answers.is_empty() {
+                assert_eq!(
+                    r.authority.len(),
+                    1,
+                    "{name}/{qtype} answered NODATA without an SOA"
+                );
+                assert_eq!(r.authority[0].record_type(), RecordType::SOA);
+            }
+        }
     }
 }

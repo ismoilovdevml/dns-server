@@ -1,4 +1,4 @@
-//! `dns-server record …` — list, inspect and edit record sets in the config file.
+//! `vega record …` — list, inspect and edit record sets in the config file.
 
 use std::{net::SocketAddr, path::Path};
 
@@ -375,7 +375,7 @@ values = ["203.0.113.10"]
 
     fn fixture() -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("dns-server.toml");
+        let path = dir.path().join("vega.toml");
         fs::write(&path, BASE).unwrap();
         (dir, path)
     }

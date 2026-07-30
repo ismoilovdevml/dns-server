@@ -14,7 +14,7 @@ use tempfile::TempDir;
 /// Path to the binary under test, as provided by Cargo.
 fn bin() -> PathBuf {
     // CARGO_BIN_EXE_<name> is set for integration tests of a binary target.
-    PathBuf::from(env!("CARGO_BIN_EXE_dns-server"))
+    PathBuf::from(env!("CARGO_BIN_EXE_vega"))
 }
 
 /// Run the binary with `args`, from `dir`.
@@ -25,7 +25,7 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         // Keep output deterministic: no colour, no inherited config, no RUST_LOG.
         .env("NO_COLOR", "1")
         .env_remove("CLICOLOR_FORCE")
-        .env_remove("DNS_CONFIG")
+        .env_remove("VEGA_CONFIG")
         .env_remove("RUST_LOG")
         .output()
         .expect("the binary should be runnable")
@@ -86,7 +86,7 @@ fn init_creates_a_config_and_is_idempotent() {
     let first = run(dir.path(), &["init", "--origin", "example.com", "--json"]);
     assert!(first.status.success());
     assert_eq!(json(&first)["created"], true);
-    assert!(dir.path().join("dns-server.toml").is_file());
+    assert!(dir.path().join("vega.toml").is_file());
 
     // A second run must not clobber the file.
     let second = run(dir.path(), &["init", "--origin", "other.test", "--json"]);
@@ -100,7 +100,7 @@ fn init_creates_a_config_and_is_idempotent() {
 #[test]
 fn config_is_discovered_in_the_working_directory() {
     let dir = workspace();
-    // No --config: the search path should find ./dns-server.toml.
+    // No --config: the search path should find ./vega.toml.
     let output = run(dir.path(), &["zone", "show", "--json"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(json(&output)["origin"], "example.com");
@@ -113,7 +113,7 @@ fn missing_config_is_an_error_with_a_useful_message() {
     assert!(!output.status.success());
     let text = stderr(&output);
     assert!(text.contains("no config file found"), "{text}");
-    assert!(text.contains("dns-server init"), "{text}");
+    assert!(text.contains("vega init"), "{text}");
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn record_add_reports_what_changed() {
 #[test]
 fn record_add_rejects_bad_input_without_writing() {
     let dir = workspace();
-    let before = std::fs::read_to_string(dir.path().join("dns-server.toml")).unwrap();
+    let before = std::fs::read_to_string(dir.path().join("vega.toml")).unwrap();
 
     let bad_value = run(dir.path(), &["record", "add", "www", "A", "not-an-ip"]);
     assert!(!bad_value.status.success());
@@ -177,7 +177,7 @@ fn record_add_rejects_bad_input_without_writing() {
     assert!(stderr(&bad_type).contains("unknown record type"));
 
     assert_eq!(
-        std::fs::read_to_string(dir.path().join("dns-server.toml")).unwrap(),
+        std::fs::read_to_string(dir.path().join("vega.toml")).unwrap(),
         before,
         "a rejected edit must leave the file untouched"
     );
@@ -279,7 +279,7 @@ fn wildcards_and_apex_names_are_accepted() {
 #[test]
 fn config_edits_survive_a_round_trip_and_keep_comments() {
     let dir = workspace();
-    let path = dir.path().join("dns-server.toml");
+    let path = dir.path().join("vega.toml");
 
     // The generated config starts with a comment; edits must not eat it.
     let before = std::fs::read_to_string(&path).unwrap();
@@ -341,7 +341,7 @@ fn check_validates_and_reports_the_zone() {
 fn check_fails_on_a_broken_config() {
     let dir = TempDir::new().unwrap();
     std::fs::write(
-        dir.path().join("dns-server.toml"),
+        dir.path().join("vega.toml"),
         "[zone]\norigin = \"example.com\"\n\n[[zone.records]]\nname = \"@\"\ntype = \"A\"\nvalues = [\"garbage\"]\n",
     )
     .unwrap();
@@ -382,7 +382,7 @@ fn shell_completions_are_generated() {
         let output = run(dir.path(), &["completions", shell]);
         assert!(output.status.success(), "{shell}: {}", stderr(&output));
         assert!(
-            stdout(&output).contains("dns-server"),
+            stdout(&output).contains("vega"),
             "{shell} completions look empty"
         );
     }
@@ -487,7 +487,7 @@ fn text_output_is_plain_when_no_color_is_set() {
 #[test]
 fn global_flags_are_accepted_on_either_side_of_the_subcommand() {
     let dir = workspace();
-    let path = dir.path().join("dns-server.toml");
+    let path = dir.path().join("vega.toml");
     let path = path.to_str().unwrap();
 
     let before = run(dir.path(), &["--config", path, "zone", "show", "--json"]);

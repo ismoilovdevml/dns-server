@@ -1,4 +1,4 @@
-//! `dns-server query` and `dns-server status` — look at a running server.
+//! `vega query` and `vega status` — look at a running server.
 //!
 //! These are the debugging commands: `query` answers "what does the server
 //! actually return", `status` answers "is it healthy and what has it been doing".

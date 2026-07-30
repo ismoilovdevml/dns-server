@@ -18,6 +18,17 @@ use crate::config::{RecordSpec, SoaSpec, ZoneConfig};
 /// RFC 1034 does not set a limit; this stops a misconfigured loop from spinning.
 const MAX_CNAME_DEPTH: usize = 8;
 
+/// Longest record value we will hand to the presentation-format parser.
+///
+/// `RData::try_from_str` runs hickory's zone-file lexer, which carries
+/// `assert!(i < 4095)` over the characters of a single token
+/// (hickory-proto `serialize/txt/zone_lex.rs`). A longer value aborts the
+/// process rather than returning an error — and because `Zone::from_config` is
+/// also the reload path, that turns one oversized record in an edited config
+/// into a crash loop instead of a rejected reload. Refuse it ourselves, with a
+/// message that says what to do.
+const MAX_RECORD_VALUE_CHARS: usize = 4090;
+
 /// Result of a zone lookup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Answer {
@@ -125,6 +136,16 @@ impl Zone {
         // are rewritten to the queried name at lookup time.
         let mut records = Vec::with_capacity(spec.values.len());
         for value in &spec.values {
+            let chars = value.chars().count();
+            if chars > MAX_RECORD_VALUE_CHARS {
+                bail!(
+                    "{} record value for {:?} is {chars} characters; the maximum is \
+                     {MAX_RECORD_VALUE_CHARS}. Split a long TXT value into several \
+                     character-strings instead.",
+                    spec.record_type,
+                    spec.name
+                );
+            }
             let rdata = RData::try_from_str(record_type, value).map_err(|e| {
                 anyhow::anyhow!(
                     "invalid {} record value {:?} for {:?}: {e}",
@@ -189,6 +210,15 @@ impl Zone {
     /// True when `name` falls inside this zone.
     pub fn contains(&self, name: &LowerName) -> bool {
         self.lower_origin.zone_of(name)
+    }
+
+    /// True when `name` is an owner name this zone holds records for.
+    ///
+    /// O(1). Exists so the ANY path can tell NXDOMAIN from NODATA without the
+    /// full-map scan that made a 29-byte ANY query cost 26x an ordinary lookup
+    /// on a 50k-record zone.
+    pub fn has_name(&self, name: &LowerName) -> bool {
+        self.names.contains(name)
     }
 
     /// Resolve `name`/`record_type` against the zone.
@@ -569,5 +599,288 @@ mod tests {
             spec("www", "A", &["203.0.113.3"]),
         ]);
         assert_eq!(z.record_count(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests from mutation testing. Each one names the mutant that
+    // survived without it, so a later refactor knows what it is load-bearing
+    // for.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_fully_qualified_in_zone_record_name_is_accepted() {
+        // Kills `delete !` in Zone::qualify: with the `!` gone, an in-zone FQDN
+        // is rejected and an out-of-zone one is silently accepted instead.
+        let z = zone(vec![spec("www.example.com.", "A", &["203.0.113.20"])]);
+        let Answer::Records(records) = z.lookup(&lower("www.example.com."), RecordType::A) else {
+            panic!("a fully-qualified in-zone name should resolve");
+        };
+        assert_eq!(records[0].name, parse_name("www.example.com.").unwrap());
+    }
+
+    #[test]
+    fn a_fully_qualified_out_of_zone_record_name_is_rejected() {
+        // The other half of the same mutant: a record claiming a name we are
+        // not authoritative for must fail at build time rather than get served.
+        let err = Zone::from_config(&ZoneConfig {
+            origin: "example.com".to_owned(),
+            default_ttl: 300,
+            builtins: false,
+            soa: None,
+            records: vec![spec("evil.example.org.", "A", &["203.0.113.20"])],
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("is not inside zone"), "{err}");
+    }
+
+    #[test]
+    fn default_ttl_is_reported_verbatim() {
+        // Kills `Zone::default_ttl -> 0` and `-> 1`. The accessor decides the
+        // TTL of every built-in sub-zone answer and nothing asserted on it.
+        assert_eq!(zone(vec![]).default_ttl(), 300);
+    }
+
+    #[test]
+    fn the_apex_exists_even_in_an_empty_zone() {
+        // Kills deleting `zone.names.insert(zone.lower_origin)`: without it the
+        // zone answers NXDOMAIN for its own origin.
+        let z = zone(vec![]);
+        assert_eq!(
+            z.lookup(&lower("example.com."), RecordType::A),
+            Answer::NoData
+        );
+        assert_eq!(
+            z.lookup(&lower("example.com."), RecordType::ANY),
+            Answer::NoData
+        );
+    }
+
+    #[test]
+    fn a_wildcard_matches_names_several_labels_below_it() {
+        // Kills `==` -> `!=` on the origin check in the wildcard walk: with the
+        // mutation the walk gives up after a single step and this is NXDOMAIN.
+        let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
+        let Answer::Records(records) = z.lookup(&lower("a.b.c.dev.example.com."), RecordType::A)
+        else {
+            panic!("*.dev must cover every name below dev.example.com");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].name,
+            parse_name("a.b.c.dev.example.com.").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_wildcard_walk_that_matches_nothing_terminates() {
+        // Kills `||` -> `&&` in the wildcard-walk break condition. With `&&`
+        // the loop calls base_name() on the root for ever; without this timeout
+        // the whole test binary hangs instead of reporting a failure.
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
+            let _ = tx.send(z.lookup(&lower("nope.example.com."), RecordType::A));
+        });
+        let answer = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the wildcard walk must terminate");
+        assert_eq!(answer, Answer::NxDomain);
+    }
+
+    #[test]
+    fn a_cname_loop_is_cut_off_after_a_handful_of_hops() {
+        // Kills `MAX_CNAME_DEPTH: 8 -> 800`. `cname_loop_terminates` expressed
+        // its bound in terms of the constant, so it stayed green for any value
+        // of it; this bound is deliberately hard-coded.
+        let z = zone(vec![
+            spec("a", "CNAME", &["b.example.com."]),
+            spec("b", "CNAME", &["a.example.com."]),
+        ]);
+        let Answer::Records(records) = z.lookup(&lower("a.example.com."), RecordType::A) else {
+            panic!("expected records");
+        };
+        assert!(
+            records.len() <= 16,
+            "a CNAME loop produced {} records; the depth limit is not doing its job",
+            records.len()
+        );
+        assert_eq!(records.len(), MAX_CNAME_DEPTH + 1);
+    }
+
+    #[test]
+    fn a_cname_chain_of_exactly_the_depth_limit_reaches_the_address() {
+        let mut records = Vec::new();
+        for i in 0..MAX_CNAME_DEPTH {
+            records.push(spec(
+                &format!("c{i}"),
+                "CNAME",
+                &[&format!("c{}.example.com.", i + 1)],
+            ));
+        }
+        records.push(spec(&format!("c{MAX_CNAME_DEPTH}"), "A", &["203.0.113.99"]));
+        let z = zone(records);
+
+        let Answer::Records(answers) = z.lookup(&lower("c0.example.com."), RecordType::A) else {
+            panic!("expected records");
+        };
+        assert_eq!(answers.len(), MAX_CNAME_DEPTH + 1);
+        assert_eq!(answers.last().unwrap().record_type(), RecordType::A);
+    }
+
+    #[test]
+    fn a_cname_chain_one_hop_too_long_stops_short_of_the_address() {
+        // Pins the behaviour on the far side of the limit, so that moving
+        // MAX_CNAME_DEPTH has to be a deliberate act.
+        let mut records = Vec::new();
+        for i in 0..=MAX_CNAME_DEPTH {
+            records.push(spec(
+                &format!("c{i}"),
+                "CNAME",
+                &[&format!("c{}.example.com.", i + 1)],
+            ));
+        }
+        records.push(spec(
+            &format!("c{}", MAX_CNAME_DEPTH + 1),
+            "A",
+            &["203.0.113.99"],
+        ));
+        let z = zone(records);
+
+        let Answer::Records(answers) = z.lookup(&lower("c0.example.com."), RecordType::A) else {
+            panic!("expected records");
+        };
+        assert_eq!(answers.len(), MAX_CNAME_DEPTH + 1);
+        assert!(
+            answers.iter().all(|r| r.record_type() == RecordType::CNAME),
+            "past the limit the chase stops before the address"
+        );
+    }
+
+    #[test]
+    fn record_count_counts_values_not_record_sets() {
+        // Kills `record_count += records.len()` -> `+= 1`.
+        let z = zone(vec![spec(
+            "pool",
+            "A",
+            &["203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4"],
+        )]);
+        assert_eq!(z.record_count(), 4);
+    }
+
+    #[test]
+    fn a_zone_level_soa_wins_over_a_record_set_soa() {
+        // Kills `zone.soa.is_none()` -> `is_some()` in the SOA fallback.
+        let z = zone(vec![spec(
+            "@",
+            "SOA",
+            &["ns9.example.com. hostmaster.example.com. 99 1 1 1 1"],
+        )]);
+        let RData::SOA(soa) = &z.soa().expect("soa").data else {
+            panic!("expected SOA");
+        };
+        assert_eq!(soa.serial, 7, "[zone.soa] must win over a record set");
+    }
+
+    #[test]
+    fn a_record_set_soa_is_used_when_no_zone_soa_is_declared() {
+        let z = Zone::from_config(&ZoneConfig {
+            origin: "example.com".to_owned(),
+            default_ttl: 300,
+            builtins: false,
+            soa: None,
+            records: vec![spec(
+                "@",
+                "SOA",
+                &["ns9.example.com. hostmaster.example.com. 99 1 1 1 1"],
+            )],
+        })
+        .expect("zone builds");
+        let RData::SOA(soa) = &z.soa().expect("soa").data else {
+            panic!("expected SOA");
+        };
+        assert_eq!(soa.serial, 99);
+    }
+
+    #[test]
+    fn a_wildcard_never_creates_a_record_at_its_own_parent() {
+        // Kills `if is_wildcard` -> `if !is_wildcard` in insert_spec.
+        let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
+        assert_eq!(
+            z.lookup(&lower("dev.example.com."), RecordType::A),
+            Answer::NxDomain,
+            "*.dev must not put a record at dev.example.com itself"
+        );
+    }
+
+    #[test]
+    fn an_out_of_zone_name_is_nxdomain_not_nodata() {
+        // Kills the out-of-zone `Resolution::NxDomain` -> `NoData`.
+        let z = zone(vec![spec("www", "A", &["203.0.113.20"])]);
+        assert_eq!(
+            z.lookup(&lower("www.example.org."), RecordType::A),
+            Answer::NxDomain
+        );
+        assert_eq!(z.lookup(&lower("."), RecordType::NS), Answer::NxDomain);
+    }
+
+    // -----------------------------------------------------------------------
+    // Known bugs, written against the RFC. These fail today and are ignored so
+    // the suite stays green until the behaviour is fixed.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "BUG: empty non-terminals answer NXDOMAIN instead of NODATA (RFC 2308 s2.2.1)"]
+    fn an_empty_non_terminal_is_nodata_not_nxdomain() {
+        // `a.b.ent.example.com` exists, so `ent.example.com` and
+        // `b.ent.example.com` exist too, as empty non-terminals. Answering
+        // NXDOMAIN for them is not cosmetic: under RFC 8020 a resolver that
+        // caches NXDOMAIN for `ent.example.com` may synthesise NXDOMAIN for
+        // everything beneath it, taking the real record out of service.
+        // `Zone::names` only ever records explicit owner names, never the
+        // ancestors those names imply.
+        let z = zone(vec![spec("a.b.ent", "A", &["203.0.113.41"])]);
+        assert_eq!(
+            z.lookup(&lower("b.ent.example.com."), RecordType::A),
+            Answer::NoData
+        );
+        assert_eq!(
+            z.lookup(&lower("ent.example.com."), RecordType::A),
+            Answer::NoData
+        );
+    }
+
+    #[test]
+    #[ignore = "BUG: a wildcard is applied below a name that exists (RFC 4592 s3.3.1)"]
+    fn a_wildcard_does_not_apply_below_a_name_that_exists() {
+        // RFC 4592: the source of synthesis is `*` under the *closest
+        // encloser*. For `a.deep.dev.example.com` the closest encloser is
+        // `deep.dev.example.com`, which exists, so the source of synthesis is
+        // `*.deep.dev.example.com` — which does not exist, hence NXDOMAIN.
+        // `Zone::resolve` instead walks up until it finds any wildcard at all,
+        // so `*.dev` leaks in underneath a name that already exists.
+        let z = zone(vec![
+            spec("*.dev", "A", &["203.0.113.50"]),
+            spec("deep.dev", "A", &["203.0.113.51"]),
+        ]);
+        assert_eq!(
+            z.lookup(&lower("a.deep.dev.example.com."), RecordType::A),
+            Answer::NxDomain
+        );
+    }
+
+    #[test]
+    #[ignore = "BUG: an empty non-terminal created by a wildcard is NXDOMAIN too"]
+    fn the_parent_of_a_wildcard_is_not_nxdomain() {
+        // `*.apps.example.com` implies `apps.example.com` exists. Answering
+        // NXDOMAIN for the parent lets an RFC 8020 resolver conclude the whole
+        // wildcard subtree is empty.
+        let z = zone(vec![spec("*.apps", "A", &["203.0.113.30"])]);
+        assert_eq!(
+            z.lookup(&lower("apps.example.com."), RecordType::A),
+            Answer::NoData
+        );
     }
 }

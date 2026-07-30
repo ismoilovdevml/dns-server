@@ -53,7 +53,7 @@ pub struct GlobalArgs {
     #[arg(
         long,
         short = 'c',
-        env = "DNS_CONFIG",
+        env = "VEGA_CONFIG",
         value_name = "FILE",
         global = true
     )]
@@ -63,7 +63,7 @@ pub struct GlobalArgs {
     #[arg(
         long,
         short = 'u',
-        env = "DNS_UDP",
+        env = "VEGA_UDP",
         value_delimiter = ',',
         global = true
     )]
@@ -73,7 +73,7 @@ pub struct GlobalArgs {
     #[arg(
         long,
         short = 't',
-        env = "DNS_TCP",
+        env = "VEGA_TCP",
         value_delimiter = ',',
         global = true
     )]
@@ -82,41 +82,46 @@ pub struct GlobalArgs {
     /// Address for the admin HTTP server (`/healthz`, `/readyz`, `/metrics`).
     ///
     /// Bind this to a private interface — it is not authenticated.
-    #[arg(long, env = "DNS_ADMIN_LISTEN", value_name = "ADDR", global = true)]
+    #[arg(long, env = "VEGA_ADMIN_LISTEN", value_name = "ADDR", global = true)]
     pub admin_listen: Option<SocketAddr>,
 
     /// Zone origin this server is authoritative for, e.g. `example.com`.
     #[arg(
         long,
         short = 'd',
-        env = "DNS_DOMAIN",
+        env = "VEGA_DOMAIN",
         value_name = "ZONE",
         global = true
     )]
     pub domain: Option<String>,
 
     /// Sustained queries per second allowed from a single source IP. `0` disables limiting.
-    #[arg(long, env = "DNS_RATE_LIMIT_QPS", value_name = "QPS", global = true)]
+    #[arg(long, env = "VEGA_RATE_LIMIT_QPS", value_name = "QPS", global = true)]
     pub rate_limit_qps: Option<u32>,
 
     /// Burst size for the per-IP rate limiter. Defaults to `2 * qps`.
-    #[arg(long, env = "DNS_RATE_LIMIT_BURST", value_name = "N", global = true)]
+    #[arg(long, env = "VEGA_RATE_LIMIT_BURST", value_name = "N", global = true)]
     pub rate_limit_burst: Option<u32>,
 
     /// Idle timeout for TCP connections, in seconds.
-    #[arg(long, env = "DNS_TCP_TIMEOUT_SECS", value_name = "SECS", global = true)]
+    #[arg(
+        long,
+        env = "VEGA_TCP_TIMEOUT_SECS",
+        value_name = "SECS",
+        global = true
+    )]
     pub tcp_timeout_secs: Option<u64>,
 
     /// Disable the diagnostic `hello.` / `counter.` / `myip.` / `version.` sub-zones.
-    #[arg(long, env = "DNS_NO_BUILTINS", global = true)]
+    #[arg(long, env = "VEGA_NO_BUILTINS", global = true)]
     pub no_builtins: bool,
 
     /// Log output format.
-    #[arg(long, env = "DNS_LOG_FORMAT", value_enum, global = true)]
+    #[arg(long, env = "VEGA_LOG_FORMAT", value_enum, global = true)]
     pub log_format: Option<LogFormat>,
 
-    /// Log filter, in `RUST_LOG` syntax, e.g. `info,dns_server=debug`.
-    #[arg(long, env = "DNS_LOG_LEVEL", value_name = "FILTER", global = true)]
+    /// Log filter, in `RUST_LOG` syntax, e.g. `info,vega=debug`.
+    #[arg(long, env = "VEGA_LOG_LEVEL", value_name = "FILTER", global = true)]
     pub log_level: Option<String>,
 
     /// Shared secret required by the mutating admin endpoints (`/reload`).
@@ -124,7 +129,7 @@ pub struct GlobalArgs {
     /// When unset, those endpoints only accept requests from loopback.
     #[arg(
         long,
-        env = "DNS_ADMIN_TOKEN",
+        env = "VEGA_ADMIN_TOKEN",
         value_name = "TOKEN",
         hide_env_values = true,
         global = true
@@ -483,7 +488,7 @@ mod tests {
     }
 
     fn cli(args: &[&str]) -> GlobalArgs {
-        let mut full = vec!["dns-server"];
+        let mut full = vec!["vega"];
         full.extend_from_slice(args);
         TestCli::try_parse_from(full)
             .expect("args should parse")
@@ -598,5 +603,89 @@ mod tests {
         let cfg = Config::merge(&cli(&[]), file).unwrap();
         assert_eq!(cfg.zone.records.len(), 2);
         assert_eq!(cfg.zone.records[1].ttl, Some(900));
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests from mutation testing.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn soa_defaults_follow_rfc_1912() {
+        // Kills every `default_serial / default_refresh / default_retry /
+        // default_expire / default_minimum -> 0 | 1 | -1` mutant. These values
+        // end up on the wire in the SOA and drive secondary and negative-cache
+        // behaviour, and nothing asserted on any of them.
+        let file: FileConfig = toml::from_str(
+            r#"
+            [zone]
+            origin = "example.com"
+
+            [zone.soa]
+            mname = "ns1.example.com."
+            rname = "hostmaster.example.com."
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::merge(&cli(&[]), file).unwrap();
+        let soa = cfg.zone.soa.expect("soa parsed");
+        assert_eq!(soa.serial, 1);
+        assert_eq!(soa.refresh, 3600);
+        assert_eq!(soa.retry, 900);
+        assert_eq!(soa.expire, 604_800);
+        assert_eq!(soa.minimum, 60);
+    }
+
+    #[test]
+    fn a_zero_tcp_timeout_is_rejected() {
+        // Kills `secs == 0` -> `secs != 0` in the tcp_timeout branch.
+        let err =
+            Config::merge(&cli(&["--tcp-timeout-secs", "0"]), FileConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("tcp_timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn a_non_zero_tcp_timeout_is_taken_verbatim() {
+        let cfg =
+            Config::merge(&cli(&["--tcp-timeout-secs", "45"]), FileConfig::default()).unwrap();
+        assert_eq!(cfg.tcp_timeout, Duration::from_secs(45));
+        // And the default when nothing is set.
+        let cfg = Config::merge(&cli(&[]), FileConfig::default()).unwrap();
+        assert_eq!(cfg.tcp_timeout, DEFAULT_TCP_TIMEOUT);
+    }
+
+    #[test]
+    fn the_summary_names_the_zone_and_every_listener() {
+        // Kills `Display::fmt -> Ok(())` and `join_addrs -> String::new() |
+        // "xyzzy"`. This text is what an operator reads from `vega check`
+        // before restarting a name server.
+        let cfg = Config::merge(
+            &cli(&[
+                "--domain",
+                "example.test",
+                "--udp",
+                "127.0.0.1:5300",
+                "--udp",
+                "127.0.0.1:5301",
+                "--rate-limit-qps",
+                "25",
+            ]),
+            FileConfig::default(),
+        )
+        .unwrap();
+
+        let text = cfg.to_string();
+        assert!(text.contains("example.test"), "{text}");
+        assert!(text.contains("127.0.0.1:5300, 127.0.0.1:5301"), "{text}");
+        assert!(text.contains("25 qps / burst 50"), "{text}");
+        assert!(text.contains("default ttl     : 300s"), "{text}");
+    }
+
+    #[test]
+    fn the_summary_says_none_when_a_transport_has_no_listener() {
+        let cfg = Config::merge(&cli(&[]), FileConfig::default()).unwrap();
+        let text = cfg.to_string();
+        assert!(text.contains("tcp listeners   : none"), "{text}");
+        assert!(text.contains("admin listener  : disabled"), "{text}");
+        assert!(text.contains("rate limit      : disabled"), "{text}");
     }
 }

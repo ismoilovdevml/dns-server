@@ -1,6 +1,6 @@
-# Kubernetes deployment for dns-server.
+# Kubernetes deployment for vega.
 #
-#   kubectl apply -f deploy/kubernetes/dns-server.yaml
+#   kubectl apply -f deploy/kubernetes/vega.yaml
 #
 # Edit the ConfigMap to describe your zone, then bump the `config-hash`
 # annotation (or use a tool like Kustomize's configMapGenerator) so a config
@@ -9,15 +9,15 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: dns-server
+  name: vega
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: dns-server-config
-  namespace: dns-server
+  name: vega-config
+  namespace: vega
 data:
-  dns-server.toml: |
+  vega.toml: |
     [server]
     udp = ["0.0.0.0:5300"]
     tcp = ["0.0.0.0:5300"]
@@ -53,15 +53,15 @@ data:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: dns-server
-  namespace: dns-server
+  name: vega
+  namespace: vega
   labels:
-    app.kubernetes.io/name: dns-server
+    app.kubernetes.io/name: vega
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app.kubernetes.io/name: dns-server
+      app.kubernetes.io/name: vega
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -70,7 +70,7 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: dns-server
+        app.kubernetes.io/name: vega
       annotations:
         # Bump this whenever the ConfigMap changes so the rollout happens.
         config-hash: "replace-me"
@@ -85,7 +85,7 @@ spec:
           whenUnsatisfiable: ScheduleAnyway
           labelSelector:
             matchLabels:
-              app.kubernetes.io/name: dns-server
+              app.kubernetes.io/name: vega
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -93,11 +93,11 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: dns-server
-          image: ghcr.io/ismoilovdevml/dns-server:latest
+        - name: vega
+          image: ghcr.io/ismoilovdevml/vega:latest
           imagePullPolicy: IfNotPresent
           args:
-            - --config=/etc/dns-server/dns-server.toml
+            - --config=/etc/vega/vega.toml
           ports:
             - name: dns-udp
               containerPort: 5300
@@ -110,7 +110,7 @@ spec:
               protocol: TCP
           env:
             # Listening above 1024 means we need no capabilities at all.
-            - name: DNS_LOG_FORMAT
+            - name: VEGA_LOG_FORMAT
               value: json
           # Liveness only asks "is the runtime scheduling tasks"; readiness is
           # what gates traffic, and it flips to 503 while we drain on SIGTERM.
@@ -150,29 +150,29 @@ spec:
               drop: ["ALL"]
           volumeMounts:
             - name: config
-              mountPath: /etc/dns-server
+              mountPath: /etc/vega
               readOnly: true
       # Give in-flight queries and the load balancer time to notice /readyz.
       terminationGracePeriodSeconds: 20
       volumes:
         - name: config
           configMap:
-            name: dns-server-config
+            name: vega-config
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: dns-server
-  namespace: dns-server
+  name: vega
+  namespace: vega
   labels:
-    app.kubernetes.io/name: dns-server
+    app.kubernetes.io/name: vega
 spec:
   type: LoadBalancer
   # Preserve the client IP: `myip.` and the per-source rate limiter are both
   # useless if every query appears to come from a node.
   externalTrafficPolicy: Local
   selector:
-    app.kubernetes.io/name: dns-server
+    app.kubernetes.io/name: vega
   ports:
     - name: dns-udp
       port: 53
@@ -186,14 +186,14 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: dns-server-admin
-  namespace: dns-server
+  name: vega-admin
+  namespace: vega
   labels:
-    app.kubernetes.io/name: dns-server
+    app.kubernetes.io/name: vega
 spec:
   type: ClusterIP
   selector:
-    app.kubernetes.io/name: dns-server
+    app.kubernetes.io/name: vega
   ports:
     - name: admin
       port: 9100
@@ -203,10 +203,43 @@ spec:
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: dns-server
-  namespace: dns-server
+  name: vega
+  namespace: vega
 spec:
   minAvailable: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: dns-server
+      app.kubernetes.io/name: vega
+---
+# The admin port is unauthenticated by design: /metrics, /healthz, /readyz and
+# /version answer anyone who can reach them. Without a policy that is every pod
+# in the cluster, which hands any workload the zone size, the build version and
+# a socket to hold open. DNS itself stays open to the world — that is the job.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vega
+  namespace: vega
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: vega
+  policyTypes:
+    - Ingress
+  ingress:
+    # Queries: from anywhere, both transports.
+    - ports:
+        - port: dns-udp
+          protocol: UDP
+        - port: dns-tcp
+          protocol: TCP
+    # Admin: scrapers only. Relabel this to match your Prometheus namespace —
+    # with no matching namespace the port is simply unreachable, which is the
+    # right way for this to fail.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: admin
+          protocol: TCP

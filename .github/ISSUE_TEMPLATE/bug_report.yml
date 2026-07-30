@@ -6,14 +6,14 @@ body:
     attributes:
       value: |
         Thanks for the report. The two most useful things you can include are the
-        output of `dns-server check --json` and the query that misbehaved.
+        output of `vega check --json` and the query that misbehaved.
 
   - type: input
     id: version
     attributes:
       label: Version
-      description: Output of `dns-server --version`
-      placeholder: dns-server 0.2.0
+      description: Output of `vega --version`
+      placeholder: vega 0.2.0
     validations:
       required: true
 
@@ -45,8 +45,8 @@ body:
       description: Commands, the query you sent, and the answer you got.
       render: shell
       placeholder: |
-        dns-server record add www A 203.0.113.10
-        dns-server query www.example.com A
+        vega record add www A 203.0.113.10
+        vega query www.example.com A
     validations:
       required: true
 

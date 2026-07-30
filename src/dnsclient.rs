@@ -1,4 +1,4 @@
-//! A small DNS client, so `dns-server query` can verify a deployment without
+//! A small DNS client, so `vega query` can verify a deployment without
 //! `dig` being installed on the box.
 //!
 //! Deliberately not a resolver: no recursion, no cache, no search list. It sends

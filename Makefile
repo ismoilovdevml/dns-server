@@ -17,7 +17,7 @@ test: ## Run every test
 	cargo test --all-features --locked
 
 check: ## Validate the example config
-	cargo run --quiet -- --config dns-server.example.toml check
+	cargo run --quiet -- --config vega.example.toml check
 
 audit: ## Licence and advisory checks
 	cargo deny check
@@ -29,7 +29,7 @@ build: ## Release build
 	cargo build --release --locked
 
 run: ## Run against the example config on port 1053
-	cargo run -- --config dns-server.example.toml \
+	cargo run -- --config vega.example.toml \
 		--udp 127.0.0.1:1053 --tcp 127.0.0.1:1053 \
 		--admin-listen 127.0.0.1:9100
 
@@ -40,7 +40,7 @@ demo: ## Build a throwaway zone in /tmp and query it
 	@echo "now run: cargo run -- --config /tmp/demo.toml --udp 127.0.0.1:1053"
 
 docker: ## Build the container image
-	docker build -t dns-server:dev .
+	docker build -t vega:dev .
 
 clean: ## Remove build artifacts
 	cargo clean

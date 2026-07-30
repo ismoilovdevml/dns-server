@@ -1,18 +1,18 @@
 <div align="center">
 
-# dns-server
+# vega
 
 **An authoritative DNS server written in Rust, driven entirely from the command line.**
 
-[![CI](https://github.com/ismoilovdevml/dns-server/actions/workflows/ci.yml/badge.svg)](https://github.com/ismoilovdevml/dns-server/actions/workflows/ci.yml)
-[![Security](https://github.com/ismoilovdevml/dns-server/actions/workflows/security.yml/badge.svg)](https://github.com/ismoilovdevml/dns-server/actions/workflows/security.yml)
-[![Docker](https://github.com/ismoilovdevml/dns-server/actions/workflows/docker.yml/badge.svg)](https://github.com/ismoilovdevml/dns-server/actions/workflows/docker.yml)
-[![Release](https://img.shields.io/github/v/release/ismoilovdevml/dns-server?logo=github&color=blue)](https://github.com/ismoilovdevml/dns-server/releases/latest)
+[![CI](https://github.com/ismoilovdevml/vega/actions/workflows/ci.yml/badge.svg)](https://github.com/ismoilovdevml/vega/actions/workflows/ci.yml)
+[![Security](https://github.com/ismoilovdevml/vega/actions/workflows/security.yml/badge.svg)](https://github.com/ismoilovdevml/vega/actions/workflows/security.yml)
+[![Docker](https://github.com/ismoilovdevml/vega/actions/workflows/docker.yml/badge.svg)](https://github.com/ismoilovdevml/vega/actions/workflows/docker.yml)
+[![Release](https://img.shields.io/github/v/release/ismoilovdevml/vega?logo=github&color=blue)](https://github.com/ismoilovdevml/vega/releases/latest)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![Hickory DNS](https://img.shields.io/badge/hickory--dns-0.26-6e5494)](https://hickory-dns.org)
-[![Container](https://img.shields.io/badge/ghcr.io-dns--server-2496ED?logo=docker&logoColor=white)](https://github.com/ismoilovdevml/dns-server/pkgs/container/dns-server)
+[![Container](https://img.shields.io/badge/ghcr.io-dns--server-2496ED?logo=docker&logoColor=white)](https://github.com/ismoilovdevml/vega/pkgs/container/vega)
 [![unsafe: forbidden](https://img.shields.io/badge/unsafe-forbidden-success.svg)](https://github.com/rust-secure-code/safety-dance)
 
 </div>
@@ -24,7 +24,7 @@
 ## What this is
 
 A single-zone authoritative name server. You describe a zone in one TOML file —
-or build it up with `dns-server record add` — and it answers queries for that
+or build it up with `vega record add` — and it answers queries for that
 zone over UDP and TCP. It is deliberately **not** a resolver: it never recurses,
 never caches, and refuses anything outside its own zone.
 
@@ -34,9 +34,9 @@ read its metrics — no editor, no `dig`, no `curl` required. Every command also
 speaks `--json`, so scripts and agents drive it the same way you do.
 
 ```bash
-dns-server init --origin example.com
-dns-server record add www A 203.0.113.10 --bump-serial --reload
-dns-server query www.example.com A
+vega init --origin example.com
+vega record add www A 203.0.113.10 --bump-serial --reload
+vega query www.example.com A
 ```
 
 | | |
@@ -56,18 +56,18 @@ dns-server query www.example.com A
 ### One line
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ismoilovdevml/dns-server/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ismoilovdevml/vega/main/install.sh | sh
 ```
 
 Downloads the release binary for your platform, verifies its SHA-256 against the
 published `SHA256SUMS`, and installs it to `/usr/local/bin`.
 
 Add `--systemd` to also create the service user, a starter config in
-`/etc/dns-server/`, and a hardened systemd unit — left **stopped** so you can
+`/etc/vega/`, and a hardened systemd unit — left **stopped** so you can
 review the zone first:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ismoilovdevml/dns-server/main/install.sh | sh -s -- --systemd
+curl -fsSL https://raw.githubusercontent.com/ismoilovdevml/vega/main/install.sh | sh -s -- --systemd
 ```
 
 <details>
@@ -76,31 +76,31 @@ curl -fsSL https://raw.githubusercontent.com/ismoilovdevml/dns-server/main/insta
 **Docker**
 
 ```bash
-docker pull ghcr.io/ismoilovdevml/dns-server:latest
+docker pull ghcr.io/ismoilovdevml/vega:latest
 ```
 
 **From source** (needs Rust 1.88+)
 
 ```bash
-cargo install --git https://github.com/ismoilovdevml/dns-server --locked
+cargo install --git https://github.com/ismoilovdevml/vega --locked
 ```
 
 **Release archive**
 
-Pick your platform from [releases](https://github.com/ismoilovdevml/dns-server/releases/latest),
+Pick your platform from [releases](https://github.com/ismoilovdevml/vega/releases/latest),
 then verify before you trust it:
 
 ```bash
 sha256sum -c SHA256SUMS --ignore-missing
-tar -xzf dns-server-v0.2.0-x86_64-unknown-linux-musl.tar.gz
+tar -xzf vega-v0.2.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
 **Shell completions**
 
 ```bash
-dns-server completions bash | sudo tee /etc/bash_completion.d/dns-server
-dns-server completions zsh  > ~/.zfunc/_dns-server
-dns-server completions fish > ~/.config/fish/completions/dns-server.fish
+vega completions bash | sudo tee /etc/bash_completion.d/vega
+vega completions zsh  > ~/.zfunc/_vega
+vega completions fish > ~/.config/fish/completions/vega.fish
 ```
 
 </details>
@@ -111,24 +111,24 @@ dns-server completions fish > ~/.config/fish/completions/dns-server.fish
 
 ```bash
 # 1. A config file, with a sensible SOA already filled in.
-dns-server init --origin example.com
+vega init --origin example.com
 
 # 2. Records. Values use zone-file syntax, so MX looks like MX.
-dns-server record add @   A     203.0.113.10 203.0.113.11
-dns-server record add www CNAME example.com.
-dns-server record add @   MX    "10 mail.example.com."
-dns-server record add @   TXT   '"v=spf1 mx -all"'
-dns-server record add '*.apps' A 203.0.113.30    # wildcard
-dns-server record add api A 203.0.113.20 --ttl 30
+vega record add @   A     203.0.113.10 203.0.113.11
+vega record add www CNAME example.com.
+vega record add @   MX    "10 mail.example.com."
+vega record add @   TXT   '"v=spf1 mx -all"'
+vega record add '*.apps' A 203.0.113.30    # wildcard
+vega record add api A 203.0.113.20 --ttl 30
 
 # 3. Check before you serve. Exits non-zero if anything is wrong.
-dns-server check
+vega check
 
 # 4. Serve. Port 53 needs privileges; use 1053 to try it out.
-dns-server serve --udp 127.0.0.1:1053 --tcp 127.0.0.1:1053
+vega serve --udp 127.0.0.1:1053 --tcp 127.0.0.1:1053
 
 # 5. In another shell:
-dns-server query www.example.com A --server 127.0.0.1:1053
+vega query www.example.com A --server 127.0.0.1:1053
 ```
 
 `query` prints what `dig` would, plus the timing and the wire size — and it tells
@@ -146,43 +146,43 @@ With no subcommand it serves. Every other subcommand manages or inspects.
 `unchanged` and still exits 0.
 
 ```text
-dns-server                      run the server (same as `serve`)
-dns-server init                 write a starter config
-dns-server check                validate config + zone, print what would be served
-dns-server serve                run the server
+vega                      run the server (same as `serve`)
+vega init                 write a starter config
+vega check                validate config + zone, print what would be served
+vega serve                run the server
 
-dns-server record list          list record sets  [--name N] [--type T]
-dns-server record get NAME      show one name's records (exit 1 if absent)
-dns-server record add NAME TYPE VALUE...   [--ttl] [--replace] [--bump-serial] [--reload]
-dns-server record delete NAME [TYPE]       [--value V] [--bump-serial] [--reload]
+vega record list          list record sets  [--name N] [--type T]
+vega record get NAME      show one name's records (exit 1 if absent)
+vega record add NAME TYPE VALUE...   [--ttl] [--replace] [--bump-serial] [--reload]
+vega record delete NAME [TYPE]       [--value V] [--bump-serial] [--reload]
 
-dns-server zone show            origin, SOA serial, counts by type
-dns-server zone export          BIND zone-file format, for diffing
-dns-server zone bump-serial     set the serial to YYYYMMDDnn
+vega zone show            origin, SOA serial, counts by type
+vega zone export          BIND zone-file format, for diffing
+vega zone bump-serial     set the serial to YYYYMMDDnn
 
-dns-server query NAME [TYPE]    send a query  [--server ADDR] [--use-tcp]
-dns-server status               health, version, uptime, traffic breakdown
-dns-server reload               make a running server re-read its config
-dns-server healthcheck          probe /healthz, exit 0 or 1
+vega query NAME [TYPE]    send a query  [--server ADDR] [--use-tcp]
+vega status               health, version, uptime, traffic breakdown
+vega reload               make a running server re-read its config
+vega healthcheck          probe /healthz, exit 0 or 1
 
-dns-server completions SHELL    bash | zsh | fish | powershell | elvish
+vega completions SHELL    bash | zsh | fish | powershell | elvish
 ```
 
 `check` resolves the whole configuration, builds the zone, and tells you what
 would be served — including the things that are easy to get wrong, like a missing
 SOA or an admin listener on a public interface:
 
-<img src="assets/cli-check.png" alt="dns-server check reporting the zone, listeners and protection settings" width="820">
+<img src="assets/cli-check.png" alt="vega check reporting the zone, listeners and protection settings" width="820">
 
 ### Config discovery
 
 Without `--config`, these are tried in order:
 
-1. `./dns-server.toml`
-2. `/etc/dns-server/dns-server.toml`
-3. `/usr/local/etc/dns-server/dns-server.toml`
+1. `./vega.toml`
+2. `/etc/vega/vega.toml`
+3. `/usr/local/etc/vega/vega.toml`
 
-<img src="assets/cli-zone.png" alt="dns-server zone show summarising the zone and its record types" width="760">
+<img src="assets/cli-zone.png" alt="vega zone show summarising the zone and its record types" width="760">
 
 ### Scripting and agents
 
@@ -191,18 +191,18 @@ nothing to scrape:
 
 ```bash
 # Is this record already there?
-if dns-server record get www A --json >/dev/null; then
+if vega record get www A --json >/dev/null; then
   echo "already configured"
 fi
 
 # What is live right now?
-dns-server status --json | jq '.metrics["dns_queries_total"]'
+vega status --json | jq '.metrics["dns_queries_total"]'
 
 # Idempotent apply: safe to run on every deploy.
-dns-server record add www A "$NEW_IP" --replace --bump-serial --reload --json
+vega record add www A "$NEW_IP" --replace --bump-serial --reload --json
 
 # Did the query actually answer?
-dns-server query www.example.com A --json | jq -r '.rcode'
+vega query www.example.com A --json | jq -r '.rcode'
 ```
 
 Output honours [`NO_COLOR`](https://no-color.org), drops colour when stdout is
@@ -239,7 +239,7 @@ Precedence: **CLI flag → environment variable → config file → default.**
 <details>
 <summary>Full example config</summary>
 
-See [`dns-server.example.toml`](dns-server.example.toml) for the annotated
+See [`vega.example.toml`](vega.example.toml) for the annotated
 version. The short form:
 
 ```toml
@@ -280,18 +280,18 @@ values = ["203.0.113.10", "203.0.113.11"]
 
 | Flag | Environment | Meaning |
 |---|---|---|
-| `--config PATH` | `DNS_CONFIG` | config file |
-| `--udp ADDR` | `DNS_UDP` | UDP listener; repeatable |
-| `--tcp ADDR` | `DNS_TCP` | TCP listener; repeatable |
-| `--admin-listen ADDR` | `DNS_ADMIN_LISTEN` | admin HTTP address |
-| `--admin-token TOKEN` | `DNS_ADMIN_TOKEN` | bearer token for `/reload` |
-| `--domain ZONE` | `DNS_DOMAIN` | zone origin |
-| `--rate-limit-qps N` | `DNS_RATE_LIMIT_QPS` | per-IP queries per second; `0` disables |
-| `--rate-limit-burst N` | `DNS_RATE_LIMIT_BURST` | bucket size |
-| `--tcp-timeout-secs N` | `DNS_TCP_TIMEOUT_SECS` | TCP idle timeout |
-| `--no-builtins` | `DNS_NO_BUILTINS` | disable the diagnostic sub-zones |
-| `--log-format FMT` | `DNS_LOG_FORMAT` | `pretty` or `json` |
-| `--log-level FILTER` | `DNS_LOG_LEVEL` | `RUST_LOG` syntax |
+| `--config PATH` | `VEGA_CONFIG` | config file |
+| `--udp ADDR` | `VEGA_UDP` | UDP listener; repeatable |
+| `--tcp ADDR` | `VEGA_TCP` | TCP listener; repeatable |
+| `--admin-listen ADDR` | `VEGA_ADMIN_LISTEN` | admin HTTP address |
+| `--admin-token TOKEN` | `VEGA_ADMIN_TOKEN` | bearer token for `/reload` |
+| `--domain ZONE` | `VEGA_DOMAIN` | zone origin |
+| `--rate-limit-qps N` | `VEGA_RATE_LIMIT_QPS` | per-IP queries per second; `0` disables |
+| `--rate-limit-burst N` | `VEGA_RATE_LIMIT_BURST` | bucket size |
+| `--tcp-timeout-secs N` | `VEGA_TCP_TIMEOUT_SECS` | TCP idle timeout |
+| `--no-builtins` | `VEGA_NO_BUILTINS` | disable the diagnostic sub-zones |
+| `--log-format FMT` | `VEGA_LOG_FORMAT` | `pretty` or `json` |
+| `--log-level FILTER` | `VEGA_LOG_LEVEL` | `RUST_LOG` syntax |
 | `--json` | — | machine-readable output |
 | `--verbose`, `-v` | — | extra detail |
 
@@ -305,10 +305,10 @@ Enabled by default; a fast way to prove a deployment works end to end. Turn them
 off with `--no-builtins` if you would rather not expose server internals.
 
 ```bash
-dns-server query version.example.com TXT           # "dns-server 0.2.0"
-dns-server query counter.example.com TXT           # queries served so far
-dns-server query myip.example.com A                # the client's own address
-dns-server query anything.hello.example.com TXT    # "hello, anything"
+vega query version.example.com TXT           # "vega 0.2.0"
+vega query counter.example.com TXT           # queries served so far
+vega query myip.example.com A                # the client's own address
+vega query anything.hello.example.com TXT    # "hello, anything"
 ```
 
 ---
@@ -318,14 +318,14 @@ dns-server query anything.hello.example.com TXT    # "hello, anything"
 ### Docker
 
 ```bash
-docker run -d --name dns-server \
+docker run -d --name vega \
   --cap-drop ALL --cap-add NET_BIND_SERVICE \
   --read-only --security-opt no-new-privileges:true \
   -p 53:53/udp -p 53:53/tcp \
   -p 127.0.0.1:9100:9100 \
-  -v "$PWD/dns-server.toml:/etc/dns-server/dns-server.toml:ro" \
-  ghcr.io/ismoilovdevml/dns-server:latest \
-  --config=/etc/dns-server/dns-server.toml
+  -v "$PWD/vega.toml:/etc/vega/vega.toml:ro" \
+  ghcr.io/ismoilovdevml/vega:latest \
+  --config=/etc/vega/vega.toml
 ```
 
 The image is [distroless](https://github.com/GoogleContainerTools/distroless):
@@ -336,21 +336,21 @@ the binary probes its own `/healthz` — no curl in the image.
 Or use [`deploy/docker-compose.yml`](deploy/docker-compose.yml):
 
 ```bash
-cp dns-server.example.toml deploy/dns-server.toml    # then edit it
+cp vega.example.toml deploy/vega.toml    # then edit it
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
 ### systemd
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ismoilovdevml/dns-server/main/install.sh | sh -s -- --systemd
-sudo $EDITOR /etc/dns-server/dns-server.toml
-sudo dns-server check --config /etc/dns-server/dns-server.toml
-sudo systemctl enable --now dns-server
-journalctl -u dns-server -f
+curl -fsSL https://raw.githubusercontent.com/ismoilovdevml/vega/main/install.sh | sh -s -- --systemd
+sudo $EDITOR /etc/vega/vega.toml
+sudo vega check --config /etc/vega/vega.toml
+sudo systemctl enable --now vega
+journalctl -u vega -f
 ```
 
-The [unit](deploy/systemd/dns-server.service) runs as a dedicated user with
+The [unit](deploy/systemd/vega.service) runs as a dedicated user with
 `CAP_NET_BIND_SERVICE` as its entire capability set, `ProtectSystem=strict`, a
 seccomp filter, and `MemoryDenyWriteExecute=yes`. `ExecStartPre` validates the
 config, so a typo fails the start instead of half-starting.
@@ -361,7 +361,7 @@ config, so a typo fails the start instead of half-starting.
 ### Kubernetes
 
 ```bash
-kubectl apply -f deploy/kubernetes/dns-server.yaml
+kubectl apply -f deploy/kubernetes/vega.yaml
 ```
 
 Two replicas, `readOnlyRootFilesystem`, all capabilities dropped, `httpGet`
@@ -388,7 +388,7 @@ the per-source rate limiter both see the node instead of the caller.
 The pod annotations in the Kubernetes manifest already mark it for scraping. If
 you just want a look, `status` renders the same data:
 
-<img src="assets/cli-status.png" alt="dns-server status showing health, uptime, query rate and a response-code breakdown" width="800">
+<img src="assets/cli-status.png" alt="vega status showing health, uptime, query rate and a response-code breakdown" width="800">
 
 ---
 
@@ -436,12 +436,12 @@ cargo test --all-features                                    # 209 tests
 cargo clippy --all-targets --all-features -- -D warnings     # pedantic, clean
 cargo fmt --all --check
 cargo deny check                                             # licences + advisories
-cargo run -- --config dns-server.example.toml check
+cargo run -- --config vega.example.toml check
 ```
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Security
 issues should go through
-[a private advisory](https://github.com/ismoilovdevml/dns-server/security/advisories/new),
+[a private advisory](https://github.com/ismoilovdevml/vega/security/advisories/new),
 not a public issue; see [SECURITY.md](SECURITY.md).
 
 ## Not implemented

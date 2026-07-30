@@ -1,4 +1,4 @@
-//! A dependency-free `/healthz` probe, so `dns-server healthcheck` can serve as a
+//! A dependency-free `/healthz` probe, so `vega healthcheck` can serve as a
 //! container `HEALTHCHECK` in images that ship no shell and no curl.
 
 use std::net::SocketAddr;

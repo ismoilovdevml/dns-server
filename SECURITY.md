@@ -3,11 +3,11 @@
 ## Reporting a vulnerability
 
 **Please do not open a public issue.** Report it privately through
-[GitHub Security Advisories](https://github.com/ismoilovdevml/dns-server/security/advisories/new),
+[GitHub Security Advisories](https://github.com/ismoilovdevml/vega/security/advisories/new),
 or by email to <ismoilovdev@gmail.com>.
 
 Useful details, if you have them: the version, a configuration that reproduces it,
-and the query or request that triggers it. A packet capture or a `dns-server query
+and the query or request that triggers it. A packet capture or a `vega query
 … --json` output is ideal.
 
 You can expect an acknowledgement within a few days and a fix or a plan within two

@@ -8,8 +8,8 @@ operator trust this in front of their zone", not ceremony.
 You need Rust 1.88 or newer (the crate's `rust-version`).
 
 ```bash
-git clone https://github.com/ismoilovdevml/dns-server
-cd dns-server
+git clone https://github.com/ismoilovdevml/vega
+cd vega
 cargo test --all-features
 ```
 
@@ -87,12 +87,12 @@ the reviewer cannot tell which line fixed the bug.
 
 ## Reporting bugs
 
-Use the [issue templates](https://github.com/ismoilovdevml/dns-server/issues/new/choose).
+Use the [issue templates](https://github.com/ismoilovdevml/vega/issues/new/choose).
 The two most useful things you can include are:
 
 ```bash
-dns-server check --json
-dns-server query the.name.that.misbehaved A --json
+vega check --json
+vega query the.name.that.misbehaved A --json
 ```
 
 Please report security issues [privately](SECURITY.md), not as a public issue.
@@ -106,7 +106,7 @@ in lookup (the way `CNAME` does), the places to touch are:
 1. `Zone::resolve` in `src/zone.rs`, for the lookup behaviour;
 2. a test in the same file covering the new behaviour and its negative case;
 3. an integration test in `tests/integration.rs` proving it survives the wire;
-4. a line in `dns-server.example.toml` showing the syntax.
+4. a line in `vega.example.toml` showing the syntax.
 
 ## Releasing
 

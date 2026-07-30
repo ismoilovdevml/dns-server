@@ -434,6 +434,44 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "BUG: `with_colour` mutates a process-global while cargo test runs these tests in parallel, so the ui tests fail ~40% of runs of `cargo test --lib ui::`"]
+    fn colour_state_is_not_shared_between_concurrent_tests() {
+        // Every ui test goes through `with_colour`, which swaps the global
+        // COLOR flag and restores it afterwards. cargo test runs tests on a
+        // thread pool, so two of them overlap and one observes the other's
+        // setting: `styling_emits_escapes_when_colour_is_on` sees colour off,
+        // or `bar_clamps_out_of_range_ratios` sees it on and gets ANSI codes.
+        // Reproduce with `cargo test --lib ui::` a few times.
+        //
+        // The fix is a test-local mutex around the flag (or passing the flag in
+        // rather than reading a global); this test demonstrates the race.
+        use std::sync::{Arc, Barrier};
+
+        let barrier = Arc::new(Barrier::new(2));
+        let on = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                (0..20_000)
+                    .filter(|_| with_colour(true, || good("yes").contains('\u{1b}')))
+                    .count()
+            })
+        };
+        let off = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                (0..20_000)
+                    .filter(|_| with_colour(false, || good("yes") == "yes"))
+                    .count()
+            })
+        };
+
+        assert_eq!(on.join().unwrap(), 20_000, "colour-on test saw colour off");
+        assert_eq!(off.join().unwrap(), 20_000, "colour-off test saw colour on");
+    }
+
+    #[test]
     fn bar_clamps_out_of_range_ratios() {
         with_colour(false, || {
             assert_eq!(bar(0.0, 4), "░░░░");

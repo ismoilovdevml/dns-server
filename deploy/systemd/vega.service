@@ -1,25 +1,33 @@
 [Unit]
-Description=Authoritative DNS server (dns-server)
-Documentation=https://github.com/ismoilovdevml/dns-server
+Description=Authoritative DNS server (vega)
+Documentation=https://github.com/ismoilovdevml/vega
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/dns-server --config /etc/dns-server/dns-server.toml
+ExecStart=/usr/local/bin/vega --config /etc/vega/vega.toml
 
 # Refuse to start on a bad config rather than failing halfway through startup.
-ExecStartPre=/usr/local/bin/dns-server --config /etc/dns-server/dns-server.toml --check
+# `check` is a subcommand, not a flag — passing `--check` makes ExecStartPre exit
+# 2, which with Type=simple means ExecStart never runs at all.
+ExecStartPre=/usr/local/bin/vega check --config /etc/vega/vega.toml
 
-# There is no in-place config reload: changing records means `systemctl restart`.
+# Records can be changed without a restart: edit the config and POST /reload, or
+# use `vega record add --reload`. Listener addresses and the rate limiter
+# are not hot-swappable and do need a restart.
 # The process handles SIGTERM and drains, so let it.
 KillSignal=SIGTERM
-TimeoutStopSec=15
-Restart=on-failure
+TimeoutStopSec=45
+
+# `on-failure` would not restart after a clean exit — and the process exits 0 on
+# SIGTERM, so a stray `killall` would leave the name server down with systemd
+# perfectly content. A name server should always come back.
+Restart=always
 RestartSec=2s
 
-User=dns-server
-Group=dns-server
+User=vega
+Group=vega
 DynamicUser=no
 
 # Binding :53 as a non-root user needs exactly this capability, nothing more.
@@ -51,16 +59,16 @@ RestrictAddressFamilies=AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
-ReadOnlyPaths=/etc/dns-server
+ReadOnlyPaths=/etc/vega
 
 # --- Resource limits ---------------------------------------------------------
 LimitNOFILE=65535
 MemoryMax=256M
 TasksMax=256
 
-# Structured logs go to the journal; use `journalctl -u dns-server -f`.
-Environment=DNS_LOG_FORMAT=pretty
-Environment=DNS_LOG_LEVEL=info
+# Structured logs go to the journal; use `journalctl -u vega -f`.
+Environment=VEGA_LOG_FORMAT=pretty
+Environment=VEGA_LOG_LEVEL=info
 StandardOutput=journal
 StandardError=journal
 
