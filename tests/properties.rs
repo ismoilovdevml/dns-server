@@ -1143,24 +1143,13 @@ proptest! {
         });
         prop_assume!(covered);
 
-        // AC-2, HALF-APPLIED ON PURPOSE — rust-dev finishes this line.
-        //
-        // The ruling deletes `Zone::has_name` and replaces it with
-        // `Zone::exists` (§5.5): a `pub` predicate meaning "is there a node
-        // here" sitting next to one meaning "must this be answered NOERROR" is
-        // the footgun that produced this bug, so the narrow one does not survive
-        // as public API. This assertion becomes, with its message unchanged:
-        //
-        //     zone.exists(&queried),
-        //
-        // It is left as `has_name` only because `Zone::exists` does not exist
-        // yet: naming it here would fail to compile the whole test binary, and a
-        // binary that does not build cannot show rust-dev a single one of the
-        // other tests failing for the right reason — nor can `cargo clippy
-        // --all-targets` run. Change it in the fix commit; the compiler will
-        // point at this line the moment `has_name` is removed.
+        // AC-2. `Zone::has_name` is gone: a `pub` predicate meaning "is there a
+        // node here" sitting next to one meaning "must this be answered NOERROR"
+        // is the footgun that produced this bug, so the narrow one did not
+        // survive as public API (ruling §5.5). The message is unchanged from
+        // when this read `has_name`, because what it describes is unchanged.
         prop_assert!(
-            zone.has_name(&queried),
+            zone.exists(&queried),
             "{name} is synthesised from a wildcard, so it exists (RFC 4592 §2.2); \
              `has_name` says otherwise, which is what makes QTYPE=ANY there an \
              authoritative NXDOMAIN"

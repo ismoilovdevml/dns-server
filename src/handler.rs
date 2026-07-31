@@ -244,12 +244,24 @@ impl DnsHandler {
         // RRset in the zone to assemble it — the most expensive. An attacker got
         // to pick both with a 29-byte packet.
         if qtype.is_any() {
-            if !zone.has_name(name) {
+            // The same existence determination every other QTYPE gets, because
+            // RFC 8482 §4.1/§4.2 change the *answer section* and license no
+            // change to the rcode. This gate used to ask whether the name was an
+            // owner name in the zone, which is false for every name a wildcard
+            // covers, so ANY denied names that AAAA — and A — answered
+            // (VEGA-083).
+            if !zone.exists(name) {
                 return Resolved::negative(ResponseCode::NXDomain, zone.soa());
             }
             // RFC 8482 §4.2 permits synthesis only when there is no CNAME at the
             // owner name, and §4.1 names the CNAME as the RRset worth returning.
             // Anything using ANY to discover an alias must still find it.
+            //
+            // The order matters and is why the gate above had to widen rather
+            // than move: this probe goes through `Zone::lookup` and so is
+            // wildcard-aware, while the gate was not, so a name covered by a
+            // wildcard CNAME was denied before ever reaching the CNAME it owed
+            // (RFC 4592 §3.4.3 with RFC 8482 §4.2).
             if let Answer::Records(cnames) = zone.lookup(name, RecordType::CNAME) {
                 if !cnames.is_empty() {
                     return Resolved::found(cnames);

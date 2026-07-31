@@ -235,14 +235,15 @@ fn a_deep_name_does_not_cost_more_than_a_shallow_one() {
 ///
 /// `DnsHandler::resolve` never calls `Zone::lookup(_, ANY)`: RFC 8482 minimal
 /// -ANY intercepts first (`handler.rs`, `if qtype.is_any()`), answering from
-/// `has_name` plus a CNAME lookup. So this is **not** a live remote DoS — it is
+/// `Zone::exists` plus a CNAME lookup. So this was **not** a live remote DoS — it was
 /// a 1.8 ms landmine in a `pub fn` with no guard and no test, one routing change
 /// away from being one. VEGA-041's SLIP, an AXFR path, or anything that decides
 /// to consult the zone for ANY re-arms it.
 ///
-/// The fix is the record-map re-key (VEGA-002): with owner-major keying, "every
-/// RRset at this name" is a map hit rather than a scan. Until then the budget
-/// belongs here, failing, so it is not rediscovered a third time.
+/// The re-key that VEGA-002 deferred and VEGA-032 owns would have made "every
+/// RRset at this name" a map hit rather than a scan. VEGA-083 got there first
+/// and by a shorter route — see below — so this budget is now live rather than
+/// aspirational, and guards against the scan being reintroduced.
 ///
 /// # VEGA-083 (AC-7): the arm is deleted rather than re-keyed
 ///
@@ -257,12 +258,9 @@ fn a_deep_name_does_not_cost_more_than_a_shallow_one() {
 /// `Zone::lookup(_, ANY)` therefore returns `NoData` for every existing name and
 /// `NxDomain` otherwise — hence the assertions below, which were
 /// `Answer::Records(_)`. Flat cost across zone sizes follows by construction.
-/// **This test must be un-`#[ignore]`d in the commit that lands the fix**; it is
-/// an acceptance criterion, not a bonus. It stays ignored until then because it
-/// is a release-mode budget and, on the unfixed tree, its 600 ANY lookups over a
-/// 100k-record zone are minutes of debug-build scanning.
+/// Un-`#[ignore]`d in the commit that landed the fix, which is AC-7 of that
+/// ruling and not a bonus.
 #[test]
-#[ignore = "VEGA-083 AC-7: un-ignore in the commit that deletes the O(zone) ANY arm; until then Zone::lookup(_, ANY) scans every record set, 1.83 ms at 100k records (CLAUDE.md performance budget)"]
 fn an_any_lookup_does_not_scan_the_whole_record_map() {
     let _watchdog = testutil::arm(WATCHDOG);
     let z = wildcard_zone();

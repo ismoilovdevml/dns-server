@@ -99,6 +99,17 @@ pub struct Zone {
     /// revalidates the whole remaining name: 174.7 µs of CPU for one 229-byte
     /// packet, against a 9.1 µs budget (VEGA-065).
     wildcard_depths: u128,
+    /// Every name at which the zone holds at least one wildcard, whatever its
+    /// type — the *source of synthesis* of RFC 4592 §3.3.1, as a set.
+    ///
+    /// `wildcard_depths` says a wildcard exists somewhere at depth `d`; this
+    /// says one exists at *this* parent. The walk needs both: the bitmap to
+    /// decide which depths are worth probing at all, this to decide whether the
+    /// probe landed on a source of synthesis. Deriving coverage from the bitmap
+    /// alone would make every name whose parent merely shares a depth with some
+    /// wildcard exist, which in a zone with an apex wildcard is very nearly
+    /// every name there is (VEGA-083, rejected alternative 5).
+    wildcard_parents: HashSet<LowerName>,
     /// Every owner name that exists in the zone, used to tell NODATA from NXDOMAIN.
     names: HashSet<LowerName>,
     /// Total number of records, for the `dns_zone_records` metric.
@@ -123,6 +134,7 @@ impl Zone {
             exact: HashMap::new(),
             wildcard: HashMap::new(),
             wildcard_depths: 0,
+            wildcard_parents: HashSet::new(),
             names: HashSet::new(),
             record_count: 0,
         };
@@ -153,9 +165,12 @@ impl Zone {
         debug_assert!(
             zone.wildcard.keys().all(|(owner, _)| {
                 let depth = label_count(owner);
-                depth <= MAX_LABELS && zone.wildcard_depths & (1u128 << depth) != 0
+                depth <= MAX_LABELS
+                    && zone.wildcard_depths & (1u128 << depth) != 0
+                    && zone.wildcard_parents.contains(owner)
             }),
-            "wildcard_depths is out of step with the wildcard map; a wildcard is unreachable"
+            "wildcard_depths or wildcard_parents is out of step with the wildcard map; a \
+             wildcard is unreachable, or a name it covers answers NXDOMAIN"
         );
 
         Ok(zone)
@@ -218,18 +233,24 @@ impl Zone {
         let key = (lower.clone(), record_type);
 
         if is_wildcard {
-            // Recorded here, in the one place that writes to `wildcard`, so the
-            // bitmap cannot drift out of step with the map it indexes. A bit
-            // that is missing is a configured wildcard answering NXDOMAIN with
-            // nothing in the log, which is the worst failure mode this design
-            // has; keeping both writes adjacent is the mitigation.
+            // Recorded here, in the one place that writes to `wildcard`, so
+            // neither index can drift out of step with the map it indexes. A
+            // missing bit is a configured wildcard answering NXDOMAIN with
+            // nothing in the log; a missing parent is every name that wildcard
+            // covers answering NXDOMAIN for the types it does not carry, which
+            // is the defect VEGA-083 fixed. Both are silent, so all three writes
+            // stay adjacent and `from_config`'s `debug_assert!` fails a future
+            // second insertion point at the moment it is added.
             let depth = label_count(&lower);
             // Unreachable — `qualify` builds this name through hickory, which
             // enforces the 255-octet limit MAX_LABELS is derived from. A branch
             // rather than an assumption, because `1u128 << 128` panics and this
-            // runs on the reload path.
+            // runs on the reload path. The parent set is written under the same
+            // condition as the bit, so a depth the walk can never probe can
+            // never claim coverage either.
             if depth <= MAX_LABELS {
                 self.wildcard_depths |= 1u128 << depth;
+                self.wildcard_parents.insert(lower.clone());
             }
             self.wildcard.entry(key).or_default().extend(records);
         } else {
@@ -281,13 +302,30 @@ impl Zone {
         self.lower_origin.zone_of(name)
     }
 
-    /// True when `name` is an owner name this zone holds records for.
+    /// True when a query for `name` must be answered NOERROR rather than
+    /// NXDOMAIN.
     ///
-    /// O(1). Exists so the ANY path can tell NXDOMAIN from NODATA without the
-    /// full-map scan that made a 29-byte ANY query cost 26x an ordinary lookup
-    /// on a 50k-record zone.
-    pub fn has_name(&self, name: &LowerName) -> bool {
-        self.names.contains(name)
+    /// Two ways to be true: the zone holds an owner name here, or a source of
+    /// synthesis exists for it (RFC 4592 §3.3.1). This is deliberately **not**
+    /// "is there a node here" — RFC 4592 §2.2 is explicit that a wildcard-covered
+    /// name is not a node in the zone, which is why DNSSEC needs a
+    /// closest-encloser proof for it. It is the RFC 1034 §4.3.2 step 3(c)
+    /// name-error determination, and it is independent of QTYPE: the name error
+    /// is set only when the `*` node does not exist, never because the node
+    /// exists and holds nothing of the queried type.
+    ///
+    /// There is no narrower `pub` predicate on purpose. The one that used to be
+    /// here answered "is this in `names`", which reads like existence and is
+    /// not; two callers believed the name and a wildcard-covered name answered
+    /// NXDOMAIN for every type the wildcard did not carry (VEGA-083).
+    ///
+    /// O(1) on a zone with no wildcards — `names.contains`, then an empty
+    /// probe mask and no probes at all.
+    pub fn exists(&self, name: &LowerName) -> bool {
+        // RFC 1035 §3.2.3: ANY is a QTYPE and never an RRTYPE, so it can never
+        // key `wildcard`. The typed half of the probe therefore always misses
+        // and only the coverage bit comes back — which is the half wanted here.
+        self.names.contains(name) || self.wildcard_probe(name, RecordType::ANY).1
     }
 
     /// Resolve `name`/`record_type` against the zone.
@@ -314,17 +352,23 @@ impl Zone {
             return Resolution::NxDomain;
         }
 
-        if record_type == RecordType::ANY {
-            let mut found = false;
-            for ((owner, _), records) in &self.exact {
-                if owner == name {
-                    out.extend(records.iter().cloned());
-                    found = true;
-                }
-            }
-            return if found {
-                Resolution::Found
-            } else if self.names.contains(name) {
+        // RFC 1035 §3.2.3: ANY (255) is a QTYPE, never an RRTYPE, so it can
+        // never be a key in `exact` or `wildcard`. RFC 8482 makes *what* to
+        // answer for it a responder policy, and that policy lives in
+        // `DnsHandler`; the zone layer reports existence and nothing else.
+        //
+        // This replaced a scan of the whole record map, which cost 1.83 ms on a
+        // 100k-record zone — 18,239x an A lookup, and one routing change away
+        // from the packet path — and which carried the same existence defect at
+        // its NXDOMAIN arm (VEGA-083 §4.4). Reporting existence is the only
+        // bounded answer: making the scan wildcard-aware makes it slower still,
+        // and making it fast needs the owner-major re-key that is VEGA-032's.
+        //
+        // A caller that reads `NoData` here as "the node is empty" is wrong.
+        // AXFR (VEGA-032) needs ordered node iteration and will not get it from
+        // this function, so do not reintroduce the scan to serve a transfer.
+        if record_type.is_any() {
+            return if self.exists(name) {
                 Resolution::NoData
             } else {
                 Resolution::NxDomain
@@ -361,18 +405,63 @@ impl Zone {
         }
 
         // Wildcards only apply when the queried name itself does not exist.
+        let (records, covered) = self.wildcard_probe(name, record_type);
+        if let Some(records) = records {
+            let qname = Name::from(name.clone());
+            out.extend(
+                records
+                    .iter()
+                    .map(|r| Record::from_rdata(qname.clone(), r.ttl, r.data.clone())),
+            );
+            return Resolution::Found;
+        }
+
+        // RFC 1034 §4.3.2 step 3(c) sets the authoritative name error *only*
+        // when the `*` node does not exist. Here it exists and holds no RRset of
+        // this type, so control goes to step 6 — exit with an empty answer
+        // section — which is RFC 2308 §2.2 NODATA.
         //
-        // Deepest set bit first, so the closest wildcard answers — the same
-        // order the old `base_name()` climb produced, and what
-        // `the_deepest_wildcard_wins_when_several_could_match` pins. Every
-        // depth skipped is a depth at which no key can exist, because equal
-        // names have equal label counts, so dropping it cannot lose a hit.
-        //
-        // `mask` strictly loses a bit each pass, so termination is structural
-        // rather than a counter that has to be checked against a floor. That
-        // matters for `origin = "."`, where the floor is 0 and a decrementing
-        // walk needs an extra guard to avoid spinning on the root.
+        // Answering NXDOMAIN instead is not cosmetic. It is authoritative and
+        // carries the SOA, so RFC 2308 §5 has it cached for the SOA MINIMUM and
+        // RFC 8020 §2 then licenses the resolver to deny the entire subtree —
+        // including the records the wildcard *does* carry. A dual-stack client's
+        // AAAA is enough to trigger it; no attacker is required (VEGA-083).
+        if covered {
+            Resolution::NoData
+        } else {
+            Resolution::NxDomain
+        }
+    }
+
+    /// Walk the wildcard depths for `name`, deepest set bit first.
+    ///
+    /// Returns the RRset to synthesise from, when the zone holds one of
+    /// `record_type` at a source of synthesis for `name`, **and** whether any
+    /// source of synthesis for `name` exists at all.
+    ///
+    /// The two halves answer different questions and only the first depends on
+    /// `record_type`: it decides the *answer section*, while coverage decides
+    /// NOERROR against NXDOMAIN (RFC 1034 §4.3.2 step 3(c)). Both callers go
+    /// through here so the two determinations cannot drift apart and start
+    /// returning a QTYPE-dependent rcode again.
+    ///
+    /// Deepest set bit first, so the closest wildcard answers — the same order
+    /// the old `base_name()` climb produced, and what
+    /// `the_deepest_wildcard_wins_when_several_could_match` pins. Every depth
+    /// skipped is a depth at which no key can exist, because equal names have
+    /// equal label counts, so dropping it cannot lose a hit.
+    ///
+    /// `mask` strictly loses a bit each pass, so termination is structural
+    /// rather than a counter that has to be checked against a floor. That
+    /// matters for `origin = "."`, where the floor is 0 and a decrementing walk
+    /// needs an extra guard to avoid spinning on the root.
+    fn wildcard_probe(
+        &self,
+        name: &LowerName,
+        record_type: RecordType,
+    ) -> (Option<&[Record]>, bool) {
         let mut mask = self.wildcard_depths & self.wildcard_window(name);
+        let mut covered = false;
         while mask != 0 {
             // `mask != 0` bounds `leading_zeros()` at 127, so `depth <= 127`
             // and neither shift below can overflow.
@@ -380,18 +469,29 @@ impl Zone {
             mask &= !(1u128 << depth);
 
             let parent = LowerName::from(name.trim_to(depth));
-            if let Some(records) = self.wildcard.get(&(parent, record_type)) {
-                let qname = Name::from(name.clone());
-                out.extend(
-                    records
-                        .iter()
-                        .map(|r| Record::from_rdata(qname.clone(), r.ttl, r.data.clone())),
-                );
-                return Resolution::Found;
+            // Coverage first, and it takes `parent` by reference: where nothing
+            // covers the name this skips building and hashing the `(name, type)`
+            // tuple key at all. That is the deliberate trade, and it is priced:
+            // an uncovered name — the shape an attacker picks, because it is the
+            // one they can generate without knowing the zone — measured flat to
+            // slightly faster (263 ns -> 253 ns, best of 5x20k, release,
+            // 100k-record zone), while a *covered* name pays one extra hash of
+            // the parent and measured ~+45 ns. Ordering the tuple probe first
+            // would move the cost onto the attacker's path instead, which is the
+            // wrong way round. Removing it entirely needs the owner-major re-key
+            // that is VEGA-032's (VEGA-083, rejected alternative 6).
+            if self.wildcard_parents.contains(&parent) {
+                covered = true;
+                if let Some(records) = self.wildcard.get(&(parent, record_type)) {
+                    return (Some(records), true);
+                }
             }
         }
-
-        Resolution::NxDomain
+        // Deliberately no early exit on `covered`: which wildcard answers must
+        // stay exactly what it is today (deepest type match). Stopping at the
+        // deepest wildcard *parent* would be a half-step towards RFC 4592
+        // §3.3.1 closest-encloser semantics, which is VEGA-009's, not this.
+        (None, covered)
     }
 
     /// The depths at which a wildcard parent of `name` could possibly sit.
