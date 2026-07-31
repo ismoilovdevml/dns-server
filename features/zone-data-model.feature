@@ -287,7 +287,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When each name is queried for A, ANY and CNAME
     Then every answer matches the transcription exactly
 
-  @happy @enforced src/zone.rs:2034
+  @happy @enforced src/zone.rs:2193
   Scenario: VEGA-065's four asterisk-in-the-name behaviours survive the arena unmodified
     # Wildcards stop being a parent-keyed map at S1 and become nodes named
     # "*.x" (RFC 4592 §2.1.1). These four are the cases a wrong label-count
@@ -444,7 +444,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
 
   # ----------------------------------------------------------- MALFORMED
 
-  @malformed @enforced src/zone.rs:1770
+  @malformed @enforced src/zone.rs:1929
   Scenario: An owner name outside the zone still fails the build after the rewrite
     # qualify() is the only thing standing between a config and a record for
     # somebody else's namespace. The arena build is a rewrite of everything

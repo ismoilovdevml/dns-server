@@ -21,16 +21,23 @@
 //! at which point the NSEC chain does not close and every validating resolver
 //! SERVFAILs the whole zone.
 //!
+//! The node set is **closed under ancestry**, up to but never past the origin:
+//! a name that exists only because something exists beneath it is a node with
+//! no RRsets, and answers NODATA rather than NXDOMAIN (RFC 4592 §2.2.2). That
+//! is not a nicety — RFC 8020 §2 lets a resolver apply one cached NXDOMAIN to
+//! the entire subtree below it, so denying an empty non-terminal denies the
+//! records that do exist under it (VEGA-006).
+//!
 //! # What this module does NOT do yet
 //!
-//! This is S1 of the six commits VEGA-032 sequences, and S1 is
-//! **behaviour-preserving**: it changes the data structure and nothing else.
-//! Empty non-terminals are still NXDOMAIN (S2), a wildcard still applies below a
-//! name that exists rather than only under the closest encloser (S3), there is
-//! no delegation, glue or occlusion handling (S4), and SOA and apex NS are still
-//! optional (S5). `tests/arena_differential.rs` holds this file to a
-//! transcription of the implementation it replaced, with zero permitted
-//! transitions.
+//! This is S2 of the six commits VEGA-032 sequences. A wildcard still applies
+//! below a name that exists rather than only under the closest encloser (S3),
+//! there is no delegation, glue or occlusion handling (S4), and SOA and apex NS
+//! are still optional (S5). `tests/arena_differential.rs` holds this file to a
+//! transcription of the implementation S1 replaced, fed a node set closed under
+//! ancestry, and permits exactly three classes of difference — all three
+//! consequences of that closure and each derived from the config rather than
+//! from what this file returned.
 //!
 //! Ruling: `.claude/backlog/decisions/VEGA-032-zone-data-model.md`.
 
@@ -307,14 +314,19 @@ impl NodeFlags {
     /// The leftmost label is `*` (RFC 4592 §2.1.1), so this node is a source of
     /// synthesis.
     ///
-    /// **At S1 this also means "not an ordinary node".** The model it replaces
-    /// kept wildcards in a separate map, so a query for the literal name
-    /// `*.dev.example.com.` never matched an exact key and fell through to the
-    /// wildcard walk. [`Zone::exact_node`] therefore skips these, which
+    /// **Through S2 this also means "not an ordinary node".** The model it
+    /// replaces kept wildcards in a separate map, so a query for the literal
+    /// name `*.dev.example.com.` never matched an exact key and fell through to
+    /// the wildcard walk. [`Zone::exact_node`] therefore skips these, which
     /// reproduces that exactly — including the case that makes the difference
     /// observable, a wildcard holding a CNAME, where treating the node as
     /// ordinary would substitute the CNAME for a query the old model answered
-    /// NODATA. S2 and S3 are where that changes, deliberately and with a ruling.
+    /// NODATA. S3 is where that changes, deliberately and with a ruling.
+    ///
+    /// Set from the **name**, never from which loop built the node: `x.*.dev`
+    /// materialises `*.dev` as an empty non-terminal, and RFC 4592 §2.1.1 makes
+    /// that a wildcard however it came to exist. A node flagged otherwise is one
+    /// the exact probe matches and the wildcard probe cannot reach.
     const WILDCARD: Self = Self(1 << 2);
 
     /// A CNAME RRset is present, so the RFC 1034 §3.6.2 substitution has
@@ -374,6 +386,11 @@ struct Node {
     /// Half-open range into [`Zone::rrsets`], ascending by numeric RRTYPE — so a
     /// type lookup is a binary search, and so RFC 4034 §4.1.2's NSEC type bitmap
     /// will want no second sort.
+    ///
+    /// **Empty** for an empty non-terminal, which is all an empty non-terminal
+    /// is: RFC 4592 §2.2.2 defines it as a name with no RRsets that has
+    /// descendants, and RFC 4035 §2.3 wants exactly that — an NSEC carrying only
+    /// the NSEC and RRSIG bits — rather than a variant to special-case.
     rrsets: Span,
     flags: NodeFlags,
 }
@@ -392,10 +409,12 @@ pub struct Zone {
     /// ancestor precedes its descendants, because canonical order sorts on the
     /// rightmost label first.
     ///
-    /// **No empty non-terminals at S1.** A node exists here for each name the
-    /// config declares, plus the apex, and for nothing else — so `a.b.ent` alone
-    /// still leaves `b.ent` NXDOMAIN. Materialising the ancestors is S2, and it
-    /// is the property every later step rests on.
+    /// **Closed under ancestry since S2.** A node exists here for each name the
+    /// config declares, plus the apex, plus every strict ancestor of both:
+    /// `a.b.ent` alone puts `b.ent` and `ent` here as nodes with no RRsets. That
+    /// closure is the property every later step rests on — it is what makes "a
+    /// node exists at this depth" monotone, and so what lets S3's
+    /// closest-encloser search be a binary search at all.
     nodes: Box<[Node]>,
     rrsets: Box<[Rrset]>,
     rdata: Box<[RData]>,
@@ -873,6 +892,32 @@ impl Zone {
              chain, and a chain that does not close SERVFAILs the whole zone"
         );
         debug_assert!(
+            {
+                // Invariant I-3, and the most dangerous coupling in the model:
+                // S3's closest-encloser search reads "a node exists at this
+                // depth" as a MONOTONE predicate, which it is only while the
+                // node set is closed under ancestry. A hole returns a shallower
+                // encloser than the truth, so a wildcard synthesises into a
+                // subtree an operator carved out — VEGA-009 reopened, silently,
+                // with answers that look correct. The set is a debug-only
+                // allocation on the reload path, which is what buys the check
+                // for every zone an operator ever loads rather than for the
+                // zones a test happens to name.
+                let names: std::collections::HashSet<LowerName> = self
+                    .nodes
+                    .iter()
+                    .map(|node| LowerName::from(node.name.clone()))
+                    .collect();
+                names.iter().all(|name| {
+                    *name == self.lower_origin
+                        || names.contains(&LowerName::from(Name::from(name.clone()).base_name()))
+                })
+            },
+            "a node's parent is not a node. The node set must be closed under \
+             ancestry (RFC 4592 §2.2.2): a name that exists only as an ancestor \
+             answers NXDOMAIN, and RFC 8020 §2 then denies every record beneath it"
+        );
+        debug_assert!(
             self.index.len() == self.nodes.len(),
             "the index and the arena hold different numbers of entries; some \
              configured record is unreachable and nothing says so"
@@ -1133,6 +1178,116 @@ impl<'a> ZoneBuilder<'a> {
             .with_context(|| format!("invalid record name {label:?}"))
     }
 
+    /// Close the node set under ancestry: every strict ancestor of every node,
+    /// down to the origin, becomes a node with no RRsets (RFC 4592 §2.2.2).
+    ///
+    /// This is the whole of VEGA-032 S2, and it closes VEGA-006. A name that
+    /// exists only because something exists beneath it — `_tcp.example.com.`
+    /// under `_sip._tcp.example.com. SRV` — used to fall through to NXDOMAIN,
+    /// and RFC 8020 §2 lets a resolver cache that denial and apply it to the
+    /// **whole subtree**, including the SRV record that does exist. SRV, TLSA,
+    /// ACME and DKIM all create such names, so any zone using them was one
+    /// cache fill away from losing records.
+    ///
+    /// An empty non-terminal is not a variant in this model. It is "a node with
+    /// no RRsets", which is what §2.2.2 says it is, and what RFC 4035 §2.3 will
+    /// need to emit an NSEC carrying only the NSEC and RRSIG bits.
+    ///
+    /// # Closure over the node set, not over the config
+    ///
+    /// The walk starts from the nodes the build actually holds, so a wildcard
+    /// whose owner name exceeds RFC 1035 §2.3.4's 255 octets — which
+    /// [`Self::insert_spec`] warns about and does not materialise — implies no
+    /// ancestors either. A name that existed because of a record the zone
+    /// refused to hold would be worse than the NXDOMAIN.
+    ///
+    /// # Three properties this must hold, each with a test that fails without it
+    ///
+    /// * It never overwrites an existing node. An ancestor is very often also a
+    ///   declared owner, and materialisation is a second write site for a node
+    ///   the config already wrote; clobbering deletes a configured record inside
+    ///   the build, where nothing else in this tree would notice.
+    /// * `record_count` does not move. Empty non-terminals are nodes, not
+    ///   records, and that gauge is an operator's only view of whether a reload
+    ///   truncated the zone (AC-2.4).
+    /// * The wildcard flag comes from the **name**. `x.*.dev` materialises
+    ///   `*.dev`, and RFC 4592 §2.1.1 makes a leftmost `*` a wildcard however
+    ///   the name came to exist. Deriving the flag from which loop created the
+    ///   node instead would leave a node that the exact-name probe matches and
+    ///   the wildcard probe does not — a source of synthesis nobody can reach.
+    ///
+    /// O(number of nodes created), not O(nodes × depth): the walk stops at the
+    /// first ancestor that already exists, and by induction everything above
+    /// that one is the responsibility of whoever inserted it. A flat zone —
+    /// 100,000 names one label below the apex — therefore does no work at all
+    /// and does not grow by a byte, which is what `tests/zone_memory.rs` holds
+    /// this to.
+    fn materialise_ancestors(&mut self) {
+        let origin_depth = label_count(self.lower_origin);
+
+        // Snapshotted, because the walk inserts into the same map. Only names
+        // with a strict ancestor *below* the origin can imply a new node: the
+        // ancestor of a name one label down is the origin, which is already
+        // there. That filter is what keeps a flat zone free of this allocation
+        // entirely rather than paying for a clone of every owner name.
+        let pending: Vec<Name> = self
+            .nodes
+            .values()
+            .filter(|node| node.name.iter().len() > origin_depth + 1)
+            .map(|node| node.name.clone())
+            .collect();
+
+        for name in pending {
+            let mut current = name;
+            // Terminates twice over: every pass either breaks or strictly
+            // reduces the label count, and the count starts at most at
+            // MAX_LABELS because hickory refused to build a longer name.
+            while current.iter().len() > origin_depth + 1 {
+                let key = LowerName::from(current.base_name());
+                if self.nodes.contains_key(&key) {
+                    // Either declared — in which case it is in `pending` on its
+                    // own account — or already materialised by an earlier walk
+                    // that carried on upwards from here. Both leave the chain
+                    // above this point closed.
+                    break;
+                }
+
+                // Lowercased, not spelled as the descendant that implied it
+                // spells it. Nobody wrote this name, two descendants may
+                // disagree about its case, and the scratch map's iteration
+                // order would otherwise decide which spelling wins — a build
+                // that is not reproducible. RFC 4343 §2 makes case
+                // non-semantic and RFC 4034 §6.2's canonical form is lowercase,
+                // so this is also the form the NSEC chain will want.
+                let parent = Name::from(key.clone());
+                let wildcard = parent.iter().next() == Some(WILDCARD_LABEL);
+                if wildcard {
+                    // The bitmap is indexed by the wildcard's *parent* depth,
+                    // the index space the walk probes in. A node exists, so its
+                    // name is representable and the depth is within
+                    // `MAX_LABELS`; the branch is here because `1u128 << 128`
+                    // panics and this runs on the reload path.
+                    let depth = label_count(&key).saturating_sub(1);
+                    if depth <= MAX_LABELS {
+                        self.wildcard_depths |= 1u128 << depth;
+                    }
+                }
+
+                self.nodes.insert(
+                    key,
+                    ScratchNode {
+                        name: parent.clone(),
+                        wildcard,
+                        // The definition of an empty non-terminal, and the
+                        // reason `record_count` does not move.
+                        rrsets: Vec::new(),
+                    },
+                );
+                current = parent;
+            }
+        }
+    }
+
     /// Lay the scratch map out as three exactly-sized arenas plus an index.
     fn finish(mut self, soa: Option<Record>) -> Result<Zone> {
         let origin = self.origin.clone();
@@ -1140,7 +1295,9 @@ impl<'a> ZoneBuilder<'a> {
         let default_ttl = self.default_ttl;
 
         // The apex always exists, even in an empty zone, otherwise a bare
-        // `SOA <origin>` query would answer NXDOMAIN for our own zone.
+        // `SOA <origin>` query would answer NXDOMAIN for our own zone. It is
+        // inserted before the ancestor closure below, which reads it as the
+        // floor every walk stops at.
         self.nodes
             .entry(lower_origin.clone())
             .or_insert_with(|| ScratchNode {
@@ -1148,6 +1305,8 @@ impl<'a> ZoneBuilder<'a> {
                 wildcard: false,
                 rrsets: Vec::new(),
             });
+
+        self.materialise_ancestors();
 
         let entries: Vec<(LowerName, ScratchNode)> = self.nodes.into_iter().collect();
 
