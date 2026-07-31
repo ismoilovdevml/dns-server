@@ -6,11 +6,16 @@
 
 use std::{
     fmt::Write as _,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use hickory_proto::op::ResponseCode;
+
+use crate::ratelimit::RateLimiter;
 
 /// Upper bounds, in seconds, of the query-latency histogram buckets.
 const LATENCY_BUCKETS: [f64; 9] = [
@@ -56,6 +61,12 @@ pub struct Metrics {
     latency_count: AtomicU64,
     /// Sum of latencies in microseconds; converted to seconds when rendering.
     latency_sum_micros: AtomicU64,
+    /// The limiter, when one is configured, so a scrape can read its occupancy.
+    ///
+    /// Held here rather than counted into a gauge as queries arrive: the limiter
+    /// deliberately keeps no per-source state to count, so the only honest
+    /// occupancy number is one derived from the table at scrape time.
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl Default for Metrics {
@@ -80,7 +91,20 @@ impl Metrics {
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             latency_count: AtomicU64::new(0),
             latency_sum_micros: AtomicU64::new(0),
+            rate_limiter: None,
         }
+    }
+
+    /// Publish the rate limiter's occupancy on `/metrics`.
+    ///
+    /// Takes the limiter itself, not a snapshot, because the gauges are computed
+    /// on scrape. Nothing is published when limiting is off: a table size for a
+    /// table that does not exist would have an operator alerting on a saturation
+    /// that cannot happen.
+    #[must_use]
+    pub fn with_rate_limiter(mut self, limiter: Option<Arc<RateLimiter>>) -> Self {
+        self.rate_limiter = limiter;
+        self
     }
 
     /// Publish the number of records loaded from the zone.
@@ -138,6 +162,25 @@ impl Metrics {
         self.queries_total.load(Ordering::Relaxed)
     }
 
+    /// Best-effort count of requests currently being handled.
+    ///
+    /// Entry (`query`) and exit (`observe_latency`) are already counted on every
+    /// path, so this costs the query path *nothing*: the alternative — an
+    /// `AtomicUsize` incremented and decremented per request — is exactly the
+    /// single contended hot atomic the performance budget forbids, on a path
+    /// whose p99 is microseconds.
+    ///
+    /// The writers stay `Relaxed`, so a sample can be skewed either way: a stale
+    /// `queries_total` with a fresh count (hence `saturating_sub`), or a fresh
+    /// total with a stale count, which over-reports and therefore errs toward
+    /// waiting. Both are safe because the only caller — the `Stopping` phase —
+    /// caps how long it will wait. Read during shutdown only.
+    pub fn in_flight(&self) -> u64 {
+        self.queries_total
+            .load(Ordering::Acquire)
+            .saturating_sub(self.latency_count.load(Ordering::Acquire))
+    }
+
     /// Seconds since the process started serving.
     pub fn uptime(&self) -> Duration {
         self.started.elapsed()
@@ -148,8 +191,41 @@ impl Metrics {
         let mut out = String::with_capacity(2048);
         self.render_info(&mut out);
         self.render_queries(&mut out);
+        self.render_rate_limit(&mut out);
         self.render_latency(&mut out);
         out
+    }
+
+    /// The two limiter gauges (VEGA-003 §8).
+    ///
+    /// `dns_ratelimit_tracked` — the map size VEGA-043 originally asked for — is
+    /// unimplementable: the limiter retains no per-source state, on purpose, and
+    /// a gauge whose name promises source cardinality while reporting something
+    /// else is worse than no gauge. What an operator can act on is the ratio:
+    /// rate-limited queries rising with `active` low is a concentrated attack
+    /// working as designed, while `active` approaching `slots` means a
+    /// maximal-diversity flood has degraded the table towards a global limit and
+    /// legitimate clients are being denied alongside it.
+    ///
+    /// The occupancy walk is 262,144 relaxed loads over 2 MiB of sequential
+    /// memory — a few hundred microseconds on the scrape task, taking no lock,
+    /// blocking no query.
+    fn render_rate_limit(&self, out: &mut String) {
+        let Some(limiter) = &self.rate_limiter else {
+            return;
+        };
+        gauge(
+            out,
+            "dns_ratelimit_slots",
+            "Slots in the rate limiter's fixed table. Constant for the process lifetime.",
+            as_f64(as_u64(limiter.slots())),
+        );
+        gauge(
+            out,
+            "dns_ratelimit_active",
+            "Slots whose token bucket is below full at scrape time.",
+            as_f64(as_u64(limiter.active())),
+        );
     }
 
     fn render_info(&self, out: &mut String) {
@@ -270,6 +346,13 @@ impl Metrics {
 #[allow(clippy::cast_precision_loss)]
 fn as_f64(value: u64) -> f64 {
     value as f64
+}
+
+/// Slot counts are bounded by the table size, so the conversion is exact on
+/// every target; the saturation is there only because a panic must not be
+/// reachable from a scrape.
+fn as_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn gauge(out: &mut String, name: &str, help: &str, value: f64) {
@@ -420,6 +503,29 @@ mod tests {
         let text = m.render_prometheus();
         assert!(text.contains("dns_rate_limited_total 2"), "{text}");
         assert!(text.contains("dns_send_errors_total 1"), "{text}");
+    }
+
+    /// Scenario: A query received in the final 50 milliseconds of the window is answered
+    /// features/shutdown.feature:162
+    #[test]
+    fn in_flight_is_entries_minus_exits_and_never_underflows() {
+        let m = Metrics::new();
+        assert_eq!(m.in_flight(), 0);
+
+        m.query(Transport::Udp);
+        m.query(Transport::Tcp);
+        assert_eq!(m.in_flight(), 2, "two entered, neither has exited");
+
+        m.observe_latency(Duration::from_micros(10));
+        assert_eq!(m.in_flight(), 1);
+        m.observe_latency(Duration::from_micros(10));
+        assert_eq!(m.in_flight(), 0);
+
+        // The counters are Relaxed and read separately, so a sample can see more
+        // exits than entries. Saturating is what keeps that from becoming a
+        // gigantic in-flight count that would burn the whole quiesce cap.
+        m.observe_latency(Duration::from_micros(10));
+        assert_eq!(m.in_flight(), 0);
     }
 
     #[test]

@@ -7,6 +7,101 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — BREAKING
+
+- **`rate_limit.qps` and `.burst` now apply to a source network, not a source
+  address.** The limiter keys on an IPv4 **/24** or an IPv6 **/56** (BIND 9's
+  documented defaults), with IPv4-mapped IPv6 sources folded to their IPv4 form
+  first. Every host inside one /24 now shares one bucket.
+
+  **This will look like an outage if you sized `qps` per resolver.** An operator
+  running `qps = 50` whose traffic comes from a resolver farm of 200 hosts inside
+  one /24 was granting that farm 10,000 queries per second and is now granting it
+  50. Size `qps` for the busiest single /24 you serve, not for a single resolver.
+  Rate limiting is off unless `qps` is configured, so no default deployment
+  changes behaviour.
+
+  Keying on the full address is what made the limiter both useless and dangerous:
+  an attacker holding one IPv6 /64 could present 2^64 distinct "sources", each
+  meeting a bucket that had never been touched, so the bucket never fired while
+  every forged address cost memory.
+
+### Fixed
+
+- **Turning rate limiting on was what made the process killable.** The limiter
+  kept a `HashMap` entry per source address, created before any packet validation
+  and capped by nothing. A measured 186 bytes per forged source meant 2,000,000
+  spoofed sources cost 356 MiB and climbing, and a container with
+  `limits.memory: 128Mi` was OOM-killed after about 723,000 sources — 7.2 seconds
+  at 100,000 spoofed packets per second, which is one rented VPS. The background
+  sweeper could not help: entries were not eligible for eviction for 600 seconds,
+  and `HashMap::retain` never returns the allocation anyway, so 0.0% of the
+  memory came back.
+
+  The map is gone. State is now a fixed table of 262,144 eight-byte slots —
+  **2 MiB, allocated once at startup, never grown, never shrunk, never pruned**,
+  identical after one query and after a two-million-source flood. There is no
+  per-source allocation, no lock and no sweeper task on the query path. Two
+  networks whose hashes collide share a bucket, which is always stricter and
+  never looser, and a per-process random seed decides which — so a collision set
+  cannot be computed offline and aimed at a victim.
+
+  Two consequences worth knowing. Under a flood spread across very many networks
+  the table degrades towards a single global limit, and legitimate clients are
+  denied alongside the attack: watch `dns_ratelimit_active` against
+  `dns_ratelimit_slots`. And two nodes behind one anycast address disagree about
+  which networks share a slot, because the seed is per process — that is
+  deliberate, and it is what stops the collision set being portable.
+
+- **`SIGTERM` did not drain.** 0.2.0 claimed below that "readiness flips to 503
+  while draining" and that shutdown "drains in-flight queries". Neither was
+  true: the signal cancelled the DNS listeners directly and the process exited
+  about 1.3 ms later, so `/readyz` went from `200` straight to connection
+  refused, in-flight TCP queries were dropped unanswered, and
+  `terminationGracePeriodSeconds` was decorative. Every rolling update was a
+  short resolution failure for whichever clients still had the old endpoint —
+  invisible in our own metrics, because those queries never arrived.
+
+  `SIGTERM` now marks the process unready *first*, keeps answering DNS for
+  `shutdown_drain_secs` (default 15 s) while `/readyz` reports `503`, then
+  closes the DNS listeners and the admin server last. `SIGINT` uses a
+  zero-length window. See "Shutdown and draining" in the README.
+
+### Changed
+
+- **Deployment timings now derive from the drain instead of being guesses.**
+  Kubernetes `terminationGracePeriodSeconds` 20 → 30, liveness
+  `periodSeconds` 15 → 10 and `timeoutSeconds` 3 → 2 (so
+  `10 × 3 = 30 s` still exceeds the 20 s hard deadline and the kubelet cannot
+  restart a draining pod), readiness `periodSeconds` 5 → 2, `timeoutSeconds`
+  3 → 1, `initialDelaySeconds` 1 → 0 so the `503` is observed well inside the
+  window. systemd `TimeoutStopSec` 45 → 30 with `KillMode=mixed` and an
+  explicit `SendSIGKILL=yes`. Compose gains `stop_grace_period: 30s`, because
+  its 10 s default would `SIGKILL` mid-drain. The image declares
+  `STOPSIGNAL SIGTERM` explicitly rather than inheriting it.
+- **No `preStop` hook**, deliberately: it runs before `SIGTERM`, when `/readyz`
+  is still `200`, so it cannot serve the `503` — and it stacks with the drain
+  into a guaranteed `SIGKILL`.
+
+### Added
+
+- `shutdown_drain_secs` / `--shutdown-drain-secs` / `VEGA_SHUTDOWN_DRAIN_SECS`,
+  `0..=300`, default 15.
+- `deploy/check-shutdown-invariants.sh`, run by CI: the shutdown timings across
+  the Kubernetes manifest, the systemd unit, the Dockerfile, Compose and the
+  image smoke test are only correct relative to each other, so they are checked
+  mechanically rather than remembered.
+- `dns_ratelimit_slots` and `dns_ratelimit_active`, both gauges, present only
+  when rate limiting is configured. `slots` is the constant table size;
+  `active` counts the slots whose bucket is below full, computed while the
+  scrape is being rendered rather than maintained by a task. The pair is how you
+  tell a concentrated attack (total rising, `active` low) from a
+  many-network flood that has collapsed the table towards one global limit
+  (`active` approaching `slots`). There is deliberately no gauge for the number
+  of distinct sources seen: the limiter does not retain that, which is the whole
+  point, and a gauge whose name promised it while reporting something else would
+  be worse than none.
+
 ## [0.2.0] - 2026-07-30
 
 A rewrite. 0.1.0 was a demonstration of the Hickory API with four hard-coded

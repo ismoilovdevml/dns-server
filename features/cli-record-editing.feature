@@ -368,6 +368,34 @@ Feature: Editing zone records from the command line
     And stderr mentions "invalid A value"
     And the file contents are identical to before
 
+  @boundary @enforced src/rdata.rs:106
+  Scenario: A record value of exactly the maximum length is accepted
+    # 4090 characters. The bound is inclusive, and `record add` must be willing
+    # to write anything the zone loader is willing to load.
+    Given an initialised workspace
+    When a 4090-character TXT value is added via the CLI
+    Then the process exits zero
+    And the config still passes "vega check"
+
+  @malformed @enforced src/rdata.rs:116
+  Scenario: A record value one character over the maximum is rejected
+    Given a config file containing one record set
+    When a 4091-character TXT value is added
+    Then the edit fails with an error mentioning "the maximum is 4090"
+    And the file still contains 1 record set
+
+  @hostile @enforced tests/record_limits.rs:97
+  Scenario: An oversized record value exits 1 rather than aborting the process
+    # hickory's zone-file lexer asserts at 4095 characters within one token, and
+    # the release profile sets panic = "abort", so an unguarded path exits 134
+    # on SIGABRT with no diagnostic an operator can act on.
+    Given an initialised workspace
+    When a 4200-character TXT value is added via the CLI
+    Then the process exits with code 1
+    And stderr mentions "is 4200 characters; the maximum is 4090"
+    And stderr does not mention "assertion failed"
+    And the value is not written to the config
+
   @malformed @enforced src/editor.rs:614
   Scenario: An unknown record type is rejected
     Given a config file

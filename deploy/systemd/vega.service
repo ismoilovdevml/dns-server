@@ -16,9 +16,26 @@ ExecStartPre=/usr/local/bin/vega check --config /etc/vega/vega.toml
 # Records can be changed without a restart: edit the config and POST /reload, or
 # use `vega record add --reload`. Listener addresses and the rate limiter
 # are not hot-swappable and do need a restart.
-# The process handles SIGTERM and drains, so let it.
+
+# --- Stopping ----------------------------------------------------------------
+# On SIGTERM the process marks itself unready, keeps answering DNS for
+# shutdown_drain_secs (default 15s), then closes the listeners and exits. Give
+# it room: drain 15s + 5s stop budget + 2s watchdog = 22s, so 30s leaves 8s of
+# slop and matches terminationGracePeriodSeconds in the Kubernetes manifest.
+# 45s was arbitrary — the in-process watchdog guarantees the process is gone by
+# 22s, so the extra 23s were spent waiting on a process that was already dead.
+# (That drain landed after 0.2.0. On 0.2.0 the process exits immediately and
+# this timeout is only ever an unused upper bound.)
+# Raise this whenever you raise shutdown_drain_secs; deploy/check-shutdown-
+# invariants.sh fails CI if the two drift apart.
 KillSignal=SIGTERM
-TimeoutStopSec=45
+# SIGTERM to the main process only — the drain is its job and it must not be
+# raced by signals to its threads — then SIGKILL the whole cgroup if it is late.
+KillMode=mixed
+TimeoutStopSec=30
+# Default, stated explicitly: a wedged process must still die. This is the
+# escape hatch that lets us refuse to reimplement "exit now" in-process.
+SendSIGKILL=yes
 
 # `on-failure` would not restart after a clean exit — and the process exits 0 on
 # SIGTERM, so a stray `killall` would leave the name server down with systemd

@@ -1,9 +1,14 @@
 //! Entry point: parse the command line, then either run the server or one of the
 //! management subcommands.
 
-use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    process::ExitCode,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory as _, Parser as _};
 use hickory_server::Server;
 use tokio::net::{TcpListener, UdpSocket};
@@ -11,21 +16,63 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, layer::SubscriberExt as _, util::SubscriberInitExt as _, EnvFilter};
 use vega::{
-    admin::{self, AdminState, ReloadOutcome},
+    admin::{self, AdminState},
     cli::{Cli, Command, RecordAction, ZoneAction},
     commands::{inspect, record, zone as zone_cmd},
     config::{Config, GlobalArgs, LogFormat},
     dnsclient,
     handler::DnsHandler,
     healthcheck,
+    lifecycle::{Lifecycle, Phase},
     metrics::Metrics,
-    ratelimit::{RateLimiter, DEFAULT_IDLE_TTL},
-    shutdown, ui,
+    ratelimit::RateLimiter,
+    reload::ReloadContext,
+    shutdown::{self, Signals},
+    ui,
     zone::Zone,
 };
 
-/// How often the rate-limiter janitor sweeps out idle buckets.
-const JANITOR_INTERVAL: Duration = Duration::from_secs(60);
+/// How long `Stopping` waits for in-flight requests before cancelling the DNS
+/// token.
+///
+/// Hickory drops the `JoinSet` holding every connection task the instant its
+/// token is cancelled, which aborts them mid-response, so this is the only
+/// window an in-flight TCP query has (RFC 7766 §6.2.4 permits the close and puts
+/// retry on the client — but a retry is seconds the client did not have to pay).
+/// Capped rather than unbounded: the listeners are still accepting throughout,
+/// so under sustained load in-flight never reaches zero and the only way out
+/// would be `SIGKILL`.
+const QUIESCE_CAP: Duration = Duration::from_secs(1);
+
+/// How often the quiesce loop re-reads the in-flight count. Small enough that a
+/// finished request is noticed immediately, large enough not to spin.
+const QUIESCE_POLL: Duration = Duration::from_millis(5);
+
+/// Budget for `Stopping` plus `Closing`, on top of the drain window.
+///
+/// Covers the quiesce cap (1s), joining the accept tasks (microseconds) and
+/// axum's graceful shutdown of open admin connections. An order of magnitude
+/// over the measured cost of all three, and deliberately not configurable: one
+/// knob for the drain is enough for an operator to reason about.
+const STOP_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long `Closing` waits for the admin server to finish its own shutdown.
+///
+/// Well inside [`STOP_BUDGET`], because the thing being waited for is not our
+/// work: axum's graceful shutdown holds until every accepted connection is done,
+/// and a connection that has sent half a request header is never done. The cost
+/// of giving up is one abandoned HTTP connection on a process that is exiting;
+/// the cost of waiting is the whole hard deadline and exit 3 (VEGA-079).
+const ADMIN_CLOSE_BUDGET: Duration = Duration::from_secs(1);
+
+/// Grace on top of the hard deadline before the OS-thread watchdog exits.
+const WATCHDOG_GRACE: Duration = Duration::from_secs(2);
+
+/// Exit code for a shutdown that overran its hard deadline.
+///
+/// Distinct from clean (0), startup failure (1) and clap's usage error (2), so
+/// `lastState.terminated.exitCode` or `systemctl status` says what happened.
+const OVERRUN_EXIT_CODE: u8 = 3;
 
 /// Environment variables renamed by the `dns-server` → `vega` rebrand.
 ///
@@ -262,8 +309,13 @@ fn serve_command(global: &GlobalArgs) -> Result<ExitCode> {
     let config = Config::load(global)?;
     init_tracing(&config);
 
-    match run(config) {
-        Ok(()) => Ok(ExitCode::SUCCESS),
+    // `global` is the invocation a reload re-resolves against, forever: the
+    // command line and environment as parsed here, with `config` already resolved
+    // through the search path.
+    match run(config, global.clone()) {
+        // The code comes from the shutdown path: 0 when every phase completed
+        // inside the deadline, 3 when it did not.
+        Ok(code) => Ok(code),
         Err(error) => {
             error!("{error:#}");
             Ok(ExitCode::FAILURE)
@@ -331,22 +383,40 @@ fn report(error: &anyhow::Error, as_json: bool) {
     }
 }
 
-fn run(config: Config) -> Result<()> {
+fn run(config: Config, invocation: GlobalArgs) -> Result<ExitCode> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("building the tokio runtime")?;
-    runtime.block_on(serve(config))
+    runtime.block_on(serve(config, invocation))
 }
 
-async fn serve(config: Config) -> Result<()> {
+/// Bind the listeners, serve, and run the shutdown state machine.
+///
+/// The ordering below is the whole of VEGA-046 and is the reason the three
+/// cancellation tokens are never shared:
+///
+/// 1. `drain_start` — cancelled first. `/readyz` answers 503 and `/reload` fails
+///    closed, while every DNS listener is still bound and answering.
+/// 2. `dns` (hickory's own) — cancelled when the window has elapsed and
+///    in-flight requests have quiesced.
+/// 3. `admin` — cancelled last, so a probe still gets an answer after DNS has
+///    gone rather than a connection refused it cannot distinguish from a crash.
+///
+/// Handing any of these to something that cancels another was the defect: a
+/// `SIGTERM` cancelled the accept loops directly, the sockets were gone in
+/// 1.3 ms, and the 503 the whole drain exists to serve was never on the wire.
+async fn serve(config: Config, invocation: GlobalArgs) -> Result<ExitCode> {
     let zone = Arc::new(Zone::from_config(&config.zone).context("building the zone")?);
-    let metrics = Arc::new(Metrics::new());
-    metrics.set_zone_records(zone.record_count() as u64);
 
+    // Before the metrics, which borrow it: the limiter keeps no per-source state
+    // to count, so `/metrics` reads its occupancy out of the table on scrape.
     let limiter = config
         .rate_limit
         .map(|rl| Arc::new(RateLimiter::new(rl.qps, rl.burst)));
+
+    let metrics = Arc::new(Metrics::new().with_rate_limiter(limiter.clone()));
+    metrics.set_zone_records(zone.record_count() as u64);
 
     // The reload hook and the server share one handler, so a swapped zone is
     // visible to both.
@@ -357,9 +427,117 @@ async fn serve(config: Config) -> Result<()> {
         limiter.clone(),
     ));
 
-    let mut server = Server::new(SharedHandler(Arc::clone(&handler)));
-    let shutdown_token = server.shutdown_token().clone();
+    let lifecycle = Arc::new(Lifecycle::new());
 
+    // Install the signal handlers before binding anything. A SIGTERM that
+    // arrives mid-startup must find a handler, not the default disposition.
+    let signals = shutdown::watch();
+
+    let mut server = Server::new(SharedHandler(Arc::clone(&handler)));
+    let dns = server.shutdown_token().clone();
+
+    bind_dns(&mut server, &config).await?;
+
+    // Bind the admin listener before reporting ready (VEGA-044). Binding inside
+    // the spawned task meant a taken port surfaced as a task that quietly died
+    // after startup, with the process still claiming success.
+    let admin_listener = match config.admin_listen {
+        Some(addr) => Some(admin::bind(addr).await?),
+        None => None,
+    };
+
+    // Two tokens of our own, cancelled at opposite ends of the sequence, and
+    // neither of them hickory's.
+    let drain_start = CancellationToken::new();
+    let admin_shutdown = CancellationToken::new();
+
+    let mut admin_state = AdminState::new(Arc::clone(&metrics))
+        .with_lifecycle(Arc::clone(&lifecycle))
+        .with_token(config.admin_token.clone());
+    // Reload only makes sense when there is a file to re-read.
+    if let Some(source) = config.source.clone() {
+        // The *drain-start* token, not the listener-cancel one. The two were the
+        // same instant before this change and are seconds apart after it, so
+        // gating a reload on the later half would let a new zone be installed
+        // throughout the whole drain — strictly worse than the old behaviour.
+        admin_state = admin_state.with_reload(vega::reload::hook(Arc::new(ReloadContext::new(
+            invocation,
+            source,
+            Arc::clone(&handler),
+            Arc::clone(&metrics),
+            config.clone(),
+            drain_start.clone(),
+        ))));
+    }
+
+    let admin_task = admin_listener.map(|listener| {
+        let state = admin_state.clone();
+        let token = admin_shutdown.clone();
+        let signals = signals.clone();
+        tokio::spawn(async move {
+            if let Err(error) = admin::serve(listener, state, token).await {
+                error!("{error:#}");
+                // A dead metrics endpoint means a blind operator, so this is
+                // fatal — but it goes through the same machine a signal uses, so
+                // DNS drains instead of dying in the same instant.
+                signals.abort();
+            }
+        })
+    });
+
+    log_shutdown_plan(&config);
+    info!(
+        version = vega::VERSION,
+        zone = %config.zone.origin,
+        records = zone.record_count(),
+        builtins = config.zone.builtins,
+        rate_limited = config.rate_limit.is_some(),
+        reloadable = config.source.is_some(),
+        "vega ready"
+    );
+    lifecycle.enter(Phase::Serving);
+
+    // Steady state. `block_until_done` is in the select so that listeners dying
+    // on their own is still a failure rather than a silent hang.
+    let cause = tokio::select! {
+        cause = signals.first() => cause,
+        result = server.block_until_done() => {
+            admin_shutdown.cancel();
+            result.context("dns server terminated with an error")?;
+            bail!("the DNS listeners stopped before any shutdown signal arrived");
+        }
+    };
+
+    let window = cause.drain_window(config.shutdown_drain);
+    let deadline = Instant::now() + window + STOP_BUDGET;
+    lifecycle.arm_deadline(deadline);
+    // Armed before the first await of the sequence, because the failure it
+    // covers is precisely a runtime that never gets to another await.
+    arm_watchdog(deadline + WATCHDOG_GRACE, Arc::clone(&lifecycle));
+    info!(
+        signal = cause.as_str(),
+        drain_secs = window.as_secs(),
+        "shutdown starting"
+    );
+
+    let sequence = Shutdown {
+        lifecycle: &lifecycle,
+        signals: &signals,
+        metrics: &metrics,
+        drain_start,
+        dns,
+        admin: admin_shutdown,
+        admin_task,
+        window,
+    };
+    Ok(sequence.execute(&mut server, deadline).await)
+}
+
+/// Bind every configured DNS listener and hand it to the server.
+///
+/// A bind failure is a startup failure: naming the address is what turns
+/// "vega exited 1" into "port 53 is already in use" at 3am.
+async fn bind_dns(server: &mut Server<SharedHandler>, config: &Config) -> Result<()> {
     for addr in &config.udp {
         let socket = UdpSocket::bind(addr)
             .await
@@ -376,92 +554,208 @@ async fn serve(config: Config) -> Result<()> {
         server.register_listener(listener, config.tcp_timeout, config.tcp_response_buffer);
     }
 
-    // One token drives everything: signals cancel it, and the admin server and
-    // janitor stop when it fires.
-    shutdown::watch(shutdown_token.clone());
-
-    let mut admin_state =
-        AdminState::new(Arc::clone(&metrics)).with_token(config.admin_token.clone());
-    // Reload only makes sense when there is a file to re-read.
-    if let Some(source) = config.source.clone() {
-        admin_state = admin_state.with_reload(reload_hook(
-            source,
-            Arc::clone(&handler),
-            Arc::clone(&metrics),
-            config.clone(),
-        ));
-    }
-
-    if let Some(addr) = config.admin_listen {
-        let state = admin_state.clone();
-        let token = shutdown_token.clone();
-        tokio::spawn(async move {
-            if let Err(error) = admin::serve(addr, state, token.clone()).await {
-                error!("{error:#}");
-                // A dead metrics endpoint means a blind operator; treat it as fatal
-                // so the orchestrator restarts us instead of running unobserved.
-                token.cancel();
-            }
-        });
-    }
-
-    if let Some(limiter) = limiter.clone() {
-        spawn_janitor(limiter, shutdown_token.clone());
-    }
-
-    info!(
-        version = vega::VERSION,
-        zone = %config.zone.origin,
-        records = zone.record_count(),
-        builtins = config.zone.builtins,
-        rate_limited = config.rate_limit.is_some(),
-        reloadable = config.source.is_some(),
-        "vega ready"
-    );
-    admin_state.mark_ready();
-
-    let result = server.block_until_done().await;
-
-    // Stop reporting ready before the sockets actually close, so a load balancer
-    // has a chance to take us out of rotation.
-    admin_state.mark_unready();
-    shutdown_token.cancel();
-
-    result.context("dns server terminated with an error")?;
-    info!("shutdown complete");
     Ok(())
 }
 
-/// Re-read the config file and swap the zone in place.
-///
-/// Listener addresses and the rate limiter are *not* re-applied: changing those
-/// means rebinding sockets, which is a restart, not a reload. The hook logs a
-/// warning if they drift so the difference is not silent.
-fn reload_hook(
-    source: PathBuf,
-    handler: Arc<DnsHandler>,
-    metrics: Arc<Metrics>,
-    original: Config,
-) -> admin::ReloadFn {
-    Arc::new(move || {
-        let args = GlobalArgs {
-            config: Some(source.clone()),
-            ..GlobalArgs::default()
-        };
-        let fresh = Config::load(&args).map_err(|e| format!("{e:#}"))?;
-        let zone = Zone::from_config(&fresh.zone).map_err(|e| format!("{e:#}"))?;
+/// Everything the shutdown sequence touches, gathered so that the ordering reads
+/// as one list in one place.
+struct Shutdown<'a> {
+    lifecycle: &'a Lifecycle,
+    signals: &'a Signals,
+    metrics: &'a Metrics,
+    /// Cancelled first: `/reload` fails closed from here on.
+    drain_start: CancellationToken,
+    /// Hickory's own token: the UDP and TCP accept loops, and by `JoinSet` drop
+    /// every connection task with them.
+    dns: CancellationToken,
+    /// The admin server's token. Cancelled last.
+    admin: CancellationToken,
+    admin_task: Option<tokio::task::JoinHandle<()>>,
+    /// How long to keep answering after the 503 goes out.
+    window: Duration,
+}
 
-        if fresh.udp != original.udp || fresh.tcp != original.tcp {
-            warn!("listener addresses changed in the config; a restart is needed to apply them");
+impl Shutdown<'_> {
+    /// Run the sequence under the hard deadline and report the process exit code.
+    ///
+    /// The deadline is enforced here, on the main task, by a timer. That covers
+    /// everything except a runtime with nothing left to poll it — which is what
+    /// [`arm_watchdog`] is for.
+    async fn execute(self, server: &mut Server<SharedHandler>, deadline: Instant) -> ExitCode {
+        let (lifecycle, metrics) = (self.lifecycle, self.metrics);
+        match tokio::time::timeout_at(deadline.into(), self.run(server)).await {
+            Ok(()) => {
+                info!("shutdown complete");
+                ExitCode::SUCCESS
+            }
+            Err(_elapsed) => {
+                error!(
+                    phase = %lifecycle.phase(),
+                    in_flight = metrics.in_flight(),
+                    "shutdown exceeded its hard deadline; abandoning in-flight work and exiting \
+                     {OVERRUN_EXIT_CODE}"
+                );
+                ExitCode::from(OVERRUN_EXIT_CODE)
+            }
+        }
+    }
+
+    /// Drain, stop, close — in that order, always, whatever the window is.
+    async fn run(self, server: &mut Server<SharedHandler>) {
+        // Published before the first `.await`, on this task, so the 503 is on the
+        // wire for the whole window rather than most of it.
+        self.drain_start.cancel();
+        self.lifecycle.enter(Phase::Draining);
+        info!(
+            window_secs = self.window.as_secs(),
+            "shutdown: draining — /readyz reports 503 while DNS keeps answering"
+        );
+
+        tokio::select! {
+            () = tokio::time::sleep(self.window) => {}
+            () = self.signals.again() => {
+                info!("shutdown: a further signal collapsed the remaining drain window");
+            }
         }
 
-        let records = zone.record_count();
-        let origin = fresh.zone.origin.clone();
-        metrics.set_zone_records(records as u64);
-        handler.replace_zone(Arc::new(zone), fresh.zone.builtins);
+        self.lifecycle.enter(Phase::Stopping);
+        info!(
+            in_flight = self.metrics.in_flight(),
+            "shutdown: stopping — letting in-flight queries finish before the DNS sockets go"
+        );
+        let abandoned = self.quiesce().await;
+        if abandoned > 0 {
+            warn!(
+                in_flight = abandoned,
+                "the quiesce cap elapsed with requests still in flight; hickory aborts their \
+                 tasks on cancel, so those clients will have to retry"
+            );
+        }
 
-        Ok(ReloadOutcome { origin, records })
-    })
+        self.dns.cancel();
+        if let Err(error) = server.block_until_done().await {
+            // Hickory returns Ok whenever its token is cancelled, so an error
+            // here is an independent socket failure on the way out. The operator
+            // asked us to stop; a socket error while stopping is not a failed
+            // shutdown, and reporting it as one would restart-loop a healthy
+            // deployment.
+            warn!(%error, "a DNS listener reported an error while shutting down");
+        }
+
+        self.lifecycle.enter(Phase::Closing);
+        info!("shutdown: closing — DNS is down, the admin listener goes last");
+        self.admin.cancel();
+        if let Some(mut task) = self.admin_task {
+            // Bounded, because axum's graceful shutdown does not return until
+            // every accepted connection has finished, and the admin server has no
+            // header-read timeout: a caller who sends half a request header and
+            // stops is waited for forever. Unbounded, three such connections put
+            // every shutdown over the hard deadline and exited 3 — an
+            // unauthenticated client deciding what a rollout looks like
+            // (VEGA-079). The clean fix is hyper's `http1_header_read_timeout`
+            // plus a connection cap, which is VEGA-019's; this bounds the damage
+            // to the last second of the shutdown either way.
+            //
+            // `&mut task` rather than `task`, so the handle survives the timeout
+            // and the leftover connections are aborted rather than detached.
+            // The admin task's own errors are already logged by the task.
+            if tokio::time::timeout(ADMIN_CLOSE_BUDGET, &mut task)
+                .await
+                .is_err()
+            {
+                warn!(
+                    budget_secs = ADMIN_CLOSE_BUDGET.as_secs(),
+                    "the admin listener did not close within its budget; a client is holding a \
+                     connection open — abandoning it and exiting"
+                );
+                task.abort();
+            }
+        }
+    }
+
+    /// Wait for in-flight requests to finish, capped at [`QUIESCE_CAP`].
+    ///
+    /// Returns whatever is still in flight when it gives up, which is zero on
+    /// every path a rollout takes: by the time `Stopping` is reached the endpoint
+    /// has been out of rotation for the whole window.
+    async fn quiesce(&self) -> u64 {
+        let cap = Instant::now() + QUIESCE_CAP;
+        loop {
+            let in_flight = self.metrics.in_flight();
+            if in_flight == 0 {
+                return 0;
+            }
+            let now = Instant::now();
+            if now >= cap {
+                return in_flight;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(QUIESCE_POLL.min(cap - now)) => {}
+                () = self.signals.again() => return self.metrics.in_flight(),
+            }
+        }
+    }
+}
+
+/// Arm an OS-thread watchdog that ends the process if the runtime is wedged.
+///
+/// This is the only layer that survives a wedged tokio runtime — a blocking
+/// reload hook that never returns, a task that never yields, a worker deadlock —
+/// because a tokio timer cannot fire when nothing is polling it, and an OS
+/// thread can. It is not belt and braces: a `spawn_blocking` task stuck on a
+/// FIFO with no writer keeps `Runtime::drop` waiting *after* a clean shutdown
+/// has already been logged, and nothing inside the runtime can observe that.
+///
+/// `std::process::exit` skips destructors, which is acceptable and cheap to
+/// justify: Vega has nothing to flush, and systemd or the kubelet would
+/// `SIGKILL` us moments later anyway. The watchdog buys a log line and a
+/// distinguishable exit code first. It is safe code, so `unsafe_code = "forbid"`
+/// is untouched.
+fn arm_watchdog(at: Instant, lifecycle: Arc<Lifecycle>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(at.saturating_duration_since(Instant::now()));
+        error!(
+            phase = %lifecycle.phase(),
+            "watchdog: the shutdown hard deadline and its grace have both elapsed and this \
+             process is still alive; exiting {OVERRUN_EXIT_CODE}"
+        );
+        std::process::exit(i32::from(OVERRUN_EXIT_CODE));
+    });
+}
+
+/// State the shutdown timings at startup, and warn about the two configurations
+/// that make the drain useless.
+///
+/// We cannot read `terminationGracePeriodSeconds` or `TimeoutStopSec` from
+/// inside the container, so we publish the number the operator has to beat and
+/// let them check it against their manifest.
+fn log_shutdown_plan(config: &Config) {
+    let drain = config.shutdown_drain;
+    let deadline = drain + STOP_BUDGET;
+    let watchdog = deadline + WATCHDOG_GRACE;
+
+    if !drain.is_zero() && drain < config.tcp_timeout {
+        warn!(
+            "shutdown drain {}s is shorter than the TCP idle timeout {}s; idle TCP connections \
+             will be closed by process exit rather than by their own timeout",
+            drain.as_secs(),
+            config.tcp_timeout.as_secs()
+        );
+    }
+    if config.admin_listen.is_none() && !drain.is_zero() {
+        warn!(
+            "no admin listener: the {}s shutdown drain cannot be observed by a readiness probe",
+            drain.as_secs()
+        );
+    }
+
+    info!(
+        "shutdown drain {}s, hard deadline {}s from signal; set terminationGracePeriodSeconds / \
+         TimeoutStopSec above {}s",
+        drain.as_secs(),
+        deadline.as_secs(),
+        watchdog.as_secs()
+    );
 }
 
 /// Newtype so a shared `Arc<DnsHandler>` satisfies Hickory's owned-handler bound.
@@ -481,25 +775,6 @@ impl hickory_server::server::RequestHandler for SharedHandler {
             .handle_request::<R, T>(request, response_handle)
             .await
     }
-}
-
-/// Periodically drop rate-limiter buckets for sources we have not seen recently.
-fn spawn_janitor(limiter: Arc<RateLimiter>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(JANITOR_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                () = shutdown.cancelled() => break,
-                _ = ticker.tick() => {
-                    let removed = limiter.prune(DEFAULT_IDLE_TTL);
-                    if removed > 0 {
-                        tracing::debug!(removed, tracked = limiter.tracked(), "pruned rate limiter");
-                    }
-                }
-            }
-        }
-    });
 }
 
 /// Install the global tracing subscriber.

@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, ValueEnum};
 use serde::Deserialize;
 
@@ -23,6 +23,23 @@ pub const DEFAULT_TTL: u32 = 300;
 
 /// Default idle timeout for TCP connections.
 pub const DEFAULT_TCP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default seconds to keep answering DNS after `SIGTERM` while `/readyz` says 503.
+///
+/// Derived in `.claude/backlog/decisions/VEGA-046-shutdown-drain.md` §2.2:
+/// readiness observation (7s = probe period 2 × (threshold 2 + 1) + timeout 1)
+/// plus kube-proxy propagation (5s), and at least the TCP idle timeout (10s) so
+/// idle keep-alive connections are closed by their own timeout — cleanly, from
+/// the read side — rather than by the process exiting.
+pub const DEFAULT_SHUTDOWN_DRAIN: Duration = Duration::from_secs(15);
+
+/// Upper bound on the configurable drain.
+///
+/// Beyond five minutes the value is a typo (`1500` for `15`) and it exceeds
+/// every grace period a sane deployment sets, so the only outcome is a
+/// guaranteed `SIGKILL`. Refusing it at startup is cheaper than discovering it
+/// during a rollout.
+pub const MAX_SHUTDOWN_DRAIN: Duration = Duration::from_secs(300);
 
 /// Per-connection outgoing buffer size for TCP, in messages.
 const TCP_RESPONSE_BUFFER: usize = 32;
@@ -112,6 +129,18 @@ pub struct GlobalArgs {
     )]
     pub tcp_timeout_secs: Option<u64>,
 
+    /// Seconds to keep answering DNS after `SIGTERM` while `/readyz` reports 503.
+    ///
+    /// `0` runs the same shutdown sequence with no waiting, which is what CI and
+    /// `cargo run` want. The maximum is 300.
+    #[arg(
+        long,
+        env = "VEGA_SHUTDOWN_DRAIN_SECS",
+        value_name = "SECS",
+        global = true
+    )]
+    pub shutdown_drain_secs: Option<u64>,
+
     /// Disable the diagnostic `hello.` / `counter.` / `myip.` / `version.` sub-zones.
     #[arg(long, env = "VEGA_NO_BUILTINS", global = true)]
     pub no_builtins: bool,
@@ -155,6 +184,10 @@ struct ServerSection {
     tcp: Vec<SocketAddr>,
     admin_listen: Option<SocketAddr>,
     tcp_timeout_secs: Option<u64>,
+    /// Signed, so `-1` is rejected by the range check with a message naming the
+    /// setting, rather than by the deserializer with one that names a type an
+    /// operator never wrote.
+    shutdown_drain_secs: Option<i64>,
     log_format: Option<LogFormat>,
     log_level: Option<String>,
     admin_token: Option<String>,
@@ -260,6 +293,9 @@ pub struct Config {
     pub admin_listen: Option<SocketAddr>,
     /// TCP idle timeout.
     pub tcp_timeout: Duration,
+    /// How long to keep answering DNS after a `SIGTERM`, while `/readyz`
+    /// reports 503 so a load balancer can take us out of rotation first.
+    pub shutdown_drain: Duration,
     /// Per-connection outgoing buffer size for TCP.
     pub tcp_response_buffer: usize,
     /// Zone configuration.
@@ -298,21 +334,140 @@ pub struct RateLimitConfig {
     pub burst: u32,
 }
 
+/// Which step of [`Config::resolve`] failed.
+///
+/// A reload has to tell an operator *which* runbook applies — a missing file is
+/// restored, a syntax error is edited, a rejected value is corrected — and the
+/// three are indistinguishable once the error has been flattened to a string.
+/// Keeping the stage lets [`crate::reload`] name a stable machine-readable code
+/// without pattern-matching on prose.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LoadStage {
+    /// The file could not be read at all: deleted, unreadable, mid-rename.
+    Read,
+    /// The bytes are not valid TOML, or carry a key the schema does not know.
+    Parse,
+    /// Parsed, but rejected by [`Config::merge`]: empty origin, zero TTL, …
+    Validate,
+}
+
+/// A configuration failure, tagged with the stage that produced it.
+#[derive(Debug)]
+pub struct LoadError {
+    /// Where in the pipeline it went wrong.
+    pub stage: LoadStage,
+    /// The underlying error, with its `.context` chain intact.
+    pub error: anyhow::Error,
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The alternate form prints the whole context chain, which is what names
+        // the offending file and value.
+        write!(f, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+/// A resolved configuration together with the file tier it was resolved from.
+///
+/// The reload path needs both: the effective [`Config`] to serve from, and what
+/// the *file alone* asked for, so a key the file changed but the process cannot
+/// apply can be reported instead of silently dropped.
+#[derive(Clone, Debug)]
+pub struct Resolved {
+    /// The effective configuration, after CLI > env > file > default.
+    pub config: Config,
+    /// What the file itself states for the settings a reload cannot apply.
+    pub stated: FileSettings,
+}
+
+/// The values a config *file* states for the settings that are fixed for the
+/// life of the process.
+///
+/// This is deliberately the file tier only, unmerged: "the operator edited this
+/// key and it did not take effect" is a statement about the file, not about the
+/// resolved config — under CLI precedence a shadowed key resolves to the value
+/// it already had, so a resolved-vs-resolved comparison reports nothing at all.
+///
+/// `admin_token` is here to be *compared*, never rendered: no caller may put its
+/// value in a response body or a log line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileSettings {
+    /// `[zone] origin`.
+    pub origin: Option<String>,
+    /// `[server] udp`. Empty means the key is absent.
+    pub udp: Vec<SocketAddr>,
+    /// `[server] tcp`. Empty means the key is absent.
+    pub tcp: Vec<SocketAddr>,
+    /// `[server] admin_listen`.
+    pub admin_listen: Option<SocketAddr>,
+    /// `[server] tcp_timeout_secs`.
+    pub tcp_timeout_secs: Option<u64>,
+    /// `[server] shutdown_drain_secs`, exactly as the file states it — signed,
+    /// because a negative value is rejected by the merge and never reaches a
+    /// comparison.
+    pub shutdown_drain_secs: Option<i64>,
+    /// `[server] log_format`.
+    pub log_format: Option<LogFormat>,
+    /// `[server] log_level`.
+    pub log_level: Option<String>,
+    /// `[server] admin_token`. Compared, never printed.
+    pub admin_token: Option<String>,
+    /// `[server.rate_limit] qps`.
+    pub rate_limit_qps: Option<u32>,
+    /// `[server.rate_limit] burst`.
+    pub rate_limit_burst: Option<u32>,
+}
+
 impl Config {
     /// Build a [`Config`] from parsed CLI arguments, reading the TOML file if one
     /// was given.
     pub fn load(cli: &GlobalArgs) -> Result<Self> {
+        Self::resolve(cli)
+            .map(|resolved| resolved.config)
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`Config::load`], keeping the failing stage and the file tier.
+    ///
+    /// This is the single precedence implementation: startup and reload both come
+    /// through here, so a rule added for one is a rule added for both. VEGA-005
+    /// happened because a second, simplified copy of this resolution existed in
+    /// the reload path.
+    pub fn resolve(cli: &GlobalArgs) -> Result<Resolved, LoadError> {
         let file = match &cli.config {
             Some(path) => Self::read_file(path)?,
             None => FileConfig::default(),
         };
-        Self::merge(cli, file)
+        let stated = FileSettings::from(&file);
+        let config = Self::merge(cli, file).map_err(|error| LoadError {
+            stage: LoadStage::Validate,
+            error,
+        })?;
+        Ok(Resolved { config, stated })
     }
 
-    fn read_file(path: &Path) -> Result<FileConfig> {
+    fn read_file(path: &Path) -> Result<FileConfig, LoadError> {
         let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config file {}", path.display()))?;
-        toml::from_str(&raw).with_context(|| format!("parsing config file {}", path.display()))
+            .with_context(|| format!("reading config file {}", path.display()))
+            .map_err(|error| LoadError {
+                stage: LoadStage::Read,
+                error,
+            })?;
+        toml::from_str(&raw).map_err(|error| LoadError {
+            stage: LoadStage::Parse,
+            // Flattened to a string on purpose, rather than kept as a `source`:
+            // anyhow prints the whole chain for `{:#}` and `{:?}`, so a surviving
+            // `toml::de::Error` anywhere in it re-introduces the snippet at the
+            // first thing that renders this error (VEGA-082).
+            error: anyhow!(
+                "parsing config file {}: {}",
+                path.display(),
+                describe_parse_error(&error, &raw)
+            ),
+        })
     }
 
     fn merge(cli: &GlobalArgs, file: FileConfig) -> Result<Self> {
@@ -361,6 +516,8 @@ impl Config {
                 Ok(Duration::from_secs(secs))
             })?;
 
+        let shutdown_drain = shutdown_drain(cli, file.server.shutdown_drain_secs)?;
+
         let qps = cli.rate_limit_qps.or(file.server.rate_limit.qps);
         let rate_limit = match qps {
             None | Some(0) => None,
@@ -382,6 +539,7 @@ impl Config {
             tcp,
             admin_listen: cli.admin_listen.or(file.server.admin_listen),
             tcp_timeout,
+            shutdown_drain,
             tcp_response_buffer: TCP_RESPONSE_BUFFER,
             zone: ZoneConfig {
                 origin,
@@ -446,12 +604,136 @@ struct FileConfig {
     zone: ZoneSection,
 }
 
+impl From<&FileConfig> for FileSettings {
+    fn from(file: &FileConfig) -> Self {
+        // Destructured exhaustively, every table of it, with the reloadable keys
+        // bound to `_`: adding a key to the file schema is a compile error here
+        // until someone decides whether a reload may apply it. Without this, a new
+        // `[server]` key would parse, merge, and then silently never appear in a
+        // reload's `ignored` — the same silence VEGA-005 is about, in a new key.
+        // `crate::reload::Running::apply_reloadable` forces the same question for
+        // the other half of the partition.
+        let FileConfig { server, zone } = file;
+        let ServerSection {
+            udp,
+            tcp,
+            admin_listen,
+            tcp_timeout_secs,
+            shutdown_drain_secs,
+            log_format,
+            log_level,
+            admin_token,
+            rate_limit,
+        } = server;
+        let RateLimitSection { qps, burst } = rate_limit;
+        let ZoneSection {
+            origin,
+            // Reloadable: applied on every reload, so never reported as ignored.
+            default_ttl: _,
+            builtins: _,
+            soa: _,
+            records: _,
+        } = zone;
+
+        Self {
+            origin: origin.clone(),
+            udp: udp.clone(),
+            tcp: tcp.clone(),
+            admin_listen: *admin_listen,
+            tcp_timeout_secs: *tcp_timeout_secs,
+            shutdown_drain_secs: *shutdown_drain_secs,
+            log_format: *log_format,
+            log_level: log_level.clone(),
+            admin_token: admin_token.clone(),
+            rate_limit_qps: *qps,
+            rate_limit_burst: *burst,
+        }
+    }
+}
+
 fn pick_addrs(cli: &[SocketAddr], file: &[SocketAddr]) -> Vec<SocketAddr> {
     if cli.is_empty() {
         file.to_vec()
     } else {
         cli.to_vec()
     }
+}
+
+/// Resolve and validate the shutdown drain window.
+///
+/// CLI (and its `VEGA_SHUTDOWN_DRAIN_SECS` env form) beats the file beats the
+/// default, like everything else here. Out of range is a hard error at startup
+/// rather than a clamp: a window longer than any grace period an operator can
+/// set guarantees a `SIGKILL` mid-drain, and finding that during a rollout costs
+/// far more than failing to start.
+fn shutdown_drain(cli: &GlobalArgs, file: Option<i64>) -> Result<Duration> {
+    let max = MAX_SHUTDOWN_DRAIN.as_secs();
+    let refuse = |value: &dyn fmt::Display| {
+        anyhow::anyhow!("shutdown_drain_secs must be between 0 and {max} seconds, got {value}")
+    };
+
+    if let Some(secs) = cli.shutdown_drain_secs {
+        if secs > max {
+            return Err(refuse(&secs));
+        }
+        return Ok(Duration::from_secs(secs));
+    }
+
+    let Some(secs) = file else {
+        return Ok(DEFAULT_SHUTDOWN_DRAIN);
+    };
+    // Signed on the way in so a negative is refused by name here, not by the
+    // deserializer talking about `u64`.
+    match u64::try_from(secs).ok().filter(|secs| *secs <= max) {
+        Some(secs) => Ok(Duration::from_secs(secs)),
+        None => Err(refuse(&secs)),
+    }
+}
+
+/// Render a TOML parse failure for an operator without quoting the file back.
+///
+/// `toml`'s own `Display` prints the offending source line under the position,
+/// with a caret beneath it. That is a good error message for a compiler and a
+/// disclosure for a name server: the line that fails to parse is very often
+/// `admin_token = "…`, and this string reaches a `/reload` response body and a
+/// WARN log that ships to whatever aggregates container stdout (VEGA-082). So
+/// the position and the parser's own description are kept — they are what makes
+/// the message actionable — and the source snippet is dropped.
+///
+/// The two ingredients are safe by construction, not by inspection: the position
+/// is a pair of integers, and `Error::message()` is the parser's description of
+/// what it expected, assembled from grammar literals rather than from input.
+fn describe_parse_error(error: &toml::de::Error, raw: &str) -> String {
+    let Some(span) = error.span() else {
+        return error.message().to_owned();
+    };
+    let (line, column) = position(raw, span.start);
+    format!(
+        "TOML parse error at line {line}, column {column}: {}",
+        error.message()
+    )
+}
+
+/// A byte offset into `raw` as the one-based line and column `toml` would report.
+///
+/// Same arithmetic as `toml`'s own `translate_position`, so the numbers an
+/// operator sees do not move: columns count characters, not bytes.
+fn position(raw: &str, offset: usize) -> (usize, usize) {
+    // The span comes from a parser reading this very string, so it is already a
+    // character boundary and in range. Clamped and floored anyway, because
+    // `/reload` reaches this from the network and `panic = "abort"` turns one
+    // slice panic into a full outage. Both loops below are bounded: the floor
+    // steps back at most three bytes (UTF-8's longest encoding) since offset 0 is
+    // always a boundary.
+    let mut offset = offset.min(raw.len());
+    while offset > 0 && !raw.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let head = &raw[..offset];
+    let line_start = head.rfind('\n').map_or(0, |newline| newline + 1);
+    let line = head[..line_start].matches('\n').count() + 1;
+    let column = head[line_start..].chars().count() + 1;
+    (line, column)
 }
 
 fn reject_duplicates(what: &str, addrs: &[SocketAddr]) -> Result<()> {
@@ -678,6 +960,365 @@ mod tests {
         assert!(text.contains("127.0.0.1:5300, 127.0.0.1:5301"), "{text}");
         assert!(text.contains("25 qps / burst 50"), "{text}");
         assert!(text.contains("default ttl     : 300s"), "{text}");
+    }
+
+    // -----------------------------------------------------------------------
+    // VEGA-046. The drain window, on all three configuration surfaces.
+    // Scenarios in features/shutdown.feature.
+    // -----------------------------------------------------------------------
+
+    /// Scenario: Startup states the drain, the hard deadline and the grace-period floor
+    /// features/shutdown.feature:141
+    #[test]
+    fn the_drain_window_defaults_to_fifteen_seconds() {
+        // The shipped default is derived, not chosen: §2.2 of the ruling. A
+        // change here moves the deadline, the watchdog and the grace period an
+        // operator has to configure, so it is pinned by value.
+        let cfg = Config::merge(&cli(&[]), FileConfig::default()).unwrap();
+        assert_eq!(cfg.shutdown_drain, DEFAULT_SHUTDOWN_DRAIN);
+        assert_eq!(cfg.shutdown_drain, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn the_drain_window_comes_from_the_file_unless_the_command_line_states_one() {
+        let file: FileConfig = toml::from_str("[server]\nshutdown_drain_secs = 42\n").unwrap();
+        let cfg = Config::merge(&cli(&[]), file.clone()).unwrap();
+        assert_eq!(cfg.shutdown_drain, Duration::from_secs(42));
+
+        // The env form is clap's, so it lands in the same field as the flag.
+        let cfg = Config::merge(&cli(&["--shutdown-drain-secs", "7"]), file).unwrap();
+        assert_eq!(cfg.shutdown_drain, Duration::from_secs(7));
+    }
+
+    /// Scenario: A zero-length drain still passes through every phase in order
+    /// features/shutdown.feature:82
+    #[test]
+    fn a_zero_drain_window_is_legal() {
+        // 0 is the right value for CI and `cargo run`; it must not be confused
+        // with "unset", which resolves to 15.
+        let file: FileConfig = toml::from_str("[server]\nshutdown_drain_secs = 0\n").unwrap();
+        assert_eq!(
+            Config::merge(&cli(&[]), file).unwrap().shutdown_drain,
+            Duration::ZERO
+        );
+    }
+
+    /// Scenario: A drain window above the 300 second maximum is refused at startup
+    /// features/shutdown.feature:100
+    #[test]
+    fn a_drain_window_above_the_maximum_is_refused_naming_the_setting_and_the_limit() {
+        let file: FileConfig = toml::from_str("[server]\nshutdown_drain_secs = 301\n").unwrap();
+        let error = Config::merge(&cli(&[]), file).unwrap_err().to_string();
+        assert!(error.contains("shutdown_drain_secs"), "{error}");
+        assert!(
+            error.contains("300"),
+            "the limit has to be in the message: {error}"
+        );
+        assert!(
+            error.contains("301"),
+            "and so does the offending value: {error}"
+        );
+
+        // The same limit on the command line, so one surface cannot be laxer.
+        let error = Config::merge(
+            &cli(&["--shutdown-drain-secs", "301"]),
+            FileConfig::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("shutdown_drain_secs"), "{error}");
+        assert!(error.contains("300"), "{error}");
+    }
+
+    /// Scenario: The 300 second maximum is itself accepted
+    /// features/shutdown.feature:109
+    #[test]
+    fn the_maximum_drain_window_is_inclusive() {
+        // Kills `secs <= max` -> `secs < max`, which would refuse a legal config.
+        let file: FileConfig = toml::from_str("[server]\nshutdown_drain_secs = 300\n").unwrap();
+        assert_eq!(
+            Config::merge(&cli(&[]), file).unwrap().shutdown_drain,
+            MAX_SHUTDOWN_DRAIN
+        );
+    }
+
+    /// Scenario: A negative drain window is refused at startup
+    /// features/shutdown.feature:116
+    #[test]
+    fn a_negative_drain_window_is_refused_by_name_rather_than_by_type() {
+        // The field is signed precisely so this message names the setting an
+        // operator wrote, instead of the deserializer complaining about u64.
+        let file: FileConfig = toml::from_str("[server]\nshutdown_drain_secs = -1\n")
+            .expect("a negative integer parses; it is the range check that rejects it");
+        let error = Config::merge(&cli(&[]), file).unwrap_err().to_string();
+        assert!(error.contains("shutdown_drain_secs"), "{error}");
+        assert!(error.contains("-1"), "{error}");
+    }
+
+    // -----------------------------------------------------------------------
+    // VEGA-005. Stage-tagged loading and the file tier the reload path reports
+    // shadowed keys from. Scenarios in features/config-precedence.feature.
+    // -----------------------------------------------------------------------
+
+    /// A file that is not there fails at the read stage, naming the path.
+    #[test]
+    fn a_missing_config_file_fails_at_the_read_stage() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("nope.toml");
+        let failure = Config::resolve(&GlobalArgs {
+            config: Some(missing.clone()),
+            ..cli(&[])
+        })
+        .expect_err("a missing file cannot resolve");
+
+        assert_eq!(failure.stage, LoadStage::Read);
+        assert!(
+            failure.to_string().contains(&missing.display().to_string()),
+            "an operator at 3am needs the path: {failure}"
+        );
+    }
+
+    #[test]
+    fn unparseable_toml_fails_at_the_parse_stage() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("vega.toml");
+        std::fs::write(&path, "[zone\norigin = ").expect("file writes");
+
+        let failure = Config::resolve(&GlobalArgs {
+            config: Some(path),
+            ..cli(&[])
+        })
+        .expect_err("broken TOML cannot resolve");
+        assert_eq!(failure.stage, LoadStage::Parse);
+    }
+
+    #[test]
+    fn a_value_the_merge_rejects_fails_at_the_validate_stage() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("vega.toml");
+        std::fs::write(&path, "[zone]\ndefault_ttl = 0\n").expect("file writes");
+
+        let failure = Config::resolve(&GlobalArgs {
+            config: Some(path),
+            ..cli(&[])
+        })
+        .expect_err("a zero TTL cannot resolve");
+        assert_eq!(failure.stage, LoadStage::Validate);
+        assert!(failure.to_string().contains("default_ttl"), "{failure}");
+    }
+
+    #[test]
+    fn the_file_tier_is_kept_even_where_the_command_line_shadows_it() {
+        // The point of `stated`: after the merge, `origin` is the CLI's value and
+        // the file's is gone. A reload has to report the file's key as shadowed,
+        // so the unmerged value has to survive the merge.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("vega.toml");
+        std::fs::write(
+            &path,
+            "[server]\nudp = [\"127.0.0.1:5399\"]\nadmin_token = \"from-the-file\"\n\
+             rate_limit = { qps = 1000, burst = 2000 }\n\
+             [zone]\norigin = \"from-the-file.test\"\n",
+        )
+        .expect("file writes");
+
+        let resolved = Config::resolve(&GlobalArgs {
+            config: Some(path),
+            ..cli(&["--domain", "from-the-cli.test", "--udp", "127.0.0.1:5300"])
+        })
+        .expect("the config resolves");
+
+        assert_eq!(resolved.config.zone.origin, "from-the-cli.test");
+        assert_eq!(
+            resolved.stated.origin.as_deref(),
+            Some("from-the-file.test")
+        );
+        assert_eq!(
+            resolved.stated.udp,
+            vec!["127.0.0.1:5399".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            resolved.stated.admin_token.as_deref(),
+            Some("from-the-file")
+        );
+        assert_eq!(resolved.stated.rate_limit_qps, Some(1000));
+        assert_eq!(resolved.stated.rate_limit_burst, Some(2000));
+    }
+
+    #[test]
+    fn a_file_that_states_nothing_yields_an_empty_file_tier() {
+        // The empty-input case: no keys stated means nothing can be shadowed, so
+        // a reload of an unchanged minimal file reports no drift at all.
+        let resolved = Config::resolve(&cli(&[])).expect("defaults resolve");
+        assert_eq!(resolved.stated, FileSettings::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // VEGA-082. A config failure is rendered for an operator, never by quoting
+    // the file back: the offending line is the secret when the key is
+    // `server.admin_token`. All three stages, because all three reach a
+    // `/reload` response body and a WARN log line.
+    // -----------------------------------------------------------------------
+
+    /// The secret used by every leak test below. Distinctive enough that a
+    /// substring search cannot match anything the renderer legitimately emits.
+    const SECRET: &str = "SUPER-SECRET-TOKEN-1";
+
+    /// Resolve `toml` from a real file and return the failure.
+    fn resolve_failure(bytes: &[u8]) -> LoadError {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("vega.toml");
+        std::fs::write(&path, bytes).expect("file writes");
+        Config::resolve(&GlobalArgs {
+            config: Some(path),
+            ..cli(&[])
+        })
+        .expect_err("this config cannot resolve")
+    }
+
+    /// A parse failure keeps its position and its message — the positive
+    /// control for the redaction below. Without this, "redact everything"
+    /// passes and the operator is left with an error they cannot act on.
+    #[test]
+    fn a_parse_failure_still_names_the_line_the_column_and_what_was_expected() {
+        // `log_level = "oops` is 17 characters, so the unterminated string is
+        // reported at line 2, column 18 — the position an editor's gutter shows.
+        let failure = resolve_failure(b"[server]\nlog_level = \"oops\n");
+        assert_eq!(failure.stage, LoadStage::Parse);
+        let rendered = failure.to_string();
+        for needle in ["line 2", "column 18", "invalid basic string"] {
+            assert!(
+                rendered.contains(needle),
+                "a redacted parse error still has to be actionable; {needle:?} is missing \
+                 from: {rendered}"
+            );
+        }
+    }
+
+    /// Scenario: A startup failure does not echo the admin_token line
+    /// features/config-precedence.feature:462
+    #[test]
+    fn a_parse_failure_on_the_admin_token_line_does_not_echo_the_token() {
+        let toml = format!("[server]\nadmin_token = \"{SECRET}\nudp = [\"127.0.0.1:5300\"]\n");
+        let failure = resolve_failure(toml.as_bytes());
+
+        assert_eq!(failure.stage, LoadStage::Parse);
+        // The exact position `toml` itself reported for this input before the
+        // redaction: proof that reimplementing the offset-to-position arithmetic
+        // did not move the numbers an operator reads.
+        assert!(
+            failure.to_string().contains("line 2, column 36"),
+            "{failure}"
+        );
+        assert!(
+            !failure.to_string().contains(SECRET),
+            "toml's own Display quotes the offending source line, so an unterminated \
+             string on the admin_token line puts the secret into the /reload body and \
+             the WARN log: {failure}"
+        );
+        assert!(
+            !format!("{:?}", failure.error).contains(SECRET),
+            "the Debug form must not carry it either: a `source` chain holding the raw \
+             toml error leaks through anyhow's `{{:?}}`"
+        );
+    }
+
+    /// Scenario: A duplicated admin_token key does not echo either value
+    /// features/live-reload.feature:354
+    #[test]
+    fn a_duplicate_admin_token_key_does_not_echo_either_value() {
+        let toml = format!("[server]\nadmin_token = \"{SECRET}\"\nadmin_token = \"{SECRET}\"\n");
+        let failure = resolve_failure(toml.as_bytes());
+
+        assert_eq!(failure.stage, LoadStage::Parse);
+        let rendered = failure.to_string();
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(
+            rendered.contains("duplicate key"),
+            "the operator still has to be told what is wrong: {rendered}"
+        );
+    }
+
+    /// Every shape of parse failure we could reach with the secret on the
+    /// `admin_token` line, not only the two the audit reproduced.
+    ///
+    /// The claim being defended is stronger than "those two inputs are fixed":
+    /// nothing the parser or serde says about `server.admin_token` can contain
+    /// its value. It holds because the field is a `String` — every TOML string
+    /// deserializes into it, so the only failures reachable on that key are
+    /// positional ones, and the position is a pair of integers. What serde does
+    /// still quote is *key names*, *unknown enum variants* and *values of the
+    /// wrong type for a typed field*; none of the three can be reached by a
+    /// well-formed token sitting where a token belongs.
+    #[test]
+    fn no_parse_failure_shape_echoes_the_value_of_admin_token() {
+        let shapes = [
+            format!("[server]\nadmin_token = \"{SECRET}\n"),
+            format!("[server]\nadmin_token = '{SECRET}\n"),
+            format!("[server]\nadmin_token = \"{SECRET}\" trailing\n"),
+            format!("[server]\nadmin_token = {{ inner = \"{SECRET}\" }}\n"),
+            format!("[server\nadmin_token = \"{SECRET}\"\n"),
+            format!("[server]\nadmin_token = \"{SECRET}\"\n[[zone.records]\n"),
+            format!("[server]\nadmin_token = \"{SECRET}\"\nadmin_token = \"other\"\n"),
+            format!("[server]\nadmin_token = \"{SECRET}\"\nudp = \"not-a-list\"\n"),
+        ];
+
+        for toml in shapes {
+            let failure = resolve_failure(toml.as_bytes());
+            assert_eq!(failure.stage, LoadStage::Parse, "{toml:?}");
+            assert!(
+                !failure.to_string().contains(SECRET),
+                "{toml:?} leaked the token: {failure}"
+            );
+            assert!(
+                failure.to_string().contains("TOML parse error at line"),
+                "{toml:?} lost the position: {failure}"
+            );
+        }
+    }
+
+    /// The read stage reads the file whole before decoding it, so a file that is
+    /// not UTF-8 fails *after* the bytes are in hand. The io error must describe
+    /// the decode, not the content.
+    #[test]
+    fn a_read_failure_on_undecodable_bytes_does_not_echo_them() {
+        let mut bytes = format!("[server]\nadmin_token = \"{SECRET}\"\n").into_bytes();
+        bytes.push(0xff);
+        let failure = resolve_failure(&bytes);
+
+        assert_eq!(failure.stage, LoadStage::Read);
+        assert!(!failure.to_string().contains(SECRET), "{failure}");
+    }
+
+    /// The validate stage never sees the file's bytes — only parsed values — and
+    /// `merge` copies `admin_token` without ever formatting it. Asserted rather
+    /// than assumed: a future `bail!` that quotes a rejected value would land
+    /// here.
+    #[test]
+    fn a_validate_failure_does_not_echo_the_admin_token_beside_it() {
+        let toml = format!("[server]\nadmin_token = \"{SECRET}\"\n[zone]\ndefault_ttl = 0\n");
+        let failure = resolve_failure(toml.as_bytes());
+
+        assert_eq!(failure.stage, LoadStage::Validate);
+        assert!(!failure.to_string().contains(SECRET), "{failure}");
+        assert!(failure.to_string().contains("default_ttl"), "{failure}");
+    }
+
+    /// The position we report is the position `toml` would have reported: an
+    /// operator comparing our message with their editor's gutter must not find
+    /// an off-by-one.
+    #[test]
+    fn a_byte_offset_becomes_the_same_one_based_line_and_column_toml_uses() {
+        let raw = "a\nbcd\nz";
+        assert_eq!(position(raw, 0), (1, 1));
+        assert_eq!(position(raw, 2), (2, 1));
+        assert_eq!(position(raw, 4), (2, 3));
+        assert_eq!(position(raw, 6), (3, 1));
+        // Past the end (the parser reports EOF this way) and inside a multi-byte
+        // character: neither may panic, because /reload reaches this from the
+        // network and `panic = "abort"` makes one panic an outage.
+        assert_eq!(position(raw, 99), (3, 2));
+        assert_eq!(position("héllo", 2), (1, 2));
     }
 
     #[test]

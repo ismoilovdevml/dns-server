@@ -195,6 +195,27 @@ Feature: Negative answers and out-of-zone refusal
     When a message with opcode NOTIFY arrives
     Then the response rcode is NOTIMP
 
+  @hostile @enforced src/handler.rs:1147
+  Scenario: The MAILB meta QTYPE is answered NOTIMP, not with the owner's CNAME
+    # RFC 1035 3.2.3 defines MAILB (253) as a QTYPE only, and RFC 973 withdrew
+    # the service behind it. hickory has no variant for it, so it arrives as
+    # Unknown(253), missed the meta-type arms, and fell into the RFC 1034 3.6.2
+    # CNAME substitution rule — which answered NOERROR with a CNAME for a
+    # transaction type that names no data at all.
+    Given the zone contains record set "alias" of type "CNAME" with values "origin.example.com."
+    When a query for "alias.example.com." with QTYPE 253 arrives
+    Then the response rcode is NOTIMP
+    And the answer section is empty
+
+  @hostile @enforced src/handler.rs:1147
+  Scenario: The MAILA meta QTYPE is answered NOTIMP, not with the owner's CNAME
+    # RFC 1035 3.2.3, QTYPE 254. Same reasoning as MAILB; note the numbering is
+    # not alphabetical, MAILB is 253 and MAILA is 254.
+    Given the zone contains record set "alias" of type "CNAME" with values "origin.example.com."
+    When a query for "alias.example.com." with QTYPE 254 arrives
+    Then the response rcode is NOTIMP
+    And the answer section is empty
+
   @hostile @gap
   Scenario: A truncated or undecodable datagram does not crash the listener
     # Decoding happens inside Hickory before our handler runs. Nothing asserts

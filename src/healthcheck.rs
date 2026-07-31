@@ -41,14 +41,14 @@ mod tests {
         let state = AdminState::new(Arc::new(Metrics::new()));
         let token = CancellationToken::new();
 
-        // Bind first so the test knows the port before the server task starts.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Bind before spawning, exactly as `serve` does: the test then knows the
+        // port, and a bind failure is a test failure rather than a hang.
+        let listener = admin::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
 
         let serve_token = token.clone();
         tokio::spawn(async move {
-            let _ = admin::serve(addr, state, serve_token).await;
+            let _ = admin::serve(listener, state, serve_token).await;
         });
 
         // Wait for the listener to come up; the probe itself retries nothing.

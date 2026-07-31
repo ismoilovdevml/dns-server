@@ -151,7 +151,11 @@ jobs:
           test "$answer" = "203.0.113.10"
 
           echo "--- graceful shutdown ---"
-          docker stop -t 15 smoke
+          # Must exceed the drain (15s) plus the 5s stop budget and 2s watchdog,
+          # or docker SIGKILLs the process and we then assert on a log line the
+          # kill prevented. deploy/check-shutdown-invariants.sh pins this to the
+          # same number as stop_grace_period and terminationGracePeriodSeconds.
+          time docker stop -t 30 smoke
           docker logs smoke 2>&1 | tail -20
           docker logs smoke 2>&1 | grep -q "shutdown complete"
 

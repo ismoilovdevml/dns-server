@@ -12,8 +12,10 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use hickory_proto::rr::{RData, RecordType};
+use hickory_proto::rr::RecordType;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
+
+use crate::rdata::{self, ValueError};
 
 /// One record set as it appears in the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,7 +178,7 @@ impl ConfigEditor {
             bail!("no values given");
         }
         for value in values {
-            validate_value(record_type, value)?;
+            validate_value(record_type, &name, value)?;
         }
 
         let tables = self.records_mut()?;
@@ -406,10 +408,22 @@ fn normalise_type(record_type: &str) -> Result<RecordType> {
 }
 
 /// Reject bad values here rather than letting the server fail to start later.
-fn validate_value(record_type: RecordType, value: &str) -> Result<()> {
-    RData::try_from_str(record_type, value)
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("invalid {record_type} value {value:?}: {e}"))
+///
+/// Goes through [`crate::rdata::parse_value`] rather than calling the parser
+/// directly: the length bound that keeps hickory's lexer from aborting the
+/// process lives there, and this path is `vega record add`, i.e. an argument
+/// straight off an operator's command line.
+fn validate_value(record_type: RecordType, owner: &str, value: &str) -> Result<()> {
+    match rdata::parse_value(record_type, owner, value) {
+        Ok(_) => Ok(()),
+        // Reworded rather than passed through: the operator is looking at the
+        // value they just typed, not at a file, so the parser's own message
+        // needs the value attached to be worth anything.
+        Err(ValueError::Unparsable(e)) => Err(anyhow::anyhow!(
+            "invalid {record_type} value {value:?}: {e}"
+        )),
+        Err(too_long @ ValueError::TooLong { .. }) => Err(anyhow::Error::new(too_long)),
+    }
 }
 
 fn matches(table: &Table, name: &str, record_type: &str) -> bool {
@@ -607,6 +621,74 @@ values = ["203.0.113.10"]
             .add("bad", "A", &vals(&["not-an-ip"]), None, false)
             .unwrap_err();
         assert!(error.to_string().contains("invalid A value"), "{error}");
+        assert_eq!(editor.records().len(), 1, "nothing should have been added");
+    }
+
+    /// A TXT value of exactly `n` characters, quotes included — quoted because
+    /// that is what an operator types and what the parser expects, and the
+    /// quotes count towards the length the lexer walks.
+    fn txt_of(n: usize) -> String {
+        format!("\"{}\"", "a".repeat(n - 2))
+    }
+
+    /// Scenario: A record value of exactly the maximum length is accepted
+    /// features/cli-record-editing.feature
+    ///
+    /// The bound is inclusive. Without this, `chars > MAX` could be tightened to
+    /// `>=` — or the constant dropped to something arbitrarily small — and the
+    /// rejection test alone would not notice.
+    #[test]
+    fn a_record_value_at_the_length_limit_is_accepted() {
+        let (_dir, mut editor) = editor(BASE);
+        let value = txt_of(rdata::MAX_VALUE_CHARS);
+        assert_eq!(value.chars().count(), rdata::MAX_VALUE_CHARS);
+
+        let change = editor
+            .add("big", "TXT", &vals(&[&value]), None, false)
+            .expect("a value at the limit must be accepted");
+        assert_eq!(change, Change::Created);
+    }
+
+    /// Scenario: A record value one character over the maximum is rejected
+    /// features/cli-record-editing.feature
+    ///
+    /// One character over the limit, so an off-by-one in the guard fails here.
+    /// Before the fix this did not fail — it aborted the process inside
+    /// hickory's lexer, which under `panic = "abort"` is exit 134 for anyone
+    /// scripting `vega record add`.
+    #[test]
+    fn a_record_value_one_character_over_the_limit_is_rejected_not_aborted() {
+        let (_dir, mut editor) = editor(BASE);
+        let value = txt_of(rdata::MAX_VALUE_CHARS + 1);
+
+        let error = editor
+            .add("big", "TXT", &vals(&[&value]), None, false)
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("is {} characters", rdata::MAX_VALUE_CHARS + 1)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("the maximum is {}", rdata::MAX_VALUE_CHARS)),
+            "{message}"
+        );
+        assert_eq!(editor.records().len(), 1, "nothing should have been added");
+    }
+
+    /// A long value in the *second* position must be caught too: `add` loops,
+    /// and a guard applied only to the first value would leave the rest to the
+    /// lexer. The first value is valid so the loop has to reach the second.
+    #[test]
+    fn every_value_in_the_list_is_length_checked_not_just_the_first() {
+        let (_dir, mut editor) = editor(BASE);
+        let good = txt_of(16);
+        let bad = txt_of(rdata::MAX_VALUE_CHARS + 1);
+
+        let error = editor
+            .add("big", "TXT", &vals(&[&good, &bad]), None, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("the maximum is"), "{error}");
         assert_eq!(editor.records().len(), 1, "nothing should have been added");
     }
 

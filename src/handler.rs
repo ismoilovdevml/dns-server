@@ -48,6 +48,22 @@ const MAX_EDNS_PAYLOAD: u16 = 1232;
 /// enforce the limit ourselves rather than inheriting that default.
 const MAX_UDP_NO_EDNS: usize = 512;
 
+/// QTYPE 253, "a request for mailbox-related records (MB, MG or MR)".
+///
+/// RFC 1035 §3.2.3 defines it as a QTYPE, never a TYPE; RFC 973 withdrew the
+/// service behind it. Spelled as a number because hickory has no variant for it
+/// — `RecordType::from(u16)` ends `_ => Self::Unknown(value)`, so this is
+/// exactly how it arrives off the wire, and matching a named variant here would
+/// silently never fire.
+const MAILB_QTYPE: RecordType = RecordType::Unknown(253);
+
+/// QTYPE 254, "a request for mail agent RRs (Obsolete - see MX)".
+///
+/// RFC 1035 §3.2.3, and see [`MAILB_QTYPE`] for why it is a raw number. Note the
+/// ordering is the one the RFC gives and not alphabetical: MAILB is 253 and
+/// MAILA is 254.
+const MAILA_QTYPE: RecordType = RecordType::Unknown(254);
+
 /// DNS header, fixed size. RFC 1035 §4.1.1.
 const HEADER_SIZE: usize = 12;
 
@@ -228,12 +244,24 @@ impl DnsHandler {
         // RRset in the zone to assemble it — the most expensive. An attacker got
         // to pick both with a 29-byte packet.
         if qtype.is_any() {
-            if !zone.has_name(name) {
+            // The same existence determination every other QTYPE gets, because
+            // RFC 8482 §4.1/§4.2 change the *answer section* and license no
+            // change to the rcode. This gate used to ask whether the name was an
+            // owner name in the zone, which is false for every name a wildcard
+            // covers, so ANY denied names that AAAA — and A — answered
+            // (VEGA-083).
+            if !zone.exists(name) {
                 return Resolved::negative(ResponseCode::NXDomain, zone.soa());
             }
             // RFC 8482 §4.2 permits synthesis only when there is no CNAME at the
             // owner name, and §4.1 names the CNAME as the RRset worth returning.
             // Anything using ANY to discover an alias must still find it.
+            //
+            // The order matters and is why the gate above had to widen rather
+            // than move: this probe goes through `Zone::lookup` and so is
+            // wildcard-aware, while the gate was not, so a name covered by a
+            // wildcard CNAME was denied before ever reaching the CNAME it owed
+            // (RFC 4592 §3.4.3 with RFC 8482 §4.2).
             if let Answer::Records(cnames) = zone.lookup(name, RecordType::CNAME) {
                 if !cnames.is_empty() {
                     return Resolved::found(cnames);
@@ -378,6 +406,16 @@ impl DnsHandler {
             // value on decode, so matching `Unknown(0)` here would never fire.
             RecordType::OPT | RecordType::TSIG | RecordType::ZERO => {
                 return Some(Resolved::error(ResponseCode::FormErr));
+            }
+            // MAILB and MAILA are QTYPE-only (RFC 1035 §3.2.3) and the service
+            // they asked about was withdrawn by RFC 973, so there is no type to
+            // look up and never will be: NOTIMP, not REFUSED, which would claim
+            // the zone is someone else's. They reach us as `Unknown` rather than
+            // as variants — see MAILB_QTYPE — which is how they escaped the
+            // first pass at this and kept answering with the owner's CNAME.
+            MAILB_QTYPE | MAILA_QTYPE => {
+                debug!(qtype = %query.query_type(), "obsolete mail meta query");
+                return Some(Resolved::error(ResponseCode::NotImp));
             }
             _ => {}
         }
@@ -742,7 +780,8 @@ mod tests {
         }
     }
 
-    /// Scenario: An ANY query at a CNAME owner returns the CNAME
+    /// Scenario: An ANY query does not chase a CNAME
+    /// features/zone-lookup.feature:194
     /// features/cname.feature — RFC 8482 §4.2
     ///
     /// Synthesis is only permitted when there is no CNAME at the owner name.
@@ -936,12 +975,14 @@ mod tests {
         assert_eq!(r.answers[0].record_type(), RecordType::SOA);
     }
 
-    /// Scenario: An ANY query is answered with a single synthetic HINFO
-    /// features/zone-lookup.feature:174
+    /// Scenario: An ANY query at the apex returns the HINFO and not the zone SOA
+    /// features/zone-lookup.feature:169
     ///
     /// RFC 8482 §4.1. This used to return the whole node — every RRset at the
     /// name plus the SOA — which made ANY the largest answer we could produce
-    /// from the smallest query anyone could send.
+    /// from the smallest query anyone could send. Nothing in RFC 8482 licenses
+    /// adding the SOA to the *answer* section; RFC 1034 §4.3.2 puts it in
+    /// *authority*, and only on a negative answer.
     #[test]
     fn an_apex_any_query_is_answered_with_one_synthetic_hinfo() {
         let h = handler(
@@ -966,11 +1007,13 @@ mod tests {
         assert!(!types.contains(&RecordType::SOA), "{types:?}");
     }
 
-    /// Scenario: An ANY query for a name that does not exist is NXDOMAIN
-    /// features/zone-lookup.feature:174
+    /// Scenario: A name with no source of synthesis is still NXDOMAIN
+    /// features/zone-lookup.feature:268
     ///
     /// Kills a mutant that answers every ANY query with the HINFO regardless of
     /// whether the name exists, which would make the zone claim every name in it.
+    /// Also the negative control for VEGA-083: the existence gate got *wider*
+    /// there, and this is the half that must not move.
     #[test]
     fn an_any_query_for_a_missing_name_is_nxdomain() {
         let h = handler(vec![spec("www", "A", &["203.0.113.10"])], false);
@@ -1085,11 +1128,24 @@ mod tests {
         // Guards the `Answer::Records(records) if records.is_empty()` arm: a
         // NOERROR with an empty answer section must always be cacheable, which
         // means it must always carry the zone SOA.
-        let h = handler(vec![spec("www", "A", &["203.0.113.20"])], true);
+        //
+        // The wildcard-covered rows are VEGA-083's: RFC 2308 §3 requires the SOA
+        // on a NODATA answer exactly as it does on a name error, so turning
+        // those answers from NXDOMAIN into NODATA must not drop it. An
+        // uncacheable NODATA is a different bug, not a fix.
+        let h = handler(
+            vec![
+                spec("www", "A", &["203.0.113.20"]),
+                spec("*.dev", "A", &["203.0.113.50"]),
+            ],
+            true,
+        );
         for (name, qtype) in [
             ("www.example.com.", RecordType::AAAA),
             ("www.example.com.", RecordType::MX),
             ("example.com.", RecordType::TXT),
+            ("x.dev.example.com.", RecordType::AAAA),
+            ("x.dev.example.com.", RecordType::SRV),
             ("myip.example.com.", RecordType::AAAA),
             ("version.example.com.", RecordType::A),
             ("hello.example.com.", RecordType::MX),
@@ -1105,5 +1161,734 @@ mod tests {
                 assert_eq!(r.authority[0].record_type(), RecordType::SOA);
             }
         }
+    }
+
+    /// Scenario: The MAILB meta QTYPE is answered NOTIMP, not with the owner's CNAME
+    /// Scenario: The MAILA meta QTYPE is answered NOTIMP, not with the owner's CNAME
+    /// features/negative-answers.feature — the same clause
+    /// `tests/rfc_conformance.rs::meta_query_types_are_not_answered_as_ordinary_types`
+    /// covers on the wire, pinned here to the *exact* rcode.
+    ///
+    /// The wire test accepts any of FORMERR/NOTIMP/REFUSED, so it cannot tell a
+    /// deliberate NOTIMP from a lucky REFUSED. MAILA and MAILB were withdrawn by
+    /// RFC 973 and RFC 1035 §3.2.3 lists them as QTYPEs only — they name a
+    /// transaction we do not implement rather than a zone we decline to serve,
+    /// so NOTIMP is the answer and REFUSED is not.
+    #[test]
+    fn mailb_and_maila_qtypes_are_notimp_rather_than_the_owner_cname() {
+        let h = handler(
+            vec![
+                spec("alias", "CNAME", &["origin.example.com."]),
+                spec("origin", "A", &["203.0.113.20"]),
+            ],
+            false,
+        );
+
+        for (qtype, name) in [(MAILB_QTYPE, "MAILB"), (MAILA_QTYPE, "MAILA")] {
+            let resolved = h
+                .dispatch(&query_request("alias.example.com.", qtype), client())
+                .unwrap_or_else(|| panic!("{name} should be answered, not dropped"));
+            assert_eq!(
+                resolved.code,
+                ResponseCode::NotImp,
+                "{name} (qtype {}) got rcode {:?}",
+                u16::from(qtype),
+                resolved.code
+            );
+            assert!(
+                resolved.answers.is_empty(),
+                "{name} (qtype {}) was answered with {} records",
+                u16::from(qtype),
+                resolved.answers.len()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // VEGA-083 — the rcode at a wildcard-covered name.
+    //
+    // Spec: features/zone-lookup.feature, sections "ANY QUERY" and
+    //       "WILDCARD-COVERED NAMES".
+    // Ruling: .claude/backlog/decisions/VEGA-083-any-at-a-wildcard-covered-name.md
+    //
+    // The handler owns the rcode, so this is where the law lands: RFC 1034
+    // §4.3.2 step 3(c) sets the name error only when the `*` node does not
+    // exist, and that branch is not conditioned on QTYPE anywhere. RFC 8482
+    // §4.1/§4.2 change the *answer section* for ANY and license no rcode change,
+    // so the existence determination for ANY must be the same computation as the
+    // one for AAAA — which, before this issue, it was not: ANY was gated on a
+    // raw node-set lookup that knew nothing about synthesis.
+    // -----------------------------------------------------------------------
+
+    /// Scenario: An ANY query returns one synthetic HINFO, not the whole node
+    /// features/zone-lookup.feature:154
+    ///
+    /// The apex case is covered above; this is the ordinary-name case, and it
+    /// carries the two negative assertions that make either of them mean
+    /// anything. Without "no A" and "no TXT" the scenario passes against an
+    /// implementation that returns the HINFO *and* the node, which is the
+    /// amplification VEGA-002 closed rather than the fix.
+    #[test]
+    fn an_any_query_returns_one_synthetic_hinfo_and_not_the_node() {
+        let h = handler(
+            vec![
+                spec("multi", "A", &["203.0.113.60"]),
+                spec("multi", "TXT", &["\"hello\""]),
+            ],
+            false,
+        );
+        let r = h.resolve(&lower("multi.example.com."), RecordType::ANY, client());
+        assert_eq!(r.code, ResponseCode::NoError);
+        assert_eq!(r.answers.len(), 1, "{:?}", r.answers);
+        assert_eq!(r.answers[0].record_type(), RecordType::HINFO);
+        let RData::HINFO(hinfo) = &r.answers[0].data else {
+            panic!("expected HINFO, got {:?}", r.answers[0].data);
+        };
+        assert_eq!(
+            &*hinfo.cpu, b"RFC8482",
+            "RFC 8482 §6 asks for a recognisable CPU field so operators can tell \
+             a minimal-ANY answer from a real HINFO"
+        );
+        let types: Vec<_> = r.answers.iter().map(Record::record_type).collect();
+        assert!(
+            !types.contains(&RecordType::A),
+            "the node's A came back beside the HINFO: {types:?}"
+        );
+        assert!(
+            !types.contains(&RecordType::TXT),
+            "the node's TXT came back beside the HINFO: {types:?}"
+        );
+    }
+
+    /// Scenario: An ANY query at an existing name that holds no records still
+    /// returns the HINFO
+    /// features/zone-lookup.feature:181
+    ///
+    /// Ruled substantively by the architect, because both readings of RFC 8482
+    /// are conformant: §4.2 conditions synthesis on the absence of a CNAME at
+    /// the QNAME and on nothing else, so the shape of an ANY response does not
+    /// depend on what the node holds. Taking §4.1's "subset" reading — the empty
+    /// set for an empty node, i.e. a real NODATA — would make it depend on
+    /// exactly that, and uniform-and-bounded is the whole value of §4.2 here.
+    #[test]
+    fn an_any_query_at_a_name_that_holds_no_records_still_returns_the_hinfo() {
+        let h = handler(vec![], false);
+        let r = h.resolve(&lower("example.com."), RecordType::ANY, client());
+        assert_eq!(r.code, ResponseCode::NoError);
+        assert_eq!(r.answers.len(), 1, "{:?}", r.answers);
+        assert_eq!(r.answers[0].record_type(), RecordType::HINFO);
+    }
+
+    /// Scenario: An ANY query at a wildcard-covered name is NOERROR with the RFC
+    /// 8482 HINFO
+    /// features/zone-lookup.feature:257
+    ///
+    /// The half the issue was filed as. It is the least important half — ANY is
+    /// rare and increasingly refused outright — but it is the one where the two
+    /// existence determinations were visibly different code.
+    #[test]
+    fn an_any_query_at_a_wildcard_covered_name_is_noerror_with_the_hinfo() {
+        let h = handler(vec![spec("*.dev", "A", &["203.0.113.50"])], false);
+        let r = h.resolve(&lower("x.dev.example.com."), RecordType::ANY, client());
+        assert_eq!(
+            r.code,
+            ResponseCode::NoError,
+            "a name with a source of synthesis exists (RFC 4592 §3.3.1), and RFC \
+             8482 licenses no rcode change"
+        );
+        assert_eq!(r.answers.len(), 1, "{:?}", r.answers);
+        assert_eq!(r.answers[0].record_type(), RecordType::HINFO);
+    }
+
+    /// Scenario: An ANY query at a wildcard-covered CNAME returns the
+    /// synthesised CNAME
+    /// features/zone-lookup.feature:203
+    ///
+    /// An unfiled defect the architect found at the same site, and the reason
+    /// the fix has an *order* and not just a predicate: the existence gate ran
+    /// before the CNAME probe, and the CNAME probe goes through `Zone::lookup`
+    /// and is therefore already wildcard-aware. So the branch was internally
+    /// inconsistent — it could synthesise the CNAME but refused to admit the
+    /// name existed — and a wildcard CNAME answered NXDOMAIN while holding the
+    /// answer it owed. RFC 4592 §3.4.3 and RFC 8482 §4.2 violated at once.
+    ///
+    /// Ordering the branch `exists` → CNAME → HINFO closes it. A fix that gets
+    /// the predicate right but leaves the order alone still fails this.
+    #[test]
+    fn an_any_query_at_a_wildcard_covered_cname_returns_the_synthesised_cname() {
+        let h = handler(
+            vec![
+                spec("*.dev", "CNAME", &["origin.example.com."]),
+                spec("origin", "A", &["203.0.113.20"]),
+            ],
+            false,
+        );
+        let r = h.resolve(&lower("x.dev.example.com."), RecordType::ANY, client());
+        assert_eq!(r.code, ResponseCode::NoError);
+        assert_eq!(r.answers.len(), 1, "{:?}", r.answers);
+        assert_eq!(
+            r.answers[0].record_type(),
+            RecordType::CNAME,
+            "RFC 8482 §4.2 forbids synthesising a HINFO over a CNAME, and the \
+             CNAME is synthesised at a covered name like any other type"
+        );
+        assert_eq!(
+            r.answers[0].name,
+            Name::from(lower("x.dev.example.com.")),
+            "a synthesised answer owned by `*.dev.example.com.` is discarded by \
+             every resolver that receives it"
+        );
+    }
+
+    /// Scenario: For a name with no CNAME, the rcode is a function of the name
+    /// alone
+    /// features/zone-lookup.feature:286
+    ///
+    /// AC-1 as an example, at the layer that owns the rcode. The property-test
+    /// form over generated zones is
+    /// `tests/properties.rs::the_rcode_of_a_cname_free_name_does_not_depend_on_the_qtype`;
+    /// this one names the exact packets that were observed on the wire.
+    ///
+    /// Asserted as "every QTYPE agrees with A" rather than "every QTYPE is
+    /// NOERROR", because the claim is the *invariance*, not the value: a server
+    /// that answered NXDOMAIN to all six would be wrong in a different way, and
+    /// the positive control above is what pins the value.
+    #[test]
+    fn the_rcode_at_a_wildcard_covered_name_does_not_depend_on_the_qtype() {
+        let h = handler(vec![spec("*.dev", "A", &["203.0.113.50"])], false);
+        let name = lower("x.dev.example.com.");
+
+        let carried = h.resolve(&name, RecordType::A, client());
+        assert_eq!(
+            carried.code,
+            ResponseCode::NoError,
+            "the wildcard must still answer the type it carries"
+        );
+
+        // AAAA first: it is what a dual-stack client sends alongside every A, so
+        // it is the one that poisons a resolver's cache during ordinary traffic.
+        for qtype in [
+            RecordType::AAAA,
+            RecordType::TXT,
+            RecordType::MX,
+            RecordType::SRV,
+            RecordType::ANY,
+        ] {
+            let r = h.resolve(&name, qtype, client());
+            assert_eq!(
+                r.code, carried.code,
+                "{qtype} at x.dev.example.com. answered {:?} where A answers \
+                 {:?}. RFC 1034 §4.3.2 step 3(c) conditions the name error on \
+                 the `*` node's existence and on nothing else, so the rcode may \
+                 not depend on the QTYPE",
+                r.code, carried.code
+            );
+        }
+    }
+
+    /// Scenario: Coverage is decided by the wildcard's own parent, not by its
+    /// depth
+    /// features/zone-lookup.feature:276
+    ///
+    /// The same discrimination as
+    /// `zone::tests::coverage_is_decided_by_the_wildcard_parent_not_by_its_depth`,
+    /// carried through to the rcode: the depths-alone shortcut does not just
+    /// mislabel an enum, it makes the server answer NOERROR for names it is
+    /// authoritatively denying today.
+    #[test]
+    fn a_name_whose_parent_merely_shares_a_depth_with_a_wildcard_is_still_nxdomain() {
+        let h = handler(vec![spec("*.dev", "A", &["203.0.113.50"])], false);
+        for qtype in [RecordType::A, RecordType::AAAA, RecordType::ANY] {
+            let r = h.resolve(&lower("q.other.example.com."), qtype, client());
+            assert_eq!(
+                r.code,
+                ResponseCode::NXDomain,
+                "`other.example.com.` sits at the same depth as the wildcard's \
+                 parent but is not it, so {qtype} there is a real name error"
+            );
+        }
+        // Anti-vacuity: the covered sibling must exist, or this passes against a
+        // server that never covers anything.
+        assert_eq!(
+            h.resolve(&lower("q.dev.example.com."), RecordType::AAAA, client())
+                .code,
+            ResponseCode::NoError
+        );
+    }
+
+    /// A single-question UDP request for `name`/`qtype`, as `dispatch` sees it.
+    ///
+    /// Goes through the wire encoding on purpose: `RecordType::from(u16)` is
+    /// where 253 and 254 become `Unknown`, and a test that skipped the decode
+    /// could assert against a variant no packet can ever produce.
+    fn query_request(name: &str, qtype: RecordType) -> Request {
+        query_request_from(name, qtype, "198.51.100.10:5353")
+    }
+
+    /// [`query_request`] with the source address spelled out.
+    fn query_request_from(name: &str, qtype: RecordType, src: &str) -> Request {
+        use hickory_proto::op::{Message, Query};
+
+        let mut query = Query::new();
+        let mut owner: Name = name.parse().expect("name parses");
+        owner.set_fqdn(true);
+        query
+            .set_name(owner)
+            .set_query_type(qtype)
+            .set_query_class(DNSClass::IN);
+
+        let mut message = Message::query();
+        message.add_query(query);
+        Request::from_bytes(
+            message.to_vec().expect("request encodes"),
+            src.parse().expect("source address parses"),
+            Protocol::Udp,
+        )
+        .expect("request decodes")
+    }
+
+    // -----------------------------------------------------------------------
+    // VEGA-014: what the counters say, against what actually left the socket.
+    //
+    // Every test above stops at `resolve` or `dispatch`, which is before a
+    // single byte is encoded. These drive the whole of `handle_request` against
+    // a `ResponseHandler` double, so the response-code counter can be compared
+    // with the bytes the encoder produced — including the two outcomes no
+    // packet can provoke from outside: hickory's bare-SERVFAIL fallback, and a
+    // write that fails.
+    // -----------------------------------------------------------------------
+
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    use hickory_proto::{
+        op::Message,
+        serialize::binary::{BinDecodable as _, BinEncoder},
+    };
+    use hickory_server::{
+        net::{runtime::TokioTime, NetError},
+        zone_handler::MessageResponse,
+    };
+
+    /// A byte budget too small to hold a header plus a question.
+    ///
+    /// Twelve bytes is exactly [`HEADER_SIZE`], so the first label of the QNAME
+    /// has nowhere to go and `destructive_emit` fails. Nothing a client can send
+    /// gets the budget this low — [`MIN_EDNS_PAYLOAD`] floors it at 512 and a
+    /// question is at most ~272 bytes — which is precisely why the fallback
+    /// branch needs a double to reach it at all.
+    const STARVED_BUDGET: u16 = 12;
+
+    /// How the double treats the message it is handed.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    enum SendMode {
+        /// Encode with the budget a normal UDP client gets, and keep the bytes.
+        Wire,
+        /// Encode with [`STARVED_BUDGET`], which drives hickory's fallback.
+        Starved,
+        /// The socket is gone: nothing is written, the write reports an error.
+        Broken,
+    }
+
+    /// What the double did with the messages it was handed.
+    #[derive(Debug, Default)]
+    struct SendLog {
+        /// The exact bytes the encoder produced, in send order.
+        wire: Mutex<Vec<Vec<u8>>>,
+        /// Times hickory's bare-SERVFAIL fallback replaced the real answer.
+        fallbacks: AtomicUsize,
+        /// Times the write failed and nothing at all went out.
+        failures: AtomicUsize,
+    }
+
+    impl SendLog {
+        /// The response code of each datagram, read back off the wire bytes.
+        ///
+        /// Decoded rather than remembered: the point of these tests is what a
+        /// client would see, and a double that reported its own intention would
+        /// be no better than the counter it is checking.
+        fn wire_rcodes(&self) -> Vec<ResponseCode> {
+            self.wire
+                .lock()
+                .expect("no test panics while holding this lock")
+                .iter()
+                .map(|bytes| {
+                    Message::from_bytes(bytes)
+                        .expect("the double only logs bytes the encoder produced")
+                        .metadata
+                        .response_code
+                })
+                .collect()
+        }
+    }
+
+    /// A [`ResponseHandler`] that never touches a socket.
+    #[derive(Clone, Debug)]
+    struct FakeClient {
+        mode: SendMode,
+        log: Arc<SendLog>,
+    }
+
+    impl FakeClient {
+        fn new(mode: SendMode) -> Self {
+            Self {
+                mode,
+                log: Arc::new(SendLog::default()),
+            }
+        }
+
+        fn log(&self) -> Arc<SendLog> {
+            Arc::clone(&self.log)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ResponseHandler for FakeClient {
+        async fn send_response<'a>(
+            &mut self,
+            response: MessageResponse<
+                '_,
+                'a,
+                impl Iterator<Item = &'a Record> + Send + 'a,
+                impl Iterator<Item = &'a Record> + Send + 'a,
+                impl Iterator<Item = &'a Record> + Send + 'a,
+                impl Iterator<Item = &'a Record> + Send + 'a,
+            >,
+        ) -> Result<ResponseInfo, NetError> {
+            if self.mode == SendMode::Broken {
+                self.log.failures.fetch_add(1, Ordering::Relaxed);
+                return Err(NetError::from(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "client socket closed before the response was written",
+                )));
+            }
+
+            let budget = match self.mode {
+                SendMode::Starved => STARVED_BUDGET,
+                _ => MIN_EDNS_PAYLOAD,
+            };
+            let (info, bytes, fell_back) = encode_with_budget(response, budget);
+            if fell_back {
+                self.log.fallbacks.fetch_add(1, Ordering::Relaxed);
+            }
+            self.log
+                .wire
+                .lock()
+                .expect("no test panics while holding this lock")
+                .push(bytes);
+            Ok(info)
+        }
+    }
+
+    /// hickory's `MessageResponse::encode`, with the byte budget as an argument.
+    ///
+    /// A transcription of hickory-server 0.26.1
+    /// `zone_handler/message_response.rs:80-118`, line for line, with `max_size`
+    /// lifted out of the protocol/EDNS calculation. It has to be a transcription
+    /// because `encode` is `pub(crate)` and derives its budget from numbers Vega
+    /// clamps to at least 512 bytes, so the fallback is unreachable from a
+    /// packet. What matters is that the *real* encoder still fails on the *real*
+    /// message here — the test is not asserting a SERVFAIL that a mock invented.
+    ///
+    /// Returns the info, the bytes, and whether the fallback fired.
+    fn encode_with_budget<'a>(
+        response: MessageResponse<
+            '_,
+            'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+            impl Iterator<Item = &'a Record> + Send + 'a,
+        >,
+        max_size: u16,
+    ) -> (ResponseInfo, Vec<u8>, bool) {
+        let id = response.metadata().id;
+
+        let mut bytes = Vec::with_capacity(512);
+        let mut encoder = BinEncoder::new(&mut bytes);
+        encoder.set_max_size(max_size);
+        if let Ok(info) = response.destructive_emit(&mut encoder) {
+            return (info, bytes, false);
+        }
+
+        // The encoder wrote a partial message before it ran out of room, so the
+        // buffer is discarded and a bare SERVFAIL header takes its place.
+        bytes.clear();
+        let mut encoder = BinEncoder::new(&mut bytes);
+        encoder.set_max_size(MIN_EDNS_PAYLOAD);
+
+        let mut metadata = Metadata::new(id, MessageType::Response, OpCode::Query);
+        metadata.response_code = ResponseCode::ServFail;
+        let header = Header {
+            metadata,
+            counts: HeaderCounts::default(),
+        };
+        header
+            .emit(&mut encoder)
+            .expect("a bare 12-byte header always fits in 512");
+        (ResponseInfo::from(header), bytes, true)
+    }
+
+    /// A handler over `records`, sharing `metrics` with the caller.
+    fn handler_with(
+        records: Vec<RecordSpec>,
+        metrics: &Arc<Metrics>,
+        limiter: Option<Arc<RateLimiter>>,
+    ) -> DnsHandler {
+        let cfg = zone_config(records, false);
+        let zone = Arc::new(Zone::from_config(&cfg).unwrap());
+        DnsHandler::new(zone, &cfg, Arc::clone(metrics), limiter)
+    }
+
+    /// Drive one request through the full `handle_request`, socket and all.
+    async fn serve(handler: &DnsHandler, request: &Request, client: FakeClient) -> ResponseInfo {
+        handler
+            .handle_request::<FakeClient, TokioTime>(request, client)
+            .await
+    }
+
+    /// The value of one Prometheus series, or a panic naming the whole body.
+    fn series(text: &str, name: &str) -> u64 {
+        let needle = format!("{name} ");
+        text.lines()
+            .find_map(|line| line.strip_prefix(needle.as_str()))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no series {name:?} in:\n{text}"))
+    }
+
+    /// Scenario: A response that is written successfully is counted under the rcode it carried
+    /// features/admin-api.feature:148
+    ///
+    /// The control for the two failure tests below. Without it, a double that
+    /// answered SERVFAIL to everything would satisfy them both.
+    #[tokio::test]
+    async fn a_response_that_is_written_is_counted_under_the_rcode_it_carried() {
+        let metrics = Arc::new(Metrics::new());
+        let handler = handler_with(vec![spec("www", "A", &["203.0.113.10"])], &metrics, None);
+        let client = FakeClient::new(SendMode::Wire);
+        let log = client.log();
+
+        let info = serve(
+            &handler,
+            &query_request("www.example.com.", RecordType::A),
+            client,
+        )
+        .await;
+
+        assert_eq!(log.wire_rcodes(), vec![ResponseCode::NoError]);
+        assert_eq!(log.fallbacks.load(Ordering::Relaxed), 0);
+        assert_eq!(info.response_code, ResponseCode::NoError);
+
+        let text = metrics.render_prometheus();
+        assert_eq!(series(&text, "dns_responses_total{rcode=\"noerror\"}"), 1);
+        assert_eq!(series(&text, "dns_responses_total{rcode=\"servfail\"}"), 0);
+        assert_eq!(series(&text, "dns_send_errors_total"), 0);
+    }
+
+    /// Scenario: An answer the encoder cannot fit is counted as the SERVFAIL that was sent
+    /// features/admin-api.feature:156
+    ///
+    /// This is VEGA-014 itself. `MessageResponse::encode` catches an emit
+    /// failure, throws the buffer away, puts a bare SERVFAIL header on the wire
+    /// and returns `Ok(ResponseInfo { ServFail })`. Counting the rcode we
+    /// *intended* instead of the one hickory reports back left
+    /// `dns_responses_total{rcode="servfail"}` reading zero during exactly the
+    /// failure it exists to reveal.
+    #[tokio::test]
+    async fn an_answer_the_encoder_cannot_fit_is_counted_as_the_servfail_that_was_sent() {
+        let metrics = Arc::new(Metrics::new());
+        let handler = handler_with(vec![spec("www", "A", &["203.0.113.10"])], &metrics, None);
+        let client = FakeClient::new(SendMode::Starved);
+        let log = client.log();
+
+        let info = serve(
+            &handler,
+            &query_request("www.example.com.", RecordType::A),
+            client,
+        )
+        .await;
+
+        // If hickory ever stops falling back, this test must fail loudly rather
+        // than quietly stop testing anything.
+        assert_eq!(
+            log.fallbacks.load(Ordering::Relaxed),
+            1,
+            "the encoder was expected to run out of room and fall back"
+        );
+        assert_eq!(
+            log.wire_rcodes(),
+            vec![ResponseCode::ServFail],
+            "the client received SERVFAIL, whatever we resolved"
+        );
+        assert_eq!(info.response_code, ResponseCode::ServFail);
+
+        let text = metrics.render_prometheus();
+        assert_eq!(
+            series(&text, "dns_responses_total{rcode=\"servfail\"}"),
+            1,
+            "the wire said SERVFAIL, so the counter must too:\n{text}"
+        );
+        assert_eq!(
+            series(&text, "dns_responses_total{rcode=\"noerror\"}"),
+            0,
+            "NOERROR was resolved but never sent:\n{text}"
+        );
+        assert_eq!(
+            series(&text, "dns_send_errors_total"),
+            0,
+            "the write succeeded; only its contents changed"
+        );
+    }
+
+    /// Scenario: A response that cannot be written to the socket is counted as a send error
+    /// features/admin-api.feature:168
+    ///
+    /// `dns_send_errors_total` and `serve_failed` were both 0% covered, so the
+    /// one series an operator would use to tell "we are answering SERVFAIL" from
+    /// "we are answering nothing" was dead instrumentation.
+    #[tokio::test]
+    async fn a_response_that_cannot_be_written_counts_a_send_error() {
+        let metrics = Arc::new(Metrics::new());
+        let handler = handler_with(vec![spec("www", "A", &["203.0.113.10"])], &metrics, None);
+        let client = FakeClient::new(SendMode::Broken);
+        let log = client.log();
+
+        let info = serve(
+            &handler,
+            &query_request("www.example.com.", RecordType::A),
+            client,
+        )
+        .await;
+
+        assert_eq!(log.failures.load(Ordering::Relaxed), 1);
+        assert!(
+            log.wire_rcodes().is_empty(),
+            "a failed write puts nothing on the wire"
+        );
+        assert_eq!(
+            info.response_code,
+            ResponseCode::ServFail,
+            "the server is told the request failed, not that it succeeded"
+        );
+
+        let text = metrics.render_prometheus();
+        assert_eq!(series(&text, "dns_send_errors_total"), 1, "{text}");
+    }
+
+    /// Scenario: A response that never reached the socket is still counted in dns_responses_total
+    /// features/admin-api.feature:179
+    ///
+    /// Pins today's behaviour, and today's behaviour is the wrong one — see
+    /// VEGA-088. `dns_responses_total` is documented as "DNS responses sent",
+    /// the client received nothing, and the rate-limiter drop path
+    /// (`dispatch` -> `None`) counts no response at all for the same outcome.
+    /// Changing which of the two conventions wins moves the meaning of a series
+    /// operators alert on, so it is a rust-dev change with its own issue, not a
+    /// silent edit here. When it lands, this test flips to asserting 0 and the
+    /// `@gap` scenario beside it becomes the enforced one.
+    #[tokio::test]
+    async fn a_response_that_never_reached_the_socket_is_still_counted_as_a_servfail_response() {
+        let metrics = Arc::new(Metrics::new());
+        let handler = handler_with(vec![spec("www", "A", &["203.0.113.10"])], &metrics, None);
+
+        let _ = serve(
+            &handler,
+            &query_request("www.example.com.", RecordType::A),
+            FakeClient::new(SendMode::Broken),
+        )
+        .await;
+
+        let text = metrics.render_prometheus();
+        assert_eq!(
+            series(&text, "dns_responses_total{rcode=\"servfail\"}"),
+            1,
+            "current convention: a failed write is booked as a SERVFAIL:\n{text}"
+        );
+        assert_eq!(
+            series(&text, "dns_responses_total{rcode=\"noerror\"}"),
+            0,
+            "the resolved rcode must not be the one recorded:\n{text}"
+        );
+    }
+
+    /// Scenario: A query dropped by the rate limiter is counted as no response at all
+    /// features/admin-api.feature:192
+    ///
+    /// The other half of the disagreement VEGA-088 records. A UDP drop is
+    /// deliberately silent, and it books nothing in `dns_responses_total` — so
+    /// the sum of that metric currently means "answers we tried to send", not
+    /// "answers a client received". Locking it down here means the fix for
+    /// VEGA-088 has to make the two paths agree rather than pick one at random.
+    #[tokio::test]
+    async fn a_query_dropped_by_the_rate_limiter_is_counted_as_no_response_at_all() {
+        let metrics = Arc::new(Metrics::new());
+        let limiter = Arc::new(RateLimiter::new(1, 1));
+        let handler = handler_with(
+            vec![spec("www", "A", &["203.0.113.10"])],
+            &metrics,
+            Some(Arc::clone(&limiter)),
+        );
+        // Drain the single token so the query below is the one that is dropped.
+        assert!(limiter.check(client()), "the bucket starts full");
+
+        let client_double = FakeClient::new(SendMode::Wire);
+        let log = client_double.log();
+        let _ = serve(
+            &handler,
+            &query_request("www.example.com.", RecordType::A),
+            client_double,
+        )
+        .await;
+
+        assert!(
+            log.wire_rcodes().is_empty(),
+            "a rate-limited UDP query must reach no socket at all"
+        );
+
+        let text = metrics.render_prometheus();
+        assert_eq!(series(&text, "dns_rate_limited_total"), 1, "{text}");
+        assert_eq!(series(&text, "dns_send_errors_total"), 0, "{text}");
+        for rcode in ["noerror", "nxdomain", "refused", "servfail", "other"] {
+            assert_eq!(
+                series(&text, &format!("dns_responses_total{{rcode=\"{rcode}\"}}")),
+                0,
+                "nothing was sent, so no response code was sent either:\n{text}"
+            );
+        }
+    }
+
+    /// Scenario: Every failed write is counted, not just the first
+    /// features/admin-api.feature:203
+    ///
+    /// A downstream outage produces these in bursts. A counter that moved once
+    /// and then latched would make a total outage indistinguishable from a
+    /// single dropped packet on the dashboard.
+    #[tokio::test]
+    async fn every_failed_write_is_counted_not_just_the_first() {
+        const FAILURES: u64 = 5;
+
+        let metrics = Arc::new(Metrics::new());
+        let handler = handler_with(vec![spec("www", "A", &["203.0.113.10"])], &metrics, None);
+
+        for i in 0..FAILURES {
+            let src = format!("198.51.100.{}:5353", 10 + i);
+            let _ = serve(
+                &handler,
+                &query_request_from("www.example.com.", RecordType::A, &src),
+                FakeClient::new(SendMode::Broken),
+            )
+            .await;
+        }
+
+        let text = metrics.render_prometheus();
+        assert_eq!(series(&text, "dns_send_errors_total"), FAILURES, "{text}");
+        assert_eq!(
+            series(&text, "dns_responses_total{rcode=\"servfail\"}"),
+            FAILURES,
+            "{text}"
+        );
+        assert_eq!(series(&text, "dns_queries_total"), FAILURES, "{text}");
     }
 }

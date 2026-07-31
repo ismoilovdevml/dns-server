@@ -47,8 +47,17 @@ EXPOSE 53/udp 53/tcp 9100/tcp
 ENV VEGA_LOG_FORMAT=json
 
 # The binary probes its own /healthz, so the image needs no curl or shell.
+# /healthz — not /readyz — on purpose: it stays 200 for the whole shutdown
+# drain, so `docker stop` does not also mark the container unhealthy while it
+# is deliberately answering its last queries.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/vega", "healthcheck", "--admin-listen", "127.0.0.1:9100"]
+
+# The default for this base image, stated explicitly because the shutdown drain
+# depends on it: SIGTERM starts the drain, anything else kills us outright.
+# `docker stop` must be given a timeout above the drain (default 15s) plus the
+# 7s stop budget — `docker stop -t 30`, or `stop_grace_period: 30s` in Compose.
+STOPSIGNAL SIGTERM
 
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/vega"]

@@ -198,6 +198,13 @@ async fn meta_query_types_are_not_answered_as_ordinary_types() {
         RecordType::IXFR,
         RecordType::AXFR,
         RecordType::Unknown(0),
+        // RFC 1035 s3.2.3 numbers the QTYPE-only mail types MAILB 253 and
+        // MAILA 254. hickory has no variant for either — `RecordType::from`
+        // ends in `_ => Self::Unknown(value)` — so they arrive here as
+        // `Unknown`, which is how they slipped past the first fix and were
+        // answered with the CNAME.
+        RecordType::Unknown(253),
+        RecordType::Unknown(254),
     ] {
         let response = ask(&server, &format!("alias.{ZONE}"), qtype, DNSClass::IN).await;
         assert!(

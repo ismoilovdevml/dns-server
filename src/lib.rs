@@ -5,12 +5,15 @@
 //! Serving:
 //!
 //! * [`config`] — CLI flags + TOML file, merged and validated up-front.
+//! * [`rdata`] — the one place operator text is turned into RDATA.
 //! * [`zone`] — the in-memory record store and the lookup algorithm.
 //! * [`handler`] — the [`hickory_server::server::RequestHandler`] implementation.
+//! * [`lifecycle`] — the process phase every admin endpoint answers from.
 //! * [`ratelimit`] — per-source-IP token bucket.
 //! * [`metrics`] — lock-free counters plus a Prometheus text exporter.
 //! * [`admin`] — HTTP endpoints for health, metrics and reload.
-//! * [`shutdown`] — turns `SIGINT`/`SIGTERM` into a cancellation signal.
+//! * [`reload`] — re-resolving the config and swapping the zone, live.
+//! * [`shutdown`] — turns `SIGINT`/`SIGTERM`/`SIGHUP` into a shutdown signal.
 //!
 //! Operating, all reachable from the CLI so a deployment can be driven from
 //! scripts as well as by hand:
@@ -32,11 +35,21 @@ pub mod editor;
 pub mod handler;
 pub mod healthcheck;
 pub mod http;
+pub mod lifecycle;
 pub mod metrics;
 pub mod ratelimit;
+pub mod rdata;
+pub mod reload;
 pub mod shutdown;
 pub mod ui;
 pub mod zone;
+
+/// The test harness's own guard rail: a watchdog that bounds the *process*, so
+/// a test for "this loop terminates" fails loudly instead of leaking a spinning
+/// thread. Compiled only under `cfg(test)`; integration tests pull the same file
+/// in by path so there is one implementation of the rule.
+#[cfg(test)]
+mod testutil;
 
 /// Crate version, as reported by `--version`, `/version` and the `version.<zone>` record.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
