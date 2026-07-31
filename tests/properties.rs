@@ -92,6 +92,48 @@ fn zone_config() -> impl Strategy<Value = ZoneConfig> {
     })
 }
 
+/// A zone holding at least one wildcard, paired with a name that wildcard
+/// covers **by construction**.
+///
+/// Generating the zone and the name independently and filtering the pair with
+/// `prop_assume!` is what made `a_wildcard_covered_name_exists_for_every_type`
+/// flaky: most pairs are not covered, so proptest hit its global reject limit
+/// on CI (247 successes against 1024 rejects) while passing locally on a
+/// luckier seed. A test that depends on the generator being lucky is not a
+/// test. Building the pair means every generated case exercises the property.
+///
+/// The caller keeps a `prop_assume!` as a narrow safety net, because a record
+/// generated into the zone can still place an exact set at the chosen name —
+/// but that is rare, rather than the common case it used to be.
+fn covered_case() -> impl Strategy<Value = (ZoneConfig, String)> {
+    (
+        zone_config(),
+        prop::collection::vec(label(), 0..3),
+        prop::collection::vec(label(), 1..3),
+        typed_value(),
+    )
+        .prop_map(|(mut cfg, parent, below, (record_type, value))| {
+            let owner = if parent.is_empty() {
+                "*".to_owned()
+            } else {
+                format!("*.{}", parent.join("."))
+            };
+            cfg.records.push(RecordSpec {
+                name: owner,
+                record_type,
+                ttl: None,
+                values: vec![value],
+            });
+            let suffix = if parent.is_empty() {
+                String::new()
+            } else {
+                format!("{}.", parent.join("."))
+            };
+            let name = format!("{}.{suffix}{ORIGIN}.", below.join("."));
+            (cfg, name)
+        })
+}
+
 /// A query name: sometimes in the zone, sometimes deliberately outside it.
 fn query_name() -> impl Strategy<Value = String> {
     prop_oneof![
@@ -1117,8 +1159,7 @@ proptest! {
     /// features/zone-lookup.feature:240
     #[test]
     fn a_wildcard_covered_name_exists_for_every_type(
-        cfg in zone_config(),
-        name in query_name(),
+        (cfg, name) in covered_case(),
         qtype in query_type(),
     ) {
         let _watchdog = testutil::arm(WATCHDOG);
