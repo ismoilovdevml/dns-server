@@ -664,14 +664,14 @@ proptest! {
     ///
     /// Scenario: The arena answers exactly what today's implementation answers,
     /// for every zone and every query
-    /// features/zone-data-model.feature:255
+    /// features/zone-data-model.feature:263
     ///
     /// Also carries, in the same pass:
     ///
     ///   * Scenario: A config the transcription refuses is a config the arena
-    ///     refuses — features/zone-data-model.feature:444
+    ///     refuses — features/zone-data-model.feature:458
     ///   * Scenario: A zone whose config declares no records at all still agrees
-    ///     with the transcription — features/zone-data-model.feature:423
+    ///     with the transcription — features/zone-data-model.feature:437
     ///
     /// Kept in one property rather than three because they share a generated
     /// zone, and because a build outcome that disagreed while every answer
@@ -761,7 +761,7 @@ proptest! {
 
 /// Scenario: The differential covers ANY, CNAME chasing and the negative paths,
 /// not only wildcards
-/// features/zone-data-model.feature:272
+/// features/zone-data-model.feature:280
 ///
 /// The generated property above will reach these, but it reaches them at a rate
 /// the generator decides. This walks them deterministically, so a regression in

@@ -307,13 +307,13 @@ fn negative_path_budget(unmet: &mut Vec<String>) {
 }
 
 /// Scenario: A 100,000-record zone costs at most 40 MiB of live heap
-/// features/zone-data-model.feature:337
+/// features/zone-data-model.feature:345
 ///
 /// Scenario: An answer vector is not over-allocated
-/// features/zone-data-model.feature:352
+/// features/zone-data-model.feature:360
 ///
 /// Scenario: A negative answer in a wildcard zone allocates nothing at all
-/// features/zone-data-model.feature:362
+/// features/zone-data-model.feature:370
 ///
 /// Three scenarios in one test because they share a 100,000-record zone that
 /// costs seconds to build, and because a `#[global_allocator]` makes a second

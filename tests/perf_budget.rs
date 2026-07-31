@@ -313,7 +313,7 @@ fn an_any_lookup_does_not_scan_the_whole_record_map() {
 ///
 /// Scenario: The true 127-label ceiling is measured and budgeted, not just the
 /// 123-label one
-/// features/zone-data-model.feature:500
+/// features/zone-data-model.feature:514
 ///
 /// # Why 123 is not enough
 ///

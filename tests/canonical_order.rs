@@ -71,7 +71,8 @@ const MAX_LABELS: usize = 127;
 ///
 /// # S0 replaces this body with a call to the real key. Nothing else.
 fn key_under_test(name: &LowerName) -> Vec<u8> {
-    let key = canonical::canonical_sort_key(name);
+    let mut key = Vec::new();
+    canonical::write_canonical_sort_key(name, &mut key);
     // The transcription below is the ruling's §7.2 encoding, written down before
     // any code existed. Diffing the real key against it here — octet for octet,
     // not merely "sorts the same way" — is the use the transcription was kept
@@ -482,7 +483,7 @@ fn names_that_collide_on_every_label_but_one_boundary_octet_still_sort_correctly
 // ---------------------------------------------------------------------------
 
 /// Scenario: The banned label-counting function stays out of every module that indexes by depth
-/// features/zone-data-model.feature:225
+/// features/zone-data-model.feature:233
 ///
 /// `LowerName::num_labels()` is documented as counting labels *discounting* a
 /// leading `*`; `Name::trim_to` and the suffix hash index the raw count. Mixing
@@ -582,7 +583,7 @@ fn rust_sources(dir: &str) -> Vec<std::path::PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Scenario: A name one label past the ceiling never reaches the zone at all
-/// features/zone-data-model.feature:206
+/// features/zone-data-model.feature:214
 ///
 /// `MAX_LABELS` is not a tuning knob and the `[u64; MAX_LABELS + 1]` array the
 /// suffix hash writes into is indexed by a label count taken from a name an

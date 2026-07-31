@@ -80,7 +80,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
   # LowerName: Ord says Less and a plain-terminator key says Greater. The escape
   # (0x00 -> 0x00 0x01, separator 0x00 0x00) is load-bearing, not decoration.
 
-  @happy @enforced tests/canonical_order.rs:174
+  @happy @enforced tests/canonical_order.rs:198
   Scenario: RFC 4034 §6.1's own nine-name example sorts into the order the RFC prints
     # The RFC prints the answer. Transcribing it is the one test that cannot be
     # wrong in the same direction as the implementation, because it was written
@@ -91,7 +91,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When they are sorted by the canonical sort key
     Then the result is the order printed in the RFC
 
-  @happy @enforced tests/canonical_order.rs:256
+  @happy @enforced tests/canonical_order.rs:280
   Scenario: The canonical sort key orders every name exactly as LowerName Ord does
     # hickory's cmp_labels IS RFC 4034 §6.1 — it zips reversed label iterators,
     # compares octets case-insensitively, then label lengths, then label counts.
@@ -103,7 +103,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When both are compared by the canonical sort key and by LowerName Ord
     Then the two comparisons agree, including on equality
 
-  @boundary @enforced tests/canonical_order.rs:298
+  @boundary @enforced tests/canonical_order.rs:322
   Scenario: A label containing a NUL octet sorts by the escaped key, and a plain terminator inverts it
     # The specific counterexample from the ruling §7.2, measured rather than
     # argued. Without this scenario the escape looks like paranoia and the first
@@ -115,7 +115,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     And the escaped canonical key agrees
     And a key using a plain 0x00 terminator instead reverses them
 
-  @boundary @enforced tests/canonical_order.rs:338
+  @boundary @enforced tests/canonical_order.rs:362
   Scenario: Two names differing only in case are equal under the canonical key
     # RFC 4034 §6.1 compares octets case-insensitively, and RFC 4343 says the
     # same about matching. A key that lowercases inconsistently would put the
@@ -124,7 +124,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When they are compared by the canonical sort key
     Then they compare equal
 
-  @boundary @enforced tests/canonical_order.rs:361
+  @boundary @enforced tests/canonical_order.rs:385
   Scenario: A name sorts before every name that has it as a proper suffix
     # Ancestors precede descendants, which is the property the whole arena rests
     # on: node 0 is the apex, cut propagation is one linear pass because every
@@ -134,7 +134,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When they are sorted by the canonical sort key
     Then "example." precedes "a.example." and "a.example." precedes "b.a.example."
 
-  @empty @enforced tests/canonical_order.rs:383
+  @empty @enforced tests/canonical_order.rs:407
   Scenario: The root name is the smallest key there is
     # The empty case of the key function, and it is reachable: origin = "." is
     # an accepted configuration, so the root really is a node in some zones.
@@ -142,7 +142,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When it is compared by the canonical sort key against any other name
     Then the root sorts first
 
-  @malformed @enforced tests/canonical_order.rs:412
+  @malformed @enforced tests/canonical_order.rs:436
   Scenario: A label made entirely of 0xff octets is ordered as data, not as a delimiter
     # The other end of the octet range from the NUL case. RFC 2181 §11 permits
     # it; a key that treated any octet as structural rather than as content
@@ -151,7 +151,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When both are compared by the canonical sort key and by LowerName Ord
     Then the two comparisons agree
 
-  @hostile @enforced tests/canonical_order.rs:435
+  @hostile @enforced tests/canonical_order.rs:459
   Scenario: Names chosen to collide under a naive key still sort correctly
     # An operator picks the names in a zone, but a zone file can be generated
     # from attacker-supplied input (a hosting control panel, a DDNS front end).
@@ -183,7 +183,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
   # 127, not 123. 123 is the ceiling for names under "example.com." only, and it
   # is wrong wherever the tests use it as a protocol limit.
 
-  @happy @enforced src/zone.rs:2202
+  @happy @enforced src/zone.rs:3075
   Scenario: The suffix hash at every depth equals hashing that suffix directly
     # The whole correctness claim of the one-pass hash, and it is not observable
     # from outside the crate: the primitive is pub(crate) by the ruling's §10.1,
@@ -193,7 +193,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When the suffix hashes are computed in one reverse pass
     Then h[d] equals the hash of that name's d rightmost labels, for every d
 
-  @boundary @enforced src/zone.rs:2270
+  @boundary @enforced src/zone.rs:3143
   Scenario: A 127-label name produces 128 suffix hashes and allocates nothing
     # h[0] is the root, so a 127-label name fills 128 entries — the exact width
     # of the stack array. One index past it is an out-of-bounds read on a path
@@ -210,7 +210,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When the suffix hashes are computed
     Then there are 128 entries and the pass performs no heap allocation
 
-  @boundary @enforced tests/canonical_order.rs:574
+  @boundary @enforced tests/canonical_order.rs:598
   Scenario: A name one label past the ceiling never reaches the zone at all
     # The upstream fact the [u64; 128] array is sized from. If hickory ever
     # accepted a 128-label name, the array would be indexed out of range by a
@@ -219,7 +219,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When it is parsed
     Then hickory rejects it as longer than 255 octets
 
-  @hostile @enforced src/zone.rs:1914
+  @hostile @enforced src/zone.rs:2675
   Scenario: A name of maximum-length labels is answered rather than mis-indexed
     # The other shape at the 255-octet limit: three 63-octet labels instead of
     # 127 one-octet ones. A hash pass that walked octets rather than label
@@ -229,7 +229,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When a client queries a name of three 63-octet labels
     Then the query is answered rather than panicking
 
-  @hostile @enforced tests/canonical_order.rs:482
+  @hostile @enforced tests/canonical_order.rs:506
   Scenario: The banned label-counting function stays out of every module that indexes by depth
     # num_labels() discounts a leading asterisk; trim_to and the suffix hash
     # index the raw count. Mixing them shifts every probe one label off for any
@@ -287,7 +287,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When each name is queried for A, ANY and CNAME
     Then every answer matches the transcription exactly
 
-  @happy @enforced src/zone.rs:1273
+  @happy @enforced src/zone.rs:2034
   Scenario: VEGA-065's four asterisk-in-the-name behaviours survive the arena unmodified
     # Wildcards stop being a parent-keyed map at S1 and become nodes named
     # "*.x" (RFC 4592 §2.1.1). These four are the cases a wrong label-count
@@ -298,7 +298,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When each wildcard's own literal name is queried
     Then all four answers are unchanged from today
 
-  @happy @enforced src/zone.rs:1381
+  @happy @enforced src/zone.rs:2142
   Scenario: The deepest wildcard still wins at S1, because closest-encloser is S3's
     # RFC 4592 §3.3.1's closest-encloser rule would make "*.dev" NOT answer
     # under a name whose closest encloser is deeper. That is the fix, and it is
@@ -309,7 +309,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When a client queries "x.dev.example.com." for type A
     Then the answer holds 203.0.113.50
 
-  @boundary @enforced src/zone.rs:1843
+  @boundary @enforced src/zone.rs:2604
   Scenario: Wildcard coverage is still decided per parent and never per depth
     # VEGA-083's AC-5, restated as an obligation on the arena. "*.dev" sits at
     # depth 3 and so does "other.example.com". Reading coverage off a depth
@@ -319,7 +319,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When a client queries "q.other.example.com." for type A
     Then the response rcode is NXDOMAIN
 
-  @boundary @enforced src/zone.rs:1760
+  @boundary @enforced src/zone.rs:2521
   Scenario: A wildcard-covered name is still NODATA for every type the wildcard does not carry
     # VEGA-083's ruling is an obligation on this model, not a behaviour the
     # rewrite gets to renegotiate. The arena must satisfy it from the node
@@ -328,7 +328,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When a client queries "x.dev.example.com." for type AAAA
     Then the lookup result is NoData
 
-  @boundary @enforced src/zone.rs:2047
+  @boundary @enforced src/zone.rs:3203
   Scenario: The three RFC defects VEGA-032 fixes later are still red after S1
     # S2 fixes empty non-terminals, S3 fixes the closest encloser. If one of
     # them turns green at S0 or S1, the commit went outside its fence and the
@@ -383,7 +383,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
 
   # ------------------------------------------------------------ STRUCTURE
 
-  @boundary @wip src/zone.rs — S1 commit
+  @boundary @enforced src/zone.rs:2822
   Scenario: The arena is physically in RFC 4034 §6.1 canonical order
     # Nothing consumes the ordering at S1, which is exactly why it is asserted
     # at S1: an ordering nothing exercises is an ordering nobody notices is
@@ -395,18 +395,24 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When the arena is built
     Then every adjacent pair of nodes is strictly increasing under LowerName Ord
 
-  @boundary @wip src/zone.rs — S1 commit
+  @boundary @enforced src/zone.rs:2864
   Scenario: Node 0 is the apex and every node's parent has a lower index
     # The two structural facts the rest of the design reads as given: cut
     # propagation is one linear pass because parents are already visited, and
     # NodeIdx::APEX is a constant rather than a search. Both are consequences of
     # canonical order, and both stop being true silently if the sort changes.
+    #
+    # Stated over ANCESTORS rather than over immediate parents. S1 materialises
+    # no empty non-terminals — that is S2 — so a node's immediate parent is
+    # frequently not a node at all; what every forward pass actually needs is
+    # that each ancestor which DOES exist precedes its descendant, and that is
+    # what the test asserts. The wording tightens at S2, when the two coincide.
     Given any zone the generator produces
     When the arena is built
     Then node 0 is the zone apex
-    And every non-apex node's parent appears at a lower index
+    And every ancestor that exists appears at a lower index than its descendant
 
-  @boundary @wip src/zone.rs — S1 commit
+  @boundary @enforced src/zone.rs:2923
   Scenario: Every node round-trips through the hash index
     # The index and the arena are built in one function from one scratch map and
     # dropped together, so they cannot drift across a reload. The failure this
@@ -418,7 +424,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
 
   # --------------------------------------------------------------- EMPTY
 
-  @empty @enforced src/zone.rs:1971
+  @empty @enforced src/zone.rs:2732
   Scenario: A zone holding nothing but its apex answers every shape without panicking
     # The smallest arena that can exist: one node, no RRsets, no wildcards, an
     # empty index bucket for everything else. Every branch of the lookup is
@@ -438,7 +444,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
 
   # ----------------------------------------------------------- MALFORMED
 
-  @malformed @enforced src/zone.rs:1009
+  @malformed @enforced src/zone.rs:1770
   Scenario: An owner name outside the zone still fails the build after the rewrite
     # qualify() is the only thing standing between a config and a record for
     # somebody else's namespace. The arena build is a rewrite of everything
@@ -459,7 +465,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
 
   # ------------------------------------------------------------- HOSTILE
 
-  @hostile @enforced src/zone.rs:1525
+  @hostile @enforced src/zone.rs:2286
   Scenario: The deepest name the wire can carry is 127 labels, and it is answered
     # 123 is the ceiling under "example.com." and the suite uses it as though it
     # were the protocol limit in several places. It is not: 127 one-octet labels
@@ -469,7 +475,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When a client queries a name of 127 single-octet labels
     Then it is answered with the owner rewritten to the queried name
 
-  @hostile @enforced src/zone.rs:1914
+  @hostile @enforced src/zone.rs:2675
   Scenario: A query name at exactly 255 octets is answered
     # The octet limit approached from the other direction from the label limit.
     # A name can be at the octet ceiling with very few labels, and a model that
@@ -478,7 +484,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When a client queries a name whose wire form is exactly 255 octets
     Then it is answered rather than panicking
 
-  @hostile @enforced src/zone.rs:1684
+  @hostile @enforced src/zone.rs:2445
   Scenario: A root-origin zone with a wildcard still terminates on a miss
     # origin = "." drives the probe window's floor to zero, which is where a
     # loop shaped as "count down while depth >= floor" fails to terminate. The

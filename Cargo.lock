@@ -1678,6 +1678,7 @@ dependencies = [
  "axum",
  "clap",
  "clap_complete",
+ "hashbrown",
  "hickory-proto",
  "hickory-server",
  "owo-colors",

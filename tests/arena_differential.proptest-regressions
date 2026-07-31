@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc adf14f97df0981328dfd4dd3d11ebb5f96ba6d8a8b45f7cc929dbf8c00dc01cd # shrinks to cfg = ZoneConfig { origin: "example.test", default_ttl: 300, builtins: false, soa: None, records: [RecordSpec { name: "*", record_type: "CNAME", ttl: None, values: ["a.example.test."] }] }, plan = QueryPlan { shape: 0, pick: 0, prefix: ["a"], depth: 0 }, qtype = A

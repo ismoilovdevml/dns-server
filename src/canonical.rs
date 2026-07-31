@@ -48,24 +48,17 @@ const LABEL_END: [u8; 2] = [0x00, 0x00];
 /// belongs (RFC 2181 §11 permits it; RFC 4034 §6.1 compares it as data).
 const ESCAPED_NUL: [u8; 2] = [0x00, 0x01];
 
-/// The canonical sort key of `name`: a byte string whose `Ord` is RFC 4034
-/// §6.1 canonical DNS name order.
+/// Append the canonical sort key of `name` to `key`: a byte string whose `Ord`
+/// is RFC 4034 §6.1 canonical DNS name order.
 ///
 /// Equal names produce equal keys, so two spellings of one owner name — which
 /// §6.1 compares case-insensitively — cannot become two nodes in the arena.
 ///
-/// Build-time only. The key is scratch: it is dropped once the permutation it
-/// produced has been applied, and never stored.
-pub(crate) fn canonical_sort_key(name: &LowerName) -> Vec<u8> {
-    // Worst case is every octet escaped, plus a terminator per label; `len()`
-    // already counts one octet per label boundary, so this never grows.
-    let mut key = Vec::with_capacity(name.len() * 2 + 2);
-    write_canonical_sort_key(name, &mut key);
-    key
-}
-
-/// [`canonical_sort_key`] appending into a caller-owned buffer, so a build that
-/// sorts many names can reuse one allocation.
+/// Appending into a caller-owned buffer rather than returning a `Vec` is the
+/// whole point: a build sorting 100,000 names puts every key in **one** scratch
+/// buffer and sorts a permutation of indices, so the sort costs three
+/// allocations instead of one per name. The buffer is dropped once the
+/// permutation has been applied; no key is ever stored.
 pub(crate) fn write_canonical_sort_key(name: &LowerName, key: &mut Vec<u8>) {
     // `LowerName` derefs to `Name`, whose `LabelIter` is `DoubleEndedIterator`,
     // so the reverse walk costs no allocation and no intermediate name.

@@ -31,6 +31,14 @@ axum = { version = "0.8.9", default-features = false, features = [
 ] }
 clap = { version = "4.5.53", features = ["derive", "env", "wrap_help"] }
 clap_complete = "4.6.8"
+# `HashTable` only: a hash set that lets the caller supply the hash and the
+# comparison, so a zone probe never materialises a key (VEGA-032 §4.1). Nothing
+# std offers does that. Already in the graph transitively through `indexmap`, and
+# pinned to that same version so `cargo deny`'s duplicate check stays quiet.
+# `default-features = false` keeps `foldhash` out: we hash names ourselves.
+hashbrown = { version = "0.17.1", default-features = false, features = [
+    "inline-more",
+] }
 hickory-proto = "0.26.1"
 hickory-server = "0.26.1"
 owo-colors = "4.3.0"

@@ -1,18 +1,53 @@
-//! The in-memory zone: record sets keyed by owner name and type, plus the
-//! lookup algorithm that turns a query into an answer.
+//! The in-memory zone: a canonically ordered arena of nodes, plus the lookup
+//! algorithm that turns a query into an answer.
 //!
 //! The store is immutable once built, so it can be shared across every worker
 //! task behind an [`std::sync::Arc`] with no locking on the query path.
+//!
+//! # The shape, and why it is this shape
+//!
+//! Three flat `Box<[T]>` — nodes, RRsets, RDATA — plus a
+//! [`hashbrown::HashTable`] of node indices keyed on a per-zone-seeded,
+//! label-wise hash of the owner name. Three allocations for a whole zone, where
+//! the parallel `HashMap`/`HashSet` model this replaces cost roughly three per
+//! record: 128.0 MiB and 600,035 allocations for 100,000 records, because the
+//! owner name was stored once per **record** and every single-record set carried
+//! a `Vec` over-allocated to `Vec`'s minimum capacity of four.
+//!
+//! The arena is physically ordered by RFC 4034 §6.1 canonical DNS name order
+//! from the first commit, so node index order *is* canonical order and every
+//! ancestor precedes its descendants. **Nothing reads that order yet.** It is
+//! pinned now because its failure mode is invisible until DNSSEC signs a zone,
+//! at which point the NSEC chain does not close and every validating resolver
+//! SERVFAILs the whole zone.
+//!
+//! # What this module does NOT do yet
+//!
+//! This is S1 of the six commits VEGA-032 sequences, and S1 is
+//! **behaviour-preserving**: it changes the data structure and nothing else.
+//! Empty non-terminals are still NXDOMAIN (S2), a wildcard still applies below a
+//! name that exists rather than only under the closest encloser (S3), there is
+//! no delegation, glue or occlusion handling (S4), and SOA and apex NS are still
+//! optional (S5). `tests/arena_differential.rs` holds this file to a
+//! transcription of the implementation it replaced, with zero permitted
+//! transitions.
+//!
+//! Ruling: `.claude/backlog/decisions/VEGA-032-zone-data-model.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
+use std::hash::BuildHasher;
+use std::ops::Range;
 
 use anyhow::{bail, Context, Result};
+use hashbrown::HashTable;
 use hickory_proto::rr::{
     rdata::{NS, SOA},
     LowerName, Name, RData, Record, RecordType,
 };
 
 use crate::{
+    canonical::write_canonical_sort_key,
     config::{RecordSpec, SoaSpec, ZoneConfig},
     rdata::{self, ValueError},
 };
@@ -55,11 +90,7 @@ fn label_count(name: &LowerName) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// VEGA-032 S0 — the primitives the node arena is built and probed with.
-//
-// Landed ahead of their caller, per the ruling's §10.2 sequencing: the arena
-// that consumes them is S1. Nothing in `Zone` reads them yet, which is what the
-// `#[allow(dead_code)]` below records and what S1 removes.
+// VEGA-032 S0/S1 — the primitives the node arena is built and probed with.
 // ---------------------------------------------------------------------------
 
 /// Index into the node arena.
@@ -67,11 +98,9 @@ fn label_count(name: &LowerName) -> usize {
 /// A `u32` caps a zone at `u32::MAX - 1` nodes; the build fails with a named
 /// error rather than wrapping, because a wrapped index answers the wrong
 /// records and says nothing about it.
-#[allow(dead_code)] // Wired into `Node` at S1.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(crate) struct NodeIdx(u32);
 
-#[allow(dead_code)] // Wired into `Node` at S1.
 impl NodeIdx {
     /// The apex is always node 0: canonical order puts the shortest name in the
     /// zone first, and every other node in a zone is a descendant of the apex.
@@ -79,6 +108,10 @@ impl NodeIdx {
 
     /// "No delegation at or above this node". A sentinel rather than an
     /// `Option<NodeIdx>` so the field stays four bytes instead of eight.
+    // Read by `Node::cut`, which arrives with delegation at S4. Kept here rather
+    // than added then, because it is the other half of `APEX`'s contract that a
+    // `u32` index reserves two values and the build must never hand out either.
+    #[allow(dead_code)]
     pub(crate) const NONE: Self = Self(u32::MAX);
 
     /// The arena position, for slice access. Never `[]`: a range built at build
@@ -129,7 +162,6 @@ fn mix_label(state: u64, label: &[u8]) -> u64 {
 /// The root hashes to the seed itself, which is what makes
 /// [`SuffixHashes::at(0)`](SuffixHashes::at) meaningful and what lets a
 /// root-origin zone use the same arithmetic as every other.
-#[allow(dead_code)] // The index that keys on it is S1's.
 fn name_hash(seed: u64, name: &LowerName) -> u64 {
     let mut hash = seed;
     for label in name.iter().rev() {
@@ -155,7 +187,6 @@ fn name_hash(seed: u64, name: &LowerName) -> u64 {
 /// from [`MAX_LABELS`], which is not a tuning knob: a longer name cannot exist
 /// on the wire and hickory rejects one before it reaches us, pinned by
 /// `tests/canonical_order.rs::a_name_one_label_past_the_ceiling_is_rejected_before_it_reaches_the_zone`.
-#[allow(dead_code)] // The probe that reads it is S1's.
 struct SuffixHashes {
     /// `h[d]` hashes the `d` rightmost labels. Filled up to `min(labels,
     /// MAX_LABELS)`; entries past that are never read, because [`Self::at`]
@@ -167,7 +198,6 @@ struct SuffixHashes {
     labels: usize,
 }
 
-#[allow(dead_code)] // The probe that reads it is S1's.
 impl SuffixHashes {
     /// One reverse pass over `name`.
     ///
@@ -221,21 +251,166 @@ pub enum Answer {
     NxDomain,
 }
 
-/// Key for a record set.
-type RrKey = (LowerName, RecordType);
+/// The `*` label, RFC 4592 §2.1.1. A wildcard is a node whose leftmost label is
+/// this and nothing else; it is not an entry filed under its parent.
+const WILDCARD_LABEL: &[u8] = b"*";
+
+/// How much scratch to reserve per name for the build-time sort keys.
+///
+/// A key is one octet per label octet plus two per label, so a three-label name
+/// like `www.example.com.` is 24. Reserving is what keeps the one shared buffer
+/// to a handful of growths instead of a `realloc` per name; overshooting costs
+/// scratch that is freed before the zone is served.
+const TYPICAL_KEY_OCTETS: usize = 32;
+
+/// A half-open `(start, end)` range into one of the three arenas.
+///
+/// `u32` rather than `usize` because two of them plus a `RecordType` and a TTL
+/// is sixteen bytes per RRset, and the arena is the reason a 100,000-record zone
+/// fits in tens of megabytes instead of 128 MiB.
+type Span = (u32, u32);
+
+/// A [`Span`] as a slice range.
+///
+/// Never used to index with `[]`. Every caller feeds the result to
+/// `slice::get`, so a range the build got wrong is an empty answer rather than
+/// an abort — with `panic = "abort"` in release, one out-of-range index on the
+/// packet path is a full outage, and "the build made this range so it must be
+/// valid" is exactly the assumption the next refactor falsifies.
+fn span(range: Span) -> Range<usize> {
+    // A widening conversion on every platform this targets. `unwrap_or` rather
+    // than `unwrap` because nothing on a packet-reachable path may panic; the
+    // saturated values produce an empty range, hence an empty slice.
+    let start = usize::try_from(range.0).unwrap_or(usize::MAX);
+    let end = usize::try_from(range.1).unwrap_or(0);
+    start..end
+}
+
+/// What a node is, beyond its records.
+///
+/// Flags rather than a `NodeKind` enum, because the states are not mutually
+/// exclusive — the apex owns an NS RRset and is not a cut, a glue node sits
+/// below a cut and is also an ordinary node with an A RRset, and a node can be
+/// named `*.something` and hold no records at all. An enum either loses one of
+/// those combinations or grows into a bitfield with extra steps
+/// (VEGA-032 §3.2).
+///
+/// Bits 1 and 4 are reserved for `DELEGATION` and `GLUE`, which arrive with S4.
+/// They are not declared here: a flag nothing reads is a flag nobody maintains.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct NodeFlags(u8);
+
+impl NodeFlags {
+    /// No flags: an ordinary node.
+    const NONE: Self = Self(0);
+
+    /// The leftmost label is `*` (RFC 4592 §2.1.1), so this node is a source of
+    /// synthesis.
+    ///
+    /// **At S1 this also means "not an ordinary node".** The model it replaces
+    /// kept wildcards in a separate map, so a query for the literal name
+    /// `*.dev.example.com.` never matched an exact key and fell through to the
+    /// wildcard walk. [`Zone::exact_node`] therefore skips these, which
+    /// reproduces that exactly — including the case that makes the difference
+    /// observable, a wildcard holding a CNAME, where treating the node as
+    /// ordinary would substitute the CNAME for a query the old model answered
+    /// NODATA. S2 and S3 are where that changes, deliberately and with a ruling.
+    const WILDCARD: Self = Self(1 << 2);
+
+    /// A CNAME RRset is present, so the RFC 1034 §3.6.2 substitution has
+    /// something to find. Lets every other node skip a second type search.
+    const HAS_CNAME: Self = Self(1 << 3);
+
+    /// True when every bit of `other` is set here.
+    const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Set every bit of `other`.
+    fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+/// One RRset, or one TTL-homogeneous run of one.
+///
+/// RFC 2181 §5 says every record in an RRset shares a TTL and that they are
+/// atomic, so the TTL belongs here and not once per record — that移 alone is four
+/// bytes times every record in the zone.
+///
+/// **A run, not strictly an RRset, until S5.** Two `[[zone.records]]` blocks for
+/// one owner and type with different TTLs are merged today into a single set
+/// with mixed TTLs, which is the RFC 2181 §5 violation VEGA-061 pins and S5
+/// fixes. Until then the arena keeps them as consecutive runs of one type, in
+/// config order, so the answer is byte-identical to what the map model produced.
+/// `tests/properties.rs::an_rrset_never_mixes_ttls` stays red on purpose.
+#[derive(Debug)]
+struct Rrset {
+    /// RFC 1035 §3.2.2. Never `ANY`: §3.2.3 makes 255 a QTYPE, so it can never
+    /// be the type of a record and never a key here.
+    rtype: RecordType,
+    ttl: u32,
+    /// Half-open range into [`Zone::rdata`]. Config order is preserved, so
+    /// answers are deterministic across builds and reloads.
+    rdata: Span,
+}
+
+/// One name in the zone.
+///
+/// 96 bytes: an 80-byte `Name`, an 8-byte range, one byte of flags, padded.
+/// Measured, not computed — the ruling's §7.1 works from
+/// `size_of::<Name>() = 96` and `size_of::<RData>() = 168`, and hickory-proto
+/// 0.26.1 on this machine reports **80** and **184**. The two errors cancel and
+/// the ~303 B/record total stands; `tests/zone_memory.rs` prints all three on
+/// every run so a dependency bump that moves them is visible.
+#[derive(Debug)]
+struct Node {
+    /// The owner name, in the case the config wrote it, because that is the case
+    /// the map model echoed into every answer.
+    ///
+    /// The zone's only copy of it. Storing it once per **record** instead is
+    /// where most of the 1,342 bytes per record went.
+    name: Name,
+    /// Half-open range into [`Zone::rrsets`], ascending by numeric RRTYPE — so a
+    /// type lookup is a binary search, and so RFC 4034 §4.1.2's NSEC type bitmap
+    /// will want no second sort.
+    rrsets: Span,
+    flags: NodeFlags,
+}
 
 /// An immutable authoritative zone.
 #[derive(Debug)]
 pub struct Zone {
-    origin: Name,
+    /// The origin, lowercased. There is no second, case-preserving copy: node 0
+    /// **is** the apex, carrying the origin exactly as the config wrote it, so a
+    /// separate field would be a second source of truth for one name.
     lower_origin: LowerName,
     default_ttl: u32,
     soa: Option<Record>,
-    /// Exact-match record sets.
-    exact: HashMap<RrKey, Vec<Record>>,
-    /// Wildcard record sets, keyed by the name *below* which they apply. A
-    /// config entry of `*.dev` is stored under `dev.<origin>`.
-    wildcard: HashMap<RrKey, Vec<Record>>,
+
+    /// Nodes in RFC 4034 §6.1 canonical order. Node 0 is the apex, and every
+    /// ancestor precedes its descendants, because canonical order sorts on the
+    /// rightmost label first.
+    ///
+    /// **No empty non-terminals at S1.** A node exists here for each name the
+    /// config declares, plus the apex, and for nothing else — so `a.b.ent` alone
+    /// still leaves `b.ent` NXDOMAIN. Materialising the ancestors is S2, and it
+    /// is the property every later step rests on.
+    nodes: Box<[Node]>,
+    rrsets: Box<[Rrset]>,
+    rdata: Box<[RData]>,
+
+    /// Owner name to node index, keyed on [`name_hash`] and compared label-wise,
+    /// so a probe never materialises a key.
+    ///
+    /// Seeded per zone from `RandomState`, which the OS seeds once per process.
+    /// Mandatory, not decorative: the operator picks the keys in this table and
+    /// an attacker picks every probe, so with a fixed multiplier a family of
+    /// QNAMEs can be precomputed to land in one group and turn each probe into a
+    /// scan of it.
+    index: HashTable<u32>,
+    hash_seed: u64,
+
     /// Bit `d` is set when the zone holds at least one wildcard whose parent
     /// name has exactly `d` labels.
     ///
@@ -245,20 +420,15 @@ pub struct Zone {
     /// `base_name()` at a time was O(labels²), because `base_name` rebuilds and
     /// revalidates the whole remaining name: 174.7 µs of CPU for one 229-byte
     /// packet, against a 9.1 µs budget (VEGA-065).
-    wildcard_depths: u128,
-    /// Every name at which the zone holds at least one wildcard, whatever its
-    /// type — the *source of synthesis* of RFC 4592 §3.3.1, as a set.
     ///
-    /// `wildcard_depths` says a wildcard exists somewhere at depth `d`; this
-    /// says one exists at *this* parent. The walk needs both: the bitmap to
-    /// decide which depths are worth probing at all, this to decide whether the
-    /// probe landed on a source of synthesis. Deriving coverage from the bitmap
-    /// alone would make every name whose parent merely shares a depth with some
-    /// wildcard exist, which in a zone with an apex wildcard is very nearly
-    /// every name there is (VEGA-083, rejected alternative 5).
-    wildcard_parents: HashSet<LowerName>,
-    /// Every owner name that exists in the zone, used to tell NODATA from NXDOMAIN.
-    names: HashSet<LowerName>,
+    /// **Kept at S1, and subsumed at S3, not undone.** Once S2 closes the node
+    /// set under ancestry the set of populated depths is contiguous, so this
+    /// `u128` carries no information a `u8` pair does not and the bitmap becomes
+    /// `((1 << (max_depth + 1)) - 1) & !((1 << origin_depth) - 1)`. That is
+    /// VEGA-065's invariant made structural. Until then it is what keeps the
+    /// walk bounded, and it is recomputed here over wildcard *nodes*.
+    wildcard_depths: u128,
+
     /// Total number of records, for the `dns_zone_records` metric.
     record_count: usize,
 }
@@ -268,164 +438,58 @@ impl Zone {
     ///
     /// Record values are parsed in presentation format, the same syntax a zone
     /// file uses, so `MX` values look like `"10 mail.example.com."`.
+    ///
+    /// O(R + N log N): the log factor buys canonical order, which is the
+    /// prerequisite for DNSSEC's NSEC chain (RFC 4035 §2.3) and AXFR's
+    /// deterministic iteration (RFC 5936 §2.2). The sort runs on a precomputed
+    /// byte key rather than on `LowerName: Ord`, because each `Ord` comparison
+    /// is O(labels × octets) through two iterators and reload wall time is
+    /// already seconds on a million-record zone.
     pub fn from_config(cfg: &ZoneConfig) -> Result<Self> {
         let origin = parse_name(&cfg.origin)
             .with_context(|| format!("invalid zone origin {:?}", cfg.origin))?;
         let lower_origin = LowerName::from(origin.clone());
 
-        let mut zone = Self {
-            origin: origin.clone(),
-            lower_origin,
-            default_ttl: cfg.default_ttl,
-            soa: None,
-            exact: HashMap::new(),
-            wildcard: HashMap::new(),
-            wildcard_depths: 0,
-            wildcard_parents: HashSet::new(),
-            names: HashSet::new(),
-            record_count: 0,
+        // Built before the records, so a malformed `[zone.soa]` is reported
+        // ahead of a malformed record set — the order the previous model failed
+        // in, and an operator reading a reload failure reads the first line.
+        let soa = match &cfg.soa {
+            Some(spec) => Some(build_soa(&origin, spec)?),
+            None => None,
         };
 
-        if let Some(soa) = &cfg.soa {
-            zone.soa = Some(build_soa(&origin, soa)?);
+        let mut builder = ZoneBuilder::new(&origin, &lower_origin, cfg.default_ttl);
+        for spec in &cfg.records {
+            builder.insert_spec(spec)?;
         }
 
-        for spec in &cfg.records {
-            zone.insert_spec(spec)?;
-        }
+        let mut zone = builder.finish(soa)?;
 
         // An SOA declared as a plain record set wins over none at all, so pick it
         // up if the operator wrote `[[zone.records]] type = "SOA"` instead.
         if zone.soa.is_none() {
-            let key = (zone.lower_origin.clone(), RecordType::SOA);
-            zone.soa = zone.exact.get(&key).and_then(|rs| rs.first()).cloned();
+            zone.soa = zone.apex_soa();
         }
 
-        // The apex always exists, even in an empty zone, otherwise a bare
-        // `SOA <origin>` query would answer NXDOMAIN for our own zone.
-        zone.names.insert(zone.lower_origin.clone());
-
-        // Debug-only on purpose: the invariant is maintained structurally by
-        // `insert_spec`, and this scan is O(wildcards) on a path an operator
-        // pays for on every reload. It is here to fail a future writer who adds
-        // a second insertion point, at the moment they add it.
-        debug_assert!(
-            zone.wildcard.keys().all(|(owner, _)| {
-                let depth = label_count(owner);
-                depth <= MAX_LABELS
-                    && zone.wildcard_depths & (1u128 << depth) != 0
-                    && zone.wildcard_parents.contains(owner)
-            }),
-            "wildcard_depths or wildcard_parents is out of step with the wildcard map; a \
-             wildcard is unreachable, or a name it covers answers NXDOMAIN"
-        );
-
+        zone.debug_assert_invariants();
         Ok(zone)
     }
 
-    fn insert_spec(&mut self, spec: &RecordSpec) -> Result<()> {
-        let record_type: RecordType = spec
-            .record_type
-            .to_uppercase()
-            .parse()
-            .map_err(|e| anyhow::anyhow!("unknown record type {:?}: {e}", spec.record_type))?;
-
-        if spec.values.is_empty() {
-            bail!("record {:?} {} has no values", spec.name, spec.record_type);
-        }
-
-        let ttl = spec.ttl.unwrap_or(self.default_ttl);
-        let label = spec.name.trim();
-        let is_wildcard = label == "*" || label.starts_with("*.");
-
-        // For a wildcard we index under the parent name: `*.dev` -> `dev.<origin>`,
-        // and a bare `*` -> `<origin>`.
-        let owner_label = if is_wildcard {
-            label
-                .strip_prefix('*')
-                .unwrap_or("")
-                .trim_start_matches('.')
-        } else {
-            label
-        };
-        let owner = self.qualify(owner_label)?;
-
-        // The record's own name only matters for exact matches; wildcard answers
-        // are rewritten to the queried name at lookup time.
-        let mut records = Vec::with_capacity(spec.values.len());
-        for value in &spec.values {
-            // Through `rdata::parse_value` like `vega record add`, and for the
-            // same reason: hickory's lexer asserts past 4095 characters, so on
-            // this path — startup *and* every reload — an oversized value in an
-            // edited config is a crash loop, not a rejected reload. One gate,
-            // one bound, one message, whichever end the value came in through
-            // (VEGA-071).
-            let rdata = rdata::parse_value(record_type, &spec.name, value).map_err(|error| {
-                match error {
-                    // Reworded, not passed through: an operator reading this is
-                    // looking for one record set in a file that may hold
-                    // hundreds, so the value and the owner both have to be in
-                    // it. The length rule keeps `rdata`'s own wording, which is
-                    // what makes it read identically from the CLI.
-                    ValueError::Unparsable(e) => anyhow::anyhow!(
-                        "invalid {} record value {:?} for {:?}: {e}",
-                        spec.record_type,
-                        value,
-                        spec.name
-                    ),
-                    too_long @ ValueError::TooLong { .. } => anyhow::Error::new(too_long),
-                }
-            })?;
-            records.push(Record::from_rdata(owner.clone(), ttl, rdata));
-        }
-
-        self.record_count += records.len();
-        let lower = LowerName::from(owner);
-        let key = (lower.clone(), record_type);
-
-        if is_wildcard {
-            // Recorded here, in the one place that writes to `wildcard`, so
-            // neither index can drift out of step with the map it indexes. A
-            // missing bit is a configured wildcard answering NXDOMAIN with
-            // nothing in the log; a missing parent is every name that wildcard
-            // covers answering NXDOMAIN for the types it does not carry, which
-            // is the defect VEGA-083 fixed. Both are silent, so all three writes
-            // stay adjacent and `from_config`'s `debug_assert!` fails a future
-            // second insertion point at the moment it is added.
-            let depth = label_count(&lower);
-            // Unreachable — `qualify` builds this name through hickory, which
-            // enforces the 255-octet limit MAX_LABELS is derived from. A branch
-            // rather than an assumption, because `1u128 << 128` panics and this
-            // runs on the reload path. The parent set is written under the same
-            // condition as the bit, so a depth the walk can never probe can
-            // never claim coverage either.
-            if depth <= MAX_LABELS {
-                self.wildcard_depths |= 1u128 << depth;
-                self.wildcard_parents.insert(lower.clone());
-            }
-            self.wildcard.entry(key).or_default().extend(records);
-        } else {
-            self.names.insert(lower);
-            self.exact.entry(key).or_default().extend(records);
-        }
-        Ok(())
-    }
-
-    /// Turn a name relative to the origin into an absolute [`Name`].
-    fn qualify(&self, label: &str) -> Result<Name> {
-        let label = label.trim();
-        if label.is_empty() || label == "@" {
-            return Ok(self.origin.clone());
-        }
-        if label.ends_with('.') {
-            let name = parse_name(label)?;
-            if !self.lower_origin.zone_of(&LowerName::from(name.clone())) {
-                bail!("name {label:?} is not inside zone {}", self.origin);
-            }
-            return Ok(name);
-        }
-        Name::parse(label, Some(&self.origin))
-            .with_context(|| format!("invalid record name {label:?}"))
+    /// The SOA sitting at the apex as an ordinary record set, if there is one.
+    ///
+    /// The first record of the set, matching what the map model's
+    /// `rs.first().cloned()` returned.
+    fn apex_soa(&self) -> Option<Record> {
+        let hashes = SuffixHashes::new(self.hash_seed, &self.lower_origin);
+        let idx = self.exact_node(&self.lower_origin, &hashes)?;
+        let node = self.nodes.get(idx.get())?;
+        let first = self.rrsets_of(node, RecordType::SOA).first()?;
+        let value = self.rdata.get(span(first.rdata))?.first()?;
+        Some(Record::from_rdata(
+            node.name.clone(),
+            first.ttl,
+            value.clone(),
+        ))
     }
 
     /// The zone origin.
@@ -453,6 +517,95 @@ impl Zone {
         self.lower_origin.zone_of(name)
     }
 
+    // ----------------------------------------------------------- the probe
+
+    /// The node whose hash is `hash` and which satisfies `matches`.
+    ///
+    /// One table lookup and, only on a hash hit, one label-wise comparison.
+    /// Nothing is built, nothing is cloned, nothing is dropped — which is the
+    /// whole point: this replaces a `(LowerName, RecordType)` tuple key that had
+    /// to be materialised, hashed and thrown away on every probe.
+    fn probe(&self, hash: u64, matches: impl Fn(&Node) -> bool) -> Option<NodeIdx> {
+        let found = self.index.find(hash, |&i| {
+            usize::try_from(i)
+                .ok()
+                .and_then(|i| self.nodes.get(i))
+                .is_some_and(&matches)
+        })?;
+        Some(NodeIdx(*found))
+    }
+
+    /// The ordinary (non-wildcard) node at `name`, if the zone holds one.
+    ///
+    /// This is the arena's answer to both `exact.get(...)` and
+    /// `names.contains(...)` in the model it replaces: those two structures
+    /// agreed by construction, because every insertion wrote to both. Wildcards
+    /// were in neither, which is what [`NodeFlags::WILDCARD`] reproduces.
+    fn exact_node(&self, name: &LowerName, hashes: &SuffixHashes) -> Option<NodeIdx> {
+        let depth = hashes.labels();
+        let hash = hashes.at(depth)?;
+        self.probe(hash, |node| {
+            !node.flags.contains(NodeFlags::WILDCARD)
+                && node_name_matches(&node.name, name, depth, false)
+        })
+    }
+
+    /// The source of synthesis `*.<the `depth` rightmost labels of `name`>`,
+    /// if the zone holds one (RFC 4592 §3.3.1).
+    ///
+    /// One probe, at one hash: `h[depth]` already hashes the parent, and folding
+    /// the `*` label into it costs a multiply. No name is materialised, which is
+    /// the allocation VEGA-065 declared as its residual cost.
+    fn wildcard_node(
+        &self,
+        name: &LowerName,
+        depth: usize,
+        hashes: &SuffixHashes,
+    ) -> Option<NodeIdx> {
+        let hash = mix_label(hashes.at(depth)?, WILDCARD_LABEL);
+        self.probe(hash, |node| {
+            node.flags.contains(NodeFlags::WILDCARD)
+                && node_name_matches(&node.name, name, depth, true)
+        })
+    }
+
+    /// The RRsets of `rtype` at `node`, as a contiguous slice.
+    ///
+    /// A slice rather than a single RRset because two config blocks for one
+    /// owner and type with different TTLs are still merged into one answer until
+    /// S5 (see [`Rrset`]). Two `partition_point`s rather than one
+    /// `binary_search`, so the run is found whole and in order however long it
+    /// is. Both are O(log T) and bounded by the node's own RRset count.
+    fn rrsets_of(&self, node: &Node, rtype: RecordType) -> &[Rrset] {
+        let Some(all) = self.rrsets.get(span(node.rrsets)) else {
+            return &[];
+        };
+        let want = u16::from(rtype);
+        let lo = all.partition_point(|r| u16::from(r.rtype) < want);
+        let hi = all.partition_point(|r| u16::from(r.rtype) <= want);
+        all.get(lo..hi).unwrap_or(&[])
+    }
+
+    /// Copy every record of `run` into `out`, owned by `owner`.
+    ///
+    /// `reserve_exact` from a length the arena already knows. The model this
+    /// replaces collected with no size hint at all, so a one-record answer came
+    /// back in a `Vec` of capacity four — 816 wasted bytes on every query on the
+    /// hot path (VEGA-066).
+    fn emit(&self, run: &[Rrset], owner: &Name, out: &mut Vec<Record>) {
+        out.reserve_exact(run.iter().map(|r| span(r.rdata).len()).sum());
+        for rrset in run {
+            let Some(values) = self.rdata.get(span(rrset.rdata)) else {
+                continue;
+            };
+            for value in values {
+                out.push(Record::from_rdata(owner.clone(), rrset.ttl, value.clone()));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- the lookup
+
     /// True when a query for `name` must be answered NOERROR rather than
     /// NXDOMAIN.
     ///
@@ -470,13 +623,21 @@ impl Zone {
     /// not; two callers believed the name and a wildcard-covered name answered
     /// NXDOMAIN for every type the wildcard did not carry (VEGA-083).
     ///
-    /// O(1) on a zone with no wildcards — `names.contains`, then an empty
-    /// probe mask and no probes at all.
+    /// O(1) on a zone with no wildcards — one probe, then an empty probe mask
+    /// and no probes at all.
     pub fn exists(&self, name: &LowerName) -> bool {
+        let hashes = SuffixHashes::new(self.hash_seed, name);
+        self.exists_hashed(name, &hashes)
+    }
+
+    /// [`Zone::exists`] against a suffix hash the caller has already paid for.
+    fn exists_hashed(&self, name: &LowerName, hashes: &SuffixHashes) -> bool {
         // RFC 1035 §3.2.3: ANY is a QTYPE and never an RRTYPE, so it can never
-        // key `wildcard`. The typed half of the probe therefore always misses
-        // and only the coverage bit comes back — which is the half wanted here.
-        self.names.contains(name) || self.wildcard_probe(name, RecordType::ANY).1
+        // be the type of an RRset. The typed half of the probe therefore always
+        // misses and only the coverage bit comes back — which is the half wanted
+        // here.
+        self.exact_node(name, hashes).is_some()
+            || self.wildcard_probe(name, hashes, RecordType::ANY).1
     }
 
     /// Resolve `name`/`record_type` against the zone.
@@ -503,8 +664,14 @@ impl Zone {
             return Resolution::NxDomain;
         }
 
+        // One reverse pass over the query name, before any probe. Every depth
+        // this lookup will ask about is answered out of the stack from here on.
+        // Recomputed per CNAME hop because the name changes, and that recursion
+        // is bounded by MAX_CNAME_DEPTH.
+        let hashes = SuffixHashes::new(self.hash_seed, name);
+
         // RFC 1035 §3.2.3: ANY (255) is a QTYPE, never an RRTYPE, so it can
-        // never be a key in `exact` or `wildcard`. RFC 8482 makes *what* to
+        // never be the type of an RRset in the arena. RFC 8482 makes *what* to
         // answer for it a responder policy, and that policy lives in
         // `DnsHandler`; the zone layer reports existence and nothing else.
         //
@@ -512,58 +679,61 @@ impl Zone {
         // 100k-record zone — 18,239x an A lookup, and one routing change away
         // from the packet path — and which carried the same existence defect at
         // its NXDOMAIN arm (VEGA-083 §4.4). Reporting existence is the only
-        // bounded answer: making the scan wildcard-aware makes it slower still,
-        // and making it fast needs the owner-major re-key that is VEGA-032's.
+        // bounded answer, and it stays bounded now that a node arena exists:
+        // "iterate the nodes" is a very natural thing to reach for and would put
+        // the O(zone) scan straight back.
         //
         // A caller that reads `NoData` here as "the node is empty" is wrong.
-        // AXFR (VEGA-032) needs ordered node iteration and will not get it from
+        // AXFR (VEGA-034) needs ordered node iteration and will not get it from
         // this function, so do not reintroduce the scan to serve a transfer.
         if record_type.is_any() {
-            return if self.exists(name) {
+            return if self.exists_hashed(name, &hashes) {
                 Resolution::NoData
             } else {
                 Resolution::NxDomain
             };
         }
 
-        if let Some(records) = self.exact.get(&(name.clone(), record_type)) {
-            out.extend(records.iter().cloned());
-            return Resolution::Found;
-        }
-
-        // RFC 1034 §3.6.2: a CNAME at the owner name answers queries for any
-        // other type, and the target is chased if it lives in this zone.
-        if record_type != RecordType::CNAME {
-            if let Some(cnames) = self.exact.get(&(name.clone(), RecordType::CNAME)) {
-                out.extend(cnames.iter().cloned());
-                if depth >= MAX_CNAME_DEPTH {
-                    tracing::warn!(%name, "CNAME chain too long, truncating");
+        if let Some(idx) = self.exact_node(name, &hashes) {
+            if let Some(node) = self.nodes.get(idx.get()) {
+                let run = self.rrsets_of(node, record_type);
+                if !run.is_empty() {
+                    self.emit(run, &node.name, out);
                     return Resolution::Found;
                 }
-                if let Some(RData::CNAME(target)) = cnames.first().map(|r| &r.data) {
-                    let target = LowerName::from(target.0.clone());
-                    if self.contains(&target) {
-                        // A dangling in-zone target still yields the CNAME itself.
-                        let _ = self.resolve(&target, record_type, depth + 1, out);
+
+                // RFC 1034 §3.6.2: a CNAME at the owner name answers queries for
+                // any other type, and the target is chased if it lives in this
+                // zone.
+                if record_type != RecordType::CNAME && node.flags.contains(NodeFlags::HAS_CNAME) {
+                    let cnames = self.rrsets_of(node, RecordType::CNAME);
+                    if !cnames.is_empty() {
+                        self.emit(cnames, &node.name, out);
+                        if depth >= MAX_CNAME_DEPTH {
+                            tracing::warn!(%name, "CNAME chain too long, truncating");
+                            return Resolution::Found;
+                        }
+                        if let Some(RData::CNAME(target)) = self.first_value(cnames) {
+                            let target = LowerName::from(target.0.clone());
+                            if self.contains(&target) {
+                                // A dangling in-zone target still yields the
+                                // CNAME itself.
+                                let _ = self.resolve(&target, record_type, depth + 1, out);
+                            }
+                        }
+                        return Resolution::Found;
                     }
                 }
-                return Resolution::Found;
+
+                return Resolution::NoData;
             }
         }
 
-        if self.names.contains(name) {
-            return Resolution::NoData;
-        }
-
         // Wildcards only apply when the queried name itself does not exist.
-        let (records, covered) = self.wildcard_probe(name, record_type);
-        if let Some(records) = records {
+        let (run, covered) = self.wildcard_probe(name, &hashes, record_type);
+        if !run.is_empty() {
             let qname = Name::from(name.clone());
-            out.extend(
-                records
-                    .iter()
-                    .map(|r| Record::from_rdata(qname.clone(), r.ttl, r.data.clone())),
-            );
+            self.emit(run, &qname, out);
             return Resolution::Found;
         }
 
@@ -584,9 +754,14 @@ impl Zone {
         }
     }
 
+    /// The first RDATA of `run`, for reading a CNAME's target.
+    fn first_value(&self, run: &[Rrset]) -> Option<&RData> {
+        self.rdata.get(span(run.first()?.rdata))?.first()
+    }
+
     /// Walk the wildcard depths for `name`, deepest set bit first.
     ///
-    /// Returns the RRset to synthesise from, when the zone holds one of
+    /// Returns the RRsets to synthesise from, when the zone holds one of
     /// `record_type` at a source of synthesis for `name`, **and** whether any
     /// source of synthesis for `name` exists at all.
     ///
@@ -596,11 +771,20 @@ impl Zone {
     /// through here so the two determinations cannot drift apart and start
     /// returning a QTYPE-dependent rcode again.
     ///
+    /// Coverage is decided by finding the `*` node itself, never by the depth
+    /// bitmap. The bitmap says a wildcard exists *somewhere* at depth `d`, not
+    /// at *this* parent, and deriving coverage from it makes every name whose
+    /// parent merely shares a depth with some wildcard exist — which in a zone
+    /// with an apex wildcard is very nearly every name there is (VEGA-083,
+    /// rejected alternative 5).
+    ///
     /// Deepest set bit first, so the closest wildcard answers — the same order
     /// the old `base_name()` climb produced, and what
     /// `the_deepest_wildcard_wins_when_several_could_match` pins. Every depth
-    /// skipped is a depth at which no key can exist, because equal names have
-    /// equal label counts, so dropping it cannot lose a hit.
+    /// skipped is a depth at which no node can exist, because equal names have
+    /// equal label counts, so dropping it cannot lose a hit. (Deepest-wins is
+    /// **not** RFC 4592 §3.3.1's closest-encloser rule. That is VEGA-009's, and
+    /// it is S3's; S1 preserves today's answer byte for byte.)
     ///
     /// `mask` strictly loses a bit each pass, so termination is structural
     /// rather than a counter that has to be checked against a floor. That
@@ -609,8 +793,9 @@ impl Zone {
     fn wildcard_probe(
         &self,
         name: &LowerName,
+        hashes: &SuffixHashes,
         record_type: RecordType,
-    ) -> (Option<&[Record]>, bool) {
+    ) -> (&[Rrset], bool) {
         let mut mask = self.wildcard_depths & self.wildcard_window(name);
         let mut covered = false;
         while mask != 0 {
@@ -619,22 +804,13 @@ impl Zone {
             let depth = (u128::BITS - 1 - mask.leading_zeros()) as usize;
             mask &= !(1u128 << depth);
 
-            let parent = LowerName::from(name.trim_to(depth));
-            // Coverage first, and it takes `parent` by reference: where nothing
-            // covers the name this skips building and hashing the `(name, type)`
-            // tuple key at all. That is the deliberate trade, and it is priced:
-            // an uncovered name — the shape an attacker picks, because it is the
-            // one they can generate without knowing the zone — measured flat to
-            // slightly faster (263 ns -> 253 ns, best of 5x20k, release,
-            // 100k-record zone), while a *covered* name pays one extra hash of
-            // the parent and measured ~+45 ns. Ordering the tuple probe first
-            // would move the cost onto the attacker's path instead, which is the
-            // wrong way round. Removing it entirely needs the owner-major re-key
-            // that is VEGA-032's (VEGA-083, rejected alternative 6).
-            if self.wildcard_parents.contains(&parent) {
+            if let Some(idx) = self.wildcard_node(name, depth, hashes) {
                 covered = true;
-                if let Some(records) = self.wildcard.get(&(parent, record_type)) {
-                    return (Some(records), true);
+                if let Some(node) = self.nodes.get(idx.get()) {
+                    let run = self.rrsets_of(node, record_type);
+                    if !run.is_empty() {
+                        return (run, true);
+                    }
                 }
             }
         }
@@ -642,15 +818,15 @@ impl Zone {
         // stay exactly what it is today (deepest type match). Stopping at the
         // deepest wildcard *parent* would be a half-step towards RFC 4592
         // §3.3.1 closest-encloser semantics, which is VEGA-009's, not this.
-        (None, covered)
+        (&[], covered)
     }
 
     /// The depths at which a wildcard parent of `name` could possibly sit.
     ///
     /// Bounded above by the depth of `name`'s immediate parent, because a
     /// wildcard's parent is a *proper* ancestor of the names it covers (RFC
-    /// 4592 §3.3.1), and below by the origin's depth, because [`Zone::qualify`]
-    /// refuses to build a key outside the zone — anything shallower is a
+    /// 4592 §3.3.1), and below by the origin's depth, because [`ZoneBuilder::qualify`]
+    /// refuses to build a name outside the zone — anything shallower is a
     /// guaranteed miss. Empty when `name` sits at or above the origin.
     fn wildcard_window(&self, name: &LowerName) -> u128 {
         let start = label_count(name).saturating_sub(1).min(MAX_LABELS);
@@ -669,6 +845,436 @@ impl Zone {
         };
         hi & !((1u128 << floor) - 1)
     }
+
+    // ------------------------------------------------------- the invariants
+
+    /// The structural facts the arena is built to hold, checked in debug builds.
+    ///
+    /// Every one is maintained by construction, which is exactly why they are
+    /// asserted: each is here to fail a future writer at the moment they add a
+    /// second write site, the discipline VEGA-065 established for
+    /// `wildcard_depths` and VEGA-083 extended to wildcard coverage. Debug-only
+    /// because this is O(N) on a path an operator pays for on every reload.
+    fn debug_assert_invariants(&self) {
+        debug_assert!(
+            self.nodes
+                .get(NodeIdx::APEX.get())
+                .is_some_and(|n| LowerName::from(n.name.clone()) == self.lower_origin),
+            "node 0 is not the apex; canonical order puts the shortest name in \
+             the zone first and NodeIdx::APEX reads that as given"
+        );
+        debug_assert!(
+            self.nodes
+                .windows(2)
+                .all(|pair| LowerName::from(pair[0].name.clone())
+                    < LowerName::from(pair[1].name.clone())),
+            "the arena is not in strictly increasing RFC 4034 §6.1 canonical \
+             order. Nothing reads that order yet; the first reader is the NSEC \
+             chain, and a chain that does not close SERVFAILs the whole zone"
+        );
+        debug_assert!(
+            self.index.len() == self.nodes.len(),
+            "the index and the arena hold different numbers of entries; some \
+             configured record is unreachable and nothing says so"
+        );
+        debug_assert!(
+            self.nodes.iter().all(|node| {
+                let all = self.rrsets.get(span(node.rrsets));
+                all.is_some_and(|rrsets| {
+                    rrsets
+                        .windows(2)
+                        .all(|p| u16::from(p[0].rtype) <= u16::from(p[1].rtype))
+                        && rrsets
+                            .iter()
+                            .all(|r| self.rdata.get(span(r.rdata)).is_some_and(|v| !v.is_empty()))
+                })
+            }),
+            "an RRset range is out of bounds, out of type order, or empty; the \
+             type search is a binary search and reads the order as given"
+        );
+        debug_assert!(
+            self.nodes.iter().all(|node| {
+                !node.flags.contains(NodeFlags::WILDCARD) || {
+                    let depth = label_count(&LowerName::from(node.name.clone()));
+                    depth >= 1
+                        && depth - 1 <= MAX_LABELS
+                        && self.wildcard_depths & (1u128 << (depth - 1)) != 0
+                }
+            }),
+            "wildcard_depths is out of step with the wildcard nodes; a wildcard \
+             is unreachable, or a name it covers answers NXDOMAIN"
+        );
+    }
+}
+
+/// True when `node_name` is exactly the `depth` rightmost labels of `qname`,
+/// with a leading `*` label when `star`.
+///
+/// The comparison a hash hit is confirmed with. No name is materialised on
+/// either side: both are walked label by label from the right, which is also the
+/// order RFC 4034 §6.1 compares in.
+///
+/// Case-insensitive per RFC 4343 §2, even though `LowerName` guarantees its own
+/// side is folded — the node's name is stored in the case the config wrote it,
+/// because that is the case the model this replaces echoed into every answer.
+///
+/// Bounded by `depth`, which the caller has already clamped to the query name's
+/// own label count.
+fn node_name_matches(node_name: &Name, qname: &LowerName, depth: usize, star: bool) -> bool {
+    if node_name.iter().len() != depth + usize::from(star) {
+        return false;
+    }
+    let mut node_labels = node_name.iter().rev();
+    let mut query_labels = qname.iter().rev();
+    for _ in 0..depth {
+        match (node_labels.next(), query_labels.next()) {
+            (Some(left), Some(right)) if left.eq_ignore_ascii_case(right) => {}
+            _ => return false,
+        }
+    }
+    !star || node_labels.next() == Some(WILDCARD_LABEL)
+}
+
+// ---------------------------------------------------------------------------
+// The build
+// ---------------------------------------------------------------------------
+
+/// One node under construction, before the arena is laid out.
+struct ScratchNode {
+    name: Name,
+    wildcard: bool,
+    /// RRsets in config order. Sorted by numeric RRTYPE on the way into the
+    /// arena, with a **stable** sort, so that the order two blocks of one type
+    /// were declared in survives.
+    rrsets: Vec<ScratchRrset>,
+}
+
+/// One RRset, or one TTL-homogeneous run of one, under construction.
+struct ScratchRrset {
+    rtype: RecordType,
+    ttl: u32,
+    rdata: Vec<RData>,
+}
+
+/// Turns a validated config into the three arenas.
+///
+/// A scratch `HashMap` keyed by lowercased owner name, because the config
+/// arrives in whatever order the operator wrote it and the arena has to come out
+/// canonically sorted. Everything here is dropped once the arenas are built.
+struct ZoneBuilder<'a> {
+    origin: &'a Name,
+    lower_origin: &'a LowerName,
+    default_ttl: u32,
+    nodes: HashMap<LowerName, ScratchNode>,
+    record_count: usize,
+    wildcard_depths: u128,
+}
+
+impl<'a> ZoneBuilder<'a> {
+    fn new(origin: &'a Name, lower_origin: &'a LowerName, default_ttl: u32) -> Self {
+        Self {
+            origin,
+            lower_origin,
+            default_ttl,
+            nodes: HashMap::new(),
+            record_count: 0,
+            wildcard_depths: 0,
+        }
+    }
+
+    fn insert_spec(&mut self, spec: &RecordSpec) -> Result<()> {
+        let record_type: RecordType = spec
+            .record_type
+            .to_uppercase()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("unknown record type {:?}: {e}", spec.record_type))?;
+
+        if spec.values.is_empty() {
+            bail!("record {:?} {} has no values", spec.name, spec.record_type);
+        }
+
+        let ttl = spec.ttl.unwrap_or(self.default_ttl);
+        let label = spec.name.trim();
+        let is_wildcard = label == "*" || label.starts_with("*.");
+
+        // A wildcard's name is `*` prepended to whatever follows the asterisk:
+        // `*.dev` under `example.com.` is the node `*.dev.example.com.`
+        // (RFC 4592 §2.1.1). Only the leftmost asterisk is stripped, because
+        // §2.1.3 deleted RFC 1035's "should not contain other `*` labels" and a
+        // wildcard may have subdomains.
+        let owner_label = if is_wildcard {
+            label
+                .strip_prefix('*')
+                .unwrap_or("")
+                .trim_start_matches('.')
+        } else {
+            label
+        };
+        let owner = self.qualify(owner_label)?;
+
+        let mut rdata = Vec::with_capacity(spec.values.len());
+        for value in &spec.values {
+            // Through `rdata::parse_value` like `vega record add`, and for the
+            // same reason: hickory's lexer asserts past 4095 characters, so on
+            // this path — startup *and* every reload — an oversized value in an
+            // edited config is a crash loop, not a rejected reload. One gate,
+            // one bound, one message, whichever end the value came in through
+            // (VEGA-071).
+            let parsed = rdata::parse_value(record_type, &spec.name, value).map_err(|error| {
+                match error {
+                    // Reworded, not passed through: an operator reading this is
+                    // looking for one record set in a file that may hold
+                    // hundreds, so the value and the owner both have to be in
+                    // it. The length rule keeps `rdata`'s own wording, which is
+                    // what makes it read identically from the CLI.
+                    ValueError::Unparsable(e) => anyhow::anyhow!(
+                        "invalid {} record value {:?} for {:?}: {e}",
+                        spec.record_type,
+                        value,
+                        spec.name
+                    ),
+                    too_long @ ValueError::TooLong { .. } => anyhow::Error::new(too_long),
+                }
+            })?;
+            rdata.push(parsed);
+        }
+
+        self.record_count += rdata.len();
+
+        let node_name = if is_wildcard {
+            // Recorded from the *parent's* depth, which is the index space the
+            // walk probes in, and recorded before the node is built so that the
+            // one case below where no node can exist still registers. A missing
+            // bit is a configured wildcard answering NXDOMAIN with nothing in
+            // the log.
+            let depth = label_count(&LowerName::from(owner.clone()));
+            // Unreachable — `qualify` builds this name through hickory, which
+            // enforces the 255-octet limit MAX_LABELS is derived from. A branch
+            // rather than an assumption, because `1u128 << 128` panics and this
+            // runs on the reload path.
+            if depth <= MAX_LABELS {
+                self.wildcard_depths |= 1u128 << depth;
+            }
+            // A wildcard can fail to have a representable owner name of its
+            // own: RFC 1035 §2.3.4 caps a name at 255 octets, and a parent
+            // within two of that ceiling leaves no room for the `*`. By the
+            // same arithmetic such a wildcard covers no representable name
+            // either — every name it could match carries at least one more
+            // label, which costs at least two more octets — so there is nothing
+            // for a node here to answer, and the model this replaces could not
+            // answer from it either: its probe window stops at the query's
+            // parent depth, which can never reach this parent's own. The depth
+            // bit above is still recorded and the records are still counted,
+            // because both are observable and neither needs the node.
+            let Ok(name) = owner.prepend_label("*") else {
+                tracing::warn!(
+                    record = %spec.name,
+                    "wildcard owner name exceeds the 255-octet limit of RFC 1035 §2.3.4; \
+                     it can match no name the wire can carry and is not served"
+                );
+                return Ok(());
+            };
+            name
+        } else {
+            owner
+        };
+
+        let key = LowerName::from(node_name.clone());
+        let node = self.nodes.entry(key).or_insert_with(|| ScratchNode {
+            name: node_name,
+            wildcard: is_wildcard,
+            rrsets: Vec::new(),
+        });
+        debug_assert_eq!(
+            node.wildcard, is_wildcard,
+            "one owner name reached the arena as both a wildcard and an ordinary \
+             node; the two are answered from different branches and only one of \
+             them would win"
+        );
+
+        // Append to the most recent run of this type when the TTLs agree, and
+        // start a new run when they do not. The map model merged every block for
+        // one owner and type into a single `Vec` in config order, TTLs and all
+        // (RFC 2181 §5 says it should not — that is VEGA-061 and S5's), so runs
+        // are what reproduce the answer exactly without storing a TTL per record.
+        let mut appended = false;
+        if let Some(i) = node.rrsets.iter().rposition(|r| r.rtype == record_type) {
+            if let Some(run) = node.rrsets.get_mut(i) {
+                if run.ttl == ttl {
+                    run.rdata.append(&mut rdata);
+                    appended = true;
+                }
+            }
+        }
+        if !appended {
+            node.rrsets.push(ScratchRrset {
+                rtype: record_type,
+                ttl,
+                rdata,
+            });
+        }
+        Ok(())
+    }
+
+    /// Turn a name relative to the origin into an absolute [`Name`].
+    fn qualify(&self, label: &str) -> Result<Name> {
+        let label = label.trim();
+        if label.is_empty() || label == "@" {
+            return Ok(self.origin.clone());
+        }
+        if label.ends_with('.') {
+            let name = parse_name(label)?;
+            if !self.lower_origin.zone_of(&LowerName::from(name.clone())) {
+                bail!("name {label:?} is not inside zone {}", self.origin);
+            }
+            return Ok(name);
+        }
+        Name::parse(label, Some(self.origin))
+            .with_context(|| format!("invalid record name {label:?}"))
+    }
+
+    /// Lay the scratch map out as three exactly-sized arenas plus an index.
+    fn finish(mut self, soa: Option<Record>) -> Result<Zone> {
+        let origin = self.origin.clone();
+        let lower_origin = self.lower_origin.clone();
+        let default_ttl = self.default_ttl;
+
+        // The apex always exists, even in an empty zone, otherwise a bare
+        // `SOA <origin>` query would answer NXDOMAIN for our own zone.
+        self.nodes
+            .entry(lower_origin.clone())
+            .or_insert_with(|| ScratchNode {
+                name: origin.clone(),
+                wildcard: false,
+                rrsets: Vec::new(),
+            });
+
+        let entries: Vec<(LowerName, ScratchNode)> = self.nodes.into_iter().collect();
+
+        let rrset_total: usize = entries.iter().map(|(_, n)| n.rrsets.len()).sum();
+        let rdata_total: usize = entries
+            .iter()
+            .flat_map(|(_, n)| n.rrsets.iter())
+            .map(|r| r.rdata.len())
+            .sum();
+
+        // Sorted by a precomputed byte key, not by `LowerName: Ord`. Each `Ord`
+        // comparison is O(labels × octets) through two iterators, which at
+        // 100,000 names is hundreds of milliseconds on every reload; the key is
+        // a `memcmp`. Correctness still rests on `Ord`, which is what
+        // `debug_assert_invariants` and `tests/canonical_order.rs` hold it to.
+        //
+        // Every key goes into **one** scratch buffer and what gets sorted is a
+        // permutation of indices, so the sort costs three allocations rather
+        // than one per name. `sort_by_cached_key` would be 100,000 allocations
+        // and 100,000 frees on the reload path, and VEGA-069 measured RSS
+        // ratcheting 1,736 -> 2,676 -> 3,095 MiB across three reloads on exactly
+        // that kind of churn. The buffer is dropped with the permutation.
+        let mut keys: Vec<u8> = Vec::with_capacity(entries.len() * TYPICAL_KEY_OCTETS);
+        let mut key_spans: Vec<Span> = Vec::with_capacity(entries.len());
+        for (lower, _) in &entries {
+            let start = arena_offset(keys.len())?;
+            write_canonical_sort_key(lower, &mut keys);
+            key_spans.push((start, arena_offset(keys.len())?));
+        }
+        let key_of = |i: usize| -> &[u8] {
+            key_spans
+                .get(i)
+                .and_then(|&s| keys.get(span(s)))
+                .unwrap_or_default()
+        };
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        // Unstable is safe: no two nodes share a key. Equal keys mean equal
+        // names under RFC 4034 §6.1, and the scratch map is keyed by exactly
+        // that equivalence, so a duplicate cannot have survived to here.
+        order.sort_unstable_by(|&a, &b| key_of(a).cmp(key_of(b)));
+
+        let mut slots: Vec<Option<(LowerName, ScratchNode)>> =
+            entries.into_iter().map(Some).collect();
+
+        let mut nodes = Vec::with_capacity(slots.len());
+        let mut rrsets = Vec::with_capacity(rrset_total);
+        let mut rdata = Vec::with_capacity(rdata_total);
+        let mut hashes = Vec::with_capacity(slots.len());
+
+        let hash_seed = RandomState::new().hash_one(0u64);
+
+        for position in order {
+            let Some((lower, mut scratch)) = slots.get_mut(position).and_then(Option::take) else {
+                continue;
+            };
+            // Stable, so two runs of one type stay in the order the config
+            // declared them.
+            scratch.rrsets.sort_by_key(|r| u16::from(r.rtype));
+
+            let rrsets_start = arena_offset(rrsets.len())?;
+            let mut flags = NodeFlags::NONE;
+            if scratch.wildcard {
+                flags.insert(NodeFlags::WILDCARD);
+            }
+            for run in scratch.rrsets {
+                if run.rtype == RecordType::CNAME {
+                    flags.insert(NodeFlags::HAS_CNAME);
+                }
+                let rdata_start = arena_offset(rdata.len())?;
+                rdata.extend(run.rdata);
+                let rdata_end = arena_offset(rdata.len())?;
+                rrsets.push(Rrset {
+                    rtype: run.rtype,
+                    ttl: run.ttl,
+                    rdata: (rdata_start, rdata_end),
+                });
+            }
+            let rrsets_end = arena_offset(rrsets.len())?;
+
+            hashes.push(name_hash(hash_seed, &lower));
+            nodes.push(Node {
+                name: scratch.name,
+                rrsets: (rrsets_start, rrsets_end),
+                flags,
+            });
+        }
+
+        // Sized exactly, so no insertion resizes and the hasher below is never
+        // called — it is required by the signature, not by the work.
+        let mut index = HashTable::with_capacity(nodes.len());
+        for (i, &hash) in hashes.iter().enumerate() {
+            index.insert_unique(hash, arena_offset(i)?, |&other| {
+                usize::try_from(other)
+                    .ok()
+                    .and_then(|o| hashes.get(o))
+                    .copied()
+                    .unwrap_or(hash)
+            });
+        }
+
+        Ok(Zone {
+            lower_origin,
+            default_ttl,
+            soa,
+            nodes: nodes.into_boxed_slice(),
+            rrsets: rrsets.into_boxed_slice(),
+            rdata: rdata.into_boxed_slice(),
+            index,
+            hash_seed,
+            wildcard_depths: self.wildcard_depths,
+            record_count: self.record_count,
+        })
+    }
+}
+
+/// An arena offset as a `u32`, or a named build error.
+///
+/// A `u32` caps each arena at `u32::MAX` entries. A zone that large fails to
+/// build rather than wrapping an index, because a wrapped index answers the
+/// wrong records and says nothing about it.
+fn arena_offset(len: usize) -> Result<u32> {
+    u32::try_from(len).with_context(|| {
+        format!(
+            "zone is too large for this data model: an arena reached {len} \
+             entries and indices are 32-bit. Split the zone"
+        )
+    })
 }
 
 /// Internal three-way result of [`Zone::resolve`].
@@ -1675,7 +2281,7 @@ mod tests {
     ///
     /// Scenario: The deepest name the wire can carry is 127 labels, and it is
     /// answered
-    /// features/zone-data-model.feature:455
+    /// features/zone-data-model.feature:469
     #[test]
     fn the_true_deepest_name_the_wire_can_carry_is_127_labels_and_is_answered() {
         // CORRECTS a boundary the rest of this module gets wrong. `deep_name`
@@ -2051,10 +2657,10 @@ mod tests {
 
     /// Scenario: A name of maximum-length labels is answered rather than
     /// mis-indexed
-    /// features/zone-data-model.feature:215
+    /// features/zone-data-model.feature:223
     ///
     /// Scenario: A query name at exactly 255 octets is answered
-    /// features/zone-data-model.feature:465
+    /// features/zone-data-model.feature:479
     ///
     /// RFC 1035 §2.3.4 gives two independent limits — 63 octets per label and
     /// 255 octets per name — and every depth test in this tree exercises only
@@ -2111,7 +2717,7 @@ mod tests {
 
     /// Scenario: A zone holding nothing but its apex answers every shape without
     /// panicking
-    /// features/zone-data-model.feature:414
+    /// features/zone-data-model.feature:428
     ///
     /// The smallest arena that can exist: one node, no RRsets, no wildcards, and
     /// an empty bucket for every probe. Every branch of the lookup is reachable
@@ -2169,6 +2775,273 @@ mod tests {
         // find runs its full window.
         assert_eq!(z.lookup(&deep_name(123), RecordType::A), Answer::NxDomain);
         assert_eq!(z.record_count(), 0);
+    }
+
+    // -------------------------------------------------- S1: the arena
+    //
+    // AC-1.4 and AC-1.5. Nothing consumes the arena's ordering at S1, which is
+    // precisely why it is asserted at S1: the first consumer is the NSEC chain,
+    // and a chain that does not close SERVFAILs the entire zone at every
+    // validating resolver — a failure that is invisible until it is total.
+    // §10.1 keeps `Node`, `NodeIdx` and the arenas `pub(crate)`, so these
+    // cannot be integration tests.
+
+    /// A zone whose owner names are RFC 4034 §6.1's example vector, as far as
+    /// the config surface can express it.
+    ///
+    /// The RFC's `\001.z.example` and `\200.z.example` go in through raw label
+    /// octets, which `[[zone.records]]` has no syntax for — hickory's `FromStr`
+    /// rejects `\001` as a malformed label. `tests/canonical_order.rs` puts all
+    /// nine through the key directly; what is exercised here is that the arena
+    /// is physically sorted by it, which the six writable names establish.
+    /// `*.z` is among them, so a wildcard node's position is pinned too.
+    fn rfc_4034_example_zone() -> Zone {
+        zone_with_origin(
+            "example",
+            vec![
+                spec("z", "A", &["203.0.113.6"]),
+                spec("yljkjljk.a", "A", &["203.0.113.3"]),
+                spec("*.z", "A", &["203.0.113.8"]),
+                spec("@", "A", &["203.0.113.1"]),
+                spec("zABC.a", "A", &["203.0.113.5"]),
+                spec("a", "A", &["203.0.113.2"]),
+                spec("Z.a", "A", &["203.0.113.4"]),
+            ],
+        )
+    }
+
+    /// Scenario: The arena is physically in RFC 4034 §6.1 canonical order
+    /// features/zone-data-model.feature:387
+    ///
+    /// Asserted against `LowerName: Ord`, whose `cmp_labels` *is* §6.1, rather
+    /// than against the byte key the arena is actually sorted by — the key's
+    /// correctness is claimed *from* `Ord`, so checking one against the other is
+    /// the only check that is not circular. `tests/canonical_order.rs` holds the
+    /// key to the RFC's own printed vector; this holds the arena to the key.
+    #[test]
+    fn the_arena_is_in_rfc_4034_canonical_order() {
+        let z = rfc_4034_example_zone();
+        assert!(
+            z.nodes.len() >= 7,
+            "the fixture must materialise every owner as a node, or the ordering \
+             is asserted over a shorter list than it looks"
+        );
+
+        for pair in z.nodes.windows(2) {
+            let (left, right) = (&pair[0], &pair[1]);
+            let (lo, hi) = (
+                LowerName::from(left.name.clone()),
+                LowerName::from(right.name.clone()),
+            );
+            assert_eq!(
+                lo.cmp(&hi),
+                std::cmp::Ordering::Less,
+                "the arena is not in RFC 4034 §6.1 canonical order: {} is filed \
+                 before {}. Nothing reads this order yet, which is why it is \
+                 pinned now — the first reader is the NSEC chain, whose next \
+                 owner name is node i+1, and a chain that does not close \
+                 SERVFAILs the whole zone at every validating resolver",
+                left.name,
+                right.name
+            );
+        }
+    }
+
+    /// Scenario: Node 0 is the apex and every node's parent has a lower index
+    /// features/zone-data-model.feature:399
+    ///
+    /// The two structural facts the rest of the design reads as given:
+    /// `NodeIdx::APEX` is a constant rather than a search, and S4's `cut`
+    /// propagation is one forward pass because a parent has always already been
+    /// visited. Both are consequences of canonical order and both stop being
+    /// true silently if the sort moves.
+    ///
+    /// Stated over *ancestors*, not just parents. At S1 there are no empty
+    /// non-terminals (that is S2), so a node's immediate parent is frequently
+    /// not a node at all — but every ancestor that *is* one must still precede
+    /// it, and that is the property the forward pass actually needs.
+    #[test]
+    fn node_zero_is_the_apex_and_every_ancestor_that_exists_precedes_its_descendant() {
+        for z in [
+            rfc_4034_example_zone(),
+            zone(vec![
+                spec("a.b.c.deep", "A", &["203.0.113.1"]),
+                spec("*.dev", "A", &["203.0.113.2"]),
+                spec("*.*.dev", "A", &["203.0.113.3"]),
+                spec("dev", "A", &["203.0.113.4"]),
+                spec("www", "CNAME", &["dev.example.com."]),
+            ]),
+            zone(Vec::new()),
+            zone_with_origin(".", vec![spec("*", "A", &["203.0.113.1"])]),
+        ] {
+            let apex = z
+                .nodes
+                .get(NodeIdx::APEX.get())
+                .expect("every zone has at least its apex");
+            assert_eq!(
+                LowerName::from(apex.name.clone()),
+                z.lower_origin,
+                "node 0 is not the apex. Canonical order puts the shortest name \
+                 in the zone first and every other node is a descendant of it, \
+                 so NodeIdx::APEX is a constant rather than a search — unless \
+                 the sort changed"
+            );
+
+            for (i, node) in z.nodes.iter().enumerate() {
+                let name = LowerName::from(node.name.clone());
+                for (j, other) in z.nodes.iter().enumerate() {
+                    let ancestor = LowerName::from(other.name.clone());
+                    if i == j || !ancestor.zone_of(&name) {
+                        continue;
+                    }
+                    assert!(
+                        j < i,
+                        "{} is an ancestor of {} but sits at index {j}, after \
+                         index {i}. Every forward pass over the arena — `cut` \
+                         propagation at S4, the NSEC chain at VEGA-040 — reads \
+                         this as given and none of them would notice",
+                        other.name,
+                        node.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Scenario: Every node round-trips through the hash index
+    /// features/zone-data-model.feature:416
+    ///
+    /// The index and the arena are built in one function from one scratch map
+    /// and dropped together, so they cannot drift across a reload. What this
+    /// guards is the build-time failure: a node the index cannot find is a
+    /// configured record answering NXDOMAIN with nothing in the log.
+    ///
+    /// Probed the way a packet probes — through the suffix hash of the node's
+    /// own name — so a seed or a fold that disagreed between build and query
+    /// fails here rather than in production.
+    #[test]
+    fn every_node_round_trips_through_the_hash_index() {
+        for z in [
+            rfc_4034_example_zone(),
+            zone(vec![
+                spec("*.dev", "A", &["203.0.113.2"]),
+                spec("*.*.dev", "A", &["203.0.113.3"]),
+                spec("dev", "A", &["203.0.113.4"]),
+                spec("a.b.c.deep", "A", &["203.0.113.1"]),
+            ]),
+            zone_with_origin(".", vec![spec("*", "A", &["203.0.113.1"])]),
+        ] {
+            assert_eq!(
+                z.index.len(),
+                z.nodes.len(),
+                "the index holds a different number of entries than the arena \
+                 holds nodes"
+            );
+
+            for (i, node) in z.nodes.iter().enumerate() {
+                let name = LowerName::from(node.name.clone());
+                let hashes = SuffixHashes::new(z.hash_seed, &name);
+                // A wildcard node is probed as `*` under its parent, which is
+                // the shape the lookup uses and the only shape that reaches it.
+                let found = if node.flags.contains(NodeFlags::WILDCARD) {
+                    z.wildcard_node(&name, hashes.labels().saturating_sub(1), &hashes)
+                } else {
+                    z.exact_node(&name, &hashes)
+                };
+                assert_eq!(
+                    found.map(NodeIdx::get),
+                    Some(i),
+                    "{} is node {i} in the arena and the index does not lead \
+                     back to it. A record that cannot be found is NXDOMAIN with \
+                     nothing in the log",
+                    node.name
+                );
+            }
+        }
+    }
+
+    /// The order a record set is answered in is the order the config declares
+    /// it, across every shape the arena stores one in.
+    ///
+    /// WRITTEN BECAUSE A MUTANT SURVIVED. Emitting an RRset's records in
+    /// reverse — `values.iter().rev()` in `Zone::emit` — passed all 573 tests in
+    /// this tree, `tests/arena_differential.rs` included. The differential
+    /// compares records in order and would have caught it, but its generator
+    /// gives every spec a single value and a random TTL, so a set with two
+    /// records in it is a case it reaches only by luck. Order was unpinned
+    /// before S1 too (qa-spec recorded it as finding (b)); S1 is where it starts
+    /// mattering, because the arena is free to lay records out in any order it
+    /// likes and nothing else would notice.
+    ///
+    /// Order is contract, not taste: the ruling makes config order the reason
+    /// answers are deterministic across builds and reloads, and a zone that
+    /// permutes an address set between reloads makes a load-balancing
+    /// resolver's behaviour unreproducible and a packet capture undiffable.
+    ///
+    /// The third case is the discriminating one. Two blocks for one owner and
+    /// type with **different** TTLs are merged into one answer with mixed TTLs
+    /// today — the RFC 2181 §5 violation VEGA-061 pins and S5 fixes — so the
+    /// arena keeps them as consecutive runs rather than storing a TTL per
+    /// record. Declaring 10, 20, then 10 again is what says the runs are not
+    /// regrouped by TTL on the way in, and it is a case that cannot arise at all
+    /// once S5 refuses the config.
+    #[test]
+    fn an_rrset_is_answered_in_the_order_the_config_declares_it() {
+        let _watchdog = watchdog();
+
+        let ttl = |name: &str, values: &[&str], ttl: u32| {
+            let mut s = spec(name, "A", values);
+            s.ttl = Some(ttl);
+            s
+        };
+
+        let z = zone(vec![
+            spec("pool", "A", &["203.0.113.1", "203.0.113.2", "203.0.113.3"]),
+            ttl("merged", &["203.0.113.10"], 60),
+            ttl("merged", &["203.0.113.11"], 60),
+            ttl("runs", &["203.0.113.20"], 10),
+            ttl("runs", &["203.0.113.21"], 20),
+            ttl("runs", &["203.0.113.22"], 10),
+        ]);
+
+        for (label, name, want) in [
+            (
+                "one block, three values",
+                "pool.example.com.",
+                vec![
+                    ("203.0.113.1", 300),
+                    ("203.0.113.2", 300),
+                    ("203.0.113.3", 300),
+                ],
+            ),
+            (
+                "two blocks at one TTL",
+                "merged.example.com.",
+                vec![("203.0.113.10", 60), ("203.0.113.11", 60)],
+            ),
+            (
+                "three blocks, TTLs 10, 20, 10",
+                "runs.example.com.",
+                vec![
+                    ("203.0.113.20", 10),
+                    ("203.0.113.21", 20),
+                    ("203.0.113.22", 10),
+                ],
+            ),
+        ] {
+            let Answer::Records(records) = z.lookup(&lower(name), RecordType::A) else {
+                panic!("{label}: {name} must be answered");
+            };
+            let got: Vec<(RData, u32)> = records.iter().map(|r| (r.data.clone(), r.ttl)).collect();
+            let expected: Vec<(RData, u32)> =
+                want.iter().map(|(addr, ttl)| (a(addr), *ttl)).collect();
+            assert_eq!(
+                got, expected,
+                "{label}: {name} was answered out of the order its config \
+                 declares. Config order is what makes an answer reproducible \
+                 across a reload"
+            );
+        }
     }
 
     // ----------------------------------------------- S0: the suffix hash

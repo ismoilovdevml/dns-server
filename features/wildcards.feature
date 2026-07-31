@@ -20,14 +20,21 @@ Feature: Wildcard record synthesis (RFC 4592)
   # lookup time the code walks up from the queried name's parent, stopping at the
   # origin or root.
   #
-  # MODEL NOTE, VEGA-032 S1 — the paragraph above describes the parent-keyed map
-  # and stops being true at S1. There, a wildcard becomes an ordinary NODE named
+  # MODEL NOTE, VEGA-032 S1 — LANDED. The paragraph above describes the
+  # parent-keyed map and is no longer true. A wildcard is now an ordinary NODE named
   # "*.dev.example.com." (RFC 4592 §2.1.1 — a wildcard is a name whose leftmost
   # label is an asterisk, which is what makes the closest-encloser rule
   # expressible at all), reached through a hash index rather than through a
   # parent key. S1 keeps the depth bitmap, recomputed over wildcard nodes, and
   # keeps deepest-wins; the closest-encloser rule is S3's and the bitmap is
   # subsumed there, by ancestor closure, rather than abandoned.
+  #
+  # One S1 fidelity point worth knowing before reading any scenario here: a
+  # wildcard node is deliberately NOT matched by the exact-name probe, because
+  # the map it replaces held wildcards in neither `exact` nor `names`. Without
+  # that, a wildcard carrying a CNAME would start substituting it for a query
+  # the old model answered NODATA. That exclusion is what S2 and S3 remove, with
+  # a ruling, rather than something S1 got to decide.
   #
   # EVERY SCENARIO IN THIS FILE IS WRITTEN TO HOLD UNDER BOTH MODELS, and that
   # is the S1 acceptance criterion rather than an accident: S1 changes the
