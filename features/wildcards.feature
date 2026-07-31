@@ -19,6 +19,23 @@ Feature: Wildcard record synthesis (RFC 4592)
   # key ("dev.example.com.", TYPE). A bare "*" is stored under the origin. At
   # lookup time the code walks up from the queried name's parent, stopping at the
   # origin or root.
+  #
+  # MODEL NOTE, VEGA-032 S1 — the paragraph above describes the parent-keyed map
+  # and stops being true at S1. There, a wildcard becomes an ordinary NODE named
+  # "*.dev.example.com." (RFC 4592 §2.1.1 — a wildcard is a name whose leftmost
+  # label is an asterisk, which is what makes the closest-encloser rule
+  # expressible at all), reached through a hash index rather than through a
+  # parent key. S1 keeps the depth bitmap, recomputed over wildcard nodes, and
+  # keeps deepest-wins; the closest-encloser rule is S3's and the bitmap is
+  # subsumed there, by ancestor closure, rather than abandoned.
+  #
+  # EVERY SCENARIO IN THIS FILE IS WRITTEN TO HOLD UNDER BOTH MODELS, and that
+  # is the S1 acceptance criterion rather than an accident: S1 changes the
+  # structure and no answer. The mechanised form of that claim is
+  # features/zone-data-model.feature, "The arena answers exactly what today's
+  # implementation answers, for every zone and every query". Rewrite this note in
+  # the S1 commit, not before — a feature file that describes a model the code
+  # does not have yet is worse than one that describes the model it does have.
 
   Background:
     Given a zone with origin "example.com"
@@ -521,3 +538,24 @@ Feature: Wildcard record synthesis (RFC 4592)
   # If one of them turns green under VEGA-083, the change went outside its
   # fence — most likely by inserting wildcard parents into the zone's name set,
   # which is VEGA-006's work and not a security commit's. Fix the change.
+  #
+  # VEGA-032 EXTENDS THE SAME FENCE OVER S0 AND S1, and then discharges it.
+  # S0 wires nothing up, and S1 is behaviour-preserving with NO empty
+  # non-terminals and NO closest encloser, so all three stay red through both:
+  #
+  #   * an_empty_non_terminal_is_nodata_not_nxdomain  — green at S2
+  #   * the_parent_of_a_wildcard_is_not_nxdomain      — green at S2
+  #   * a_wildcard_does_not_apply_below_a_name_that_exists — green at S3
+  #
+  # If one turns green at S0 or S1, the commit went outside its fence and the
+  # commit is wrong, not the test.
+  #
+  # The commit that DOES discharge one of them — S2 or S3 — must, in the same
+  # diff, amend:
+  #   * src/zone.rs::the_three_rfc_bugs_this_fix_must_not_touch_are_still_ignored_with_their_reasons
+  #   * the comment block above those tests in src/zone.rs
+  #   * this block
+  # Editing that guard is legitimate ONLY in the commit that makes the
+  # corresponding test pass. That is the rule VEGA-005 Amendment 3a set for the
+  # reload classification table, and it is what stops "the fence moved" and "the
+  # fix landed" from being indistinguishable in the log.

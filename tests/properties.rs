@@ -796,7 +796,7 @@ proptest! {
     ///
     /// Scenario: The bounded walk agrees with the naive walk on every zone and
     /// every name
-    /// features/wildcards.feature:460
+    /// features/wildcards.feature:477
     ///
     /// This is the property that would have rejected the proposed patch: it
     /// derived probe depths from `LowerName::num_labels()`, which discounts a

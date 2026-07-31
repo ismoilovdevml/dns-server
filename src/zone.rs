@@ -804,7 +804,7 @@ mod tests {
 
     /// Scenario: A wildcard does not answer a type it was not configured for,
     /// but the name still exists
-    /// features/wildcards.feature:89
+    /// features/wildcards.feature:106
     ///
     /// FLIPPED BY VEGA-083, and it was VEGA-010's enshrining test. It asserted
     /// `NxDomain`, which is what the code did, not what RFC 1034 §4.3.2 step
@@ -1497,7 +1497,7 @@ mod tests {
     }
 
     /// Scenario: A maximum-length query name of a type no wildcard holds is NODATA
-    /// features/wildcards.feature:385
+    /// features/wildcards.feature:402
     ///
     /// FLIPPED BY VEGA-083, and owned by VEGA-065. The type-mismatch path at
     /// maximum depth: the walk runs its full window, hits nothing, and must
@@ -1514,6 +1514,13 @@ mod tests {
         assert_eq!(z.lookup(&deep_name(123), RecordType::TXT), Answer::NoData);
     }
 
+    /// Scenario: A name with the maximum legal number of labels does not panic
+    /// the lookup
+    /// features/zone-lookup.feature:360
+    ///
+    /// Scenario: The deepest name the wire can carry is 127 labels, and it is
+    /// answered
+    /// features/zone-data-model.feature:455
     #[test]
     fn the_true_deepest_name_the_wire_can_carry_is_127_labels_and_is_answered() {
         // CORRECTS a boundary the rest of this module gets wrong. `deep_name`
@@ -1658,7 +1665,7 @@ mod tests {
     }
 
     /// Scenario: A root-origin zone with a wildcard terminates on a miss
-    /// features/wildcards.feature:441
+    /// features/wildcards.feature:458
     ///
     /// FLIPPED BY VEGA-083, and owned by VEGA-065. `origin = "."` is accepted by
     /// `parse_name`, and it drives the walk's floor to 0. The rejected patch's
@@ -1865,6 +1872,148 @@ mod tests {
                  exist for every type"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // VEGA-032 S0/S1 — the boundaries the arena rewrite must not move.
+    //
+    // Spec: features/zone-data-model.feature, sections "S0 — THE SUFFIX HASH"
+    //       and "S1 — THE ARENA, BEHAVIOUR-PRESERVING".
+    // Ruling: .claude/backlog/decisions/VEGA-032-zone-data-model.md §13 AC-1.9
+    //
+    // These pass today. They are here *before* the rewrite, not after it,
+    // because each one is an input shape the arena has a new way to get wrong:
+    // S0's suffix hash writes into a `[u64; MAX_LABELS + 1]` indexed by a label
+    // count taken from a name an attacker chose, and S1 reads every arena range
+    // through a slice. Under `panic = "abort"` one out-of-range index is a full
+    // outage from one packet, and the shapes below are the ones that reach the
+    // largest index and the longest octet run the wire can carry.
+    //
+    // The rest of the suite works in labels; two of these work in octets, which
+    // is a different bound and is where a buffer sized from the wrong one
+    // breaks.
+    // -----------------------------------------------------------------------
+
+    /// Scenario: A name of maximum-length labels is answered rather than
+    /// mis-indexed
+    /// features/zone-data-model.feature:215
+    ///
+    /// Scenario: A query name at exactly 255 octets is answered
+    /// features/zone-data-model.feature:465
+    ///
+    /// RFC 1035 §2.3.4 gives two independent limits — 63 octets per label and
+    /// 255 octets per name — and every depth test in this tree exercises only
+    /// the second, through names made of single-octet labels. A name can sit at
+    /// the octet ceiling with **four** labels, and a hash pass that walked
+    /// octets where it meant labels, or sized a buffer from `name.len()` where
+    /// it meant `iter().len()`, is wrong here and correct everywhere else the
+    /// suite looks.
+    ///
+    /// Root origin, because 255 octets leaves nothing to pay for a zone suffix.
+    #[test]
+    fn a_query_name_at_the_octet_ceiling_is_answered_rather_than_mis_indexed() {
+        let _watchdog = watchdog();
+        let z = zone_with_origin(".", vec![spec("*", "A", &["203.0.113.1"])]);
+
+        // Three labels at the per-label ceiling: 3 * (1 + 63) + 1 = 193 octets.
+        let max_label = "a".repeat(63);
+        let three = format!("{max_label}.{max_label}.{max_label}.");
+        // Four labels landing on the name ceiling exactly:
+        // 3 * (1 + 63) + (1 + 61) + 1 = 255.
+        let tail = "b".repeat(61);
+        let at_limit = format!("{max_label}.{max_label}.{max_label}.{tail}.");
+
+        // `Name::len()` counts the length octet and the content of each label
+        // and stops there; the wire form adds one terminating zero, which is
+        // what the 255-octet limit counts. Measured against hickory-proto
+        // 0.26.1: three 63-octet labels report 192 and four report 256, and the
+        // rejection for the latter names 257 — the terminator included.
+        for (label, text, wire_octets, labels) in [
+            ("three 63-octet labels", three, 193, 3),
+            ("exactly 255 octets", at_limit, 255, 4),
+        ] {
+            let name = lower(&text);
+            let parsed = parse_name(&text).expect("fixture parses");
+            assert_eq!(
+                parsed.len() + 1,
+                wire_octets,
+                "{label}: the fixture must sit at the boundary it names, or it \
+                 tests a shape the wire cannot carry"
+            );
+            assert_eq!(label_count(&name), labels, "{label}: label count");
+
+            let Answer::Records(records) = z.lookup(&name, RecordType::A) else {
+                panic!("{label}: a name the apex wildcard covers must be answered");
+            };
+            assert_eq!(records.len(), 1, "{label}");
+            assert_eq!(
+                LowerName::from(records[0].name.clone()),
+                name,
+                "{label}: the synthesised owner must be the queried name"
+            );
+        }
+    }
+
+    /// Scenario: A zone holding nothing but its apex answers every shape without
+    /// panicking
+    /// features/zone-data-model.feature:414
+    ///
+    /// The smallest arena that can exist: one node, no RRsets, no wildcards, and
+    /// an empty bucket for every probe. Every branch of the lookup is reachable
+    /// on it and each one is an opportunity to index an empty slice or to walk a
+    /// zero-length range — the ruling's §6.2 bars `[]` indexing on any
+    /// packet-reachable path for exactly this reason.
+    ///
+    /// It also pins the two answers that must survive an empty zone: the apex
+    /// exists (or a bare `SOA example.com.` would be NXDOMAIN about our own
+    /// zone), and nothing else does.
+    #[test]
+    fn a_zone_holding_only_its_apex_answers_every_shape_without_panicking() {
+        let _watchdog = watchdog();
+        let z = zone(Vec::new());
+
+        assert!(
+            z.exists(&lower("example.com.")),
+            "the apex must exist even in an empty zone, or a query for our own \
+             origin answers NXDOMAIN about a zone we are authoritative for"
+        );
+
+        for (label, name, qtype, expected) in [
+            ("the apex", "example.com.", RecordType::A, Answer::NoData),
+            (
+                "the apex, ANY",
+                "example.com.",
+                RecordType::ANY,
+                Answer::NoData,
+            ),
+            (
+                "below it",
+                "nope.example.com.",
+                RecordType::A,
+                Answer::NxDomain,
+            ),
+            (
+                "below it, ANY",
+                "nope.example.com.",
+                RecordType::ANY,
+                Answer::NxDomain,
+            ),
+            ("above it", "com.", RecordType::A, Answer::NxDomain),
+            ("the root", ".", RecordType::A, Answer::NxDomain),
+            (
+                "an asterisk-leading name",
+                "*.example.com.",
+                RecordType::A,
+                Answer::NxDomain,
+            ),
+        ] {
+            assert_eq!(z.lookup(&lower(name), qtype), expected, "{label}: {name}");
+        }
+
+        // The deep shape too: an empty zone is where a walk with nothing to
+        // find runs its full window.
+        assert_eq!(z.lookup(&deep_name(123), RecordType::A), Answer::NxDomain);
+        assert_eq!(z.record_count(), 0);
     }
 
     // ------------------------------------------------- source-level guards

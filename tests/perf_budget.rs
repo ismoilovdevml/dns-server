@@ -44,7 +44,23 @@ const ZONE_SIZE: usize = 100_000;
 /// The most labels a name can carry under `example.com.` inside RFC 1035
 /// §2.3.4's 255 octets: `121 * 2 + 8 + 4 + 1 = 255`. The attack packet in
 /// VEGA-065's evidence used 100 labels; the true worst case is this.
+///
+/// **Under this origin only.** The protocol ceiling is [`PROTOCOL_MAX_LABELS`];
+/// treating 123 as the limit is the mistake VEGA-032 §5.2 corrects, and it is
+/// wrong wherever it appears as a protocol bound rather than as this zone's.
 const MAX_QUERY_LABELS: usize = 123;
+
+/// The deepest name the wire can carry at all: RFC 1035 §3.1 encodes a
+/// single-octet label in two octets and terminates the name with one, so
+/// `127 * 2 + 1 = 255` exactly. Reachable only by a name with no zone suffix to
+/// pay for, i.e. under `origin = "."`.
+///
+/// This is the deepest index every label-keyed structure in the zone model will
+/// ever see: VEGA-065's `u128` bit 127 today, and VEGA-032 S0's `[u64; 128]`
+/// suffix-hash array from S0 onwards. Measured against hickory-proto 0.26.1 —
+/// 127 labels parse, 128 are rejected with `DomainNameTooLong(257)`, pinned by
+/// `tests/canonical_order.rs::a_name_one_label_past_the_ceiling_is_rejected_before_it_reaches_the_zone`.
+const PROTOCOL_MAX_LABELS: usize = 127;
 
 fn spec(name: &str, ty: &str, values: &[&str]) -> RecordSpec {
     RecordSpec {
@@ -206,7 +222,7 @@ fn a_deep_name_does_not_cost_more_than_a_shallow_one() {
 /// map per query, for any query type.**
 ///
 /// Scenario: An ANY lookup costs the same on a 100,000-record zone as on a small one
-/// features/zone-lookup.feature:375
+/// features/zone-lookup.feature:390
 ///
 /// `Zone::resolve`'s ANY branch is
 /// `for ((owner, _), records) in &self.exact { if owner == name { … } }` — a
@@ -289,5 +305,109 @@ fn an_any_lookup_does_not_scan_the_whole_record_map() {
         "ANY costs {r:.1}x A at {ZONE_SIZE} records ({any:?} vs {a:?}). A ratio \
          that grows with the zone is an O(n) scan over the record map, which the \
          performance budget forbids for every query type"
+    );
+}
+
+/// BUDGET (VEGA-032 §5.2, AC-1.7): the same claim at the **protocol** ceiling
+/// rather than at this zone's.
+///
+/// Scenario: The true 127-label ceiling is measured and budgeted, not just the
+/// 123-label one
+/// features/zone-data-model.feature:500
+///
+/// # Why 123 is not enough
+///
+/// Every other depth budget in this tree is written at 123 labels, which is the
+/// most that fits under `example.com.` inside RFC 1035 §2.3.4's 255 octets. The
+/// decoder's ceiling is **127** — `127 * 2 + 1 = 255` — reachable by a bare name
+/// with no zone suffix to pay for, and that is the input an attacker sends. It
+/// is also the deepest index any label-keyed structure in the zone model will
+/// see: bit 127 of VEGA-065's `u128` today, and entry 127 of VEGA-032 S0's
+/// `[u64; MAX_LABELS + 1]` suffix-hash array afterwards. With
+/// `panic = "abort"`, one index past that is a full outage from one packet.
+///
+/// The ruling asks for this as a **new baseline at S1**, because the current
+/// arithmetic has never been measured at the real boundary. Ratio-budgeted like
+/// its sibling above, so a slow or shared runner cannot make it flap: what a
+/// ratio cannot survive is a change of complexity class, which is the whole
+/// point.
+///
+/// # The baseline, measured before S1
+///
+/// ```text
+/// shallow 124ns  deep(127 labels) 1.666µs  ratio 13.4x     (this test)
+/// shallow  81ns  deep(123 labels) 1.717µs  ratio 21.2x     (its sibling, same run)
+/// ```
+///
+/// The 127-label ratio is *lower* than the 123-label one only because the
+/// root-origin shallow control is slower, not because the deep case is cheaper:
+/// the absolute deep figures agree to within noise, which is the evidence that
+/// the walk is already independent of depth and that 123 was never measuring
+/// anything 127 does not. S1 must hold the ratio and is expected to improve
+/// both absolutes, because the tuple-key `LowerName` clone disappears.
+///
+/// Root origin, because that is the only way a 127-label name is in zone.
+#[test]
+fn the_protocol_ceiling_name_does_not_cost_more_than_a_shallow_one() {
+    let _watchdog = testutil::arm(WATCHDOG);
+
+    // A root-origin zone: `origin = "."` is accepted, drives the probe window's
+    // floor to zero, and is the only origin under which a 127-label name is
+    // inside the zone at all.
+    let mut records = vec![spec("*", "A", &["203.0.113.1"])];
+    records.reserve(ZONE_SIZE);
+    for i in 0..ZONE_SIZE {
+        records.push(spec(
+            &format!("h{i}.example.com."),
+            "A",
+            &[&format!(
+                "10.{}.{}.{}",
+                (i >> 16) & 0xff,
+                (i >> 8) & 0xff,
+                i & 0xff
+            )],
+        ));
+    }
+    let z = Zone::from_config(&ZoneConfig {
+        origin: ".".to_owned(),
+        default_ttl: 300,
+        builtins: false,
+        soa: None,
+        records,
+    })
+    .expect("root-origin zone builds");
+
+    let shallow = lower("nope.");
+    let deep = lower(&"a.".repeat(PROTOCOL_MAX_LABELS));
+    assert_eq!(
+        Name::from(deep.clone()).iter().len(),
+        PROTOCOL_MAX_LABELS,
+        "the fixture must sit exactly at the decoder's ceiling, not near it: \
+         this is the input that drives every label-keyed index in the model to \
+         its largest reachable value"
+    );
+
+    // Both are answered by the apex wildcard, so the two measurements are the
+    // same code path at two depths rather than two different paths.
+    assert!(matches!(
+        z.lookup(&shallow, RecordType::A),
+        Answer::Records(_)
+    ));
+    assert!(matches!(z.lookup(&deep, RecordType::A), Answer::Records(_)));
+
+    let s = best_of(5, 5_000, || {
+        std::hint::black_box(z.lookup(std::hint::black_box(&shallow), RecordType::A));
+    });
+    let d = best_of(5, 5_000, || {
+        std::hint::black_box(z.lookup(std::hint::black_box(&deep), RecordType::A));
+    });
+
+    let r = d.as_secs_f64() / s.as_secs_f64();
+    println!("shallow {s:?}  deep({PROTOCOL_MAX_LABELS} labels) {d:?}  ratio {r:.1}x");
+    assert!(
+        r < 25.0,
+        "a {PROTOCOL_MAX_LABELS}-label lookup costs {r:.1}x a 1-label one \
+         (budget 25x, measured {d:?} vs {s:?}). The depth walk is a function of \
+         the query name again, at the deepest name the wire can carry"
     );
 }

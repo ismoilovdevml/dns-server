@@ -356,12 +356,27 @@ Feature: Authoritative zone lookup
     When 25 clients query "www.example.test." for type A at the same time
     Then every response rcode is NOERROR
 
-  @hostile @gap
+  @hostile @enforced src/zone.rs:1525
   Scenario: A name with the maximum legal number of labels does not panic the lookup
-    # An attacker controls QNAME entirely. base_name() walking in the wildcard
-    # loop is bounded by label count, but nothing tests a 127-label name.
-    When a client queries a 127-label name inside "example.com." for type A
-    Then the server answers with a response rather than terminating
+    # An attacker controls QNAME entirely, and 127 — not 123 — is the ceiling
+    # they can reach: RFC 1035 §3.1 encodes a single-octet label in two octets
+    # and terminates the name with one, so 127 * 2 + 1 = 255 exactly. 123 is only
+    # what fits under "example.com.", and this file, features/wildcards.feature
+    # and tests/perf_budget.rs all used to state it as though it were the
+    # protocol limit (VEGA-032 §5.2 corrects that).
+    #
+    # It matters because 127 is the largest index every label-keyed structure in
+    # the zone model will ever see — bit 127 of VEGA-065's u128 today, entry 127
+    # of VEGA-032 S0's [u64; 128] suffix-hash array afterwards — and under
+    # panic = "abort" one index past it is a full outage from one packet.
+    #
+    # A 127-label name is only *inside* a zone whose origin is the root, so the
+    # enforcing test uses one. The 128-label case, which hickory must refuse
+    # before we ever see it, is pinned by
+    # tests/canonical_order.rs::a_name_one_label_past_the_ceiling_is_rejected_before_it_reaches_the_zone.
+    Given a zone whose origin is the root "." with a wildcard at the apex
+    When a client queries a bare 127-label name for type A
+    Then it is answered rather than terminating the process
 
   @hostile @gap
   Scenario: A query name differing only by case matches the record
