@@ -1,6 +1,6 @@
 # Shortcuts for the commands CI runs. `make` on its own lists them.
 .DEFAULT_GOAL := help
-.PHONY: help fmt lint test check deploy-check audit ci build run demo docker clean
+.PHONY: help fmt lint test pinned-bugs check deploy-check audit ci build run demo docker clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -16,6 +16,9 @@ lint: ## Format check + clippy, as CI runs them
 test: ## Run every test
 	cargo test --all-features --locked
 
+pinned-bugs: ## Run the #[ignore]d tests and require them to still fail
+	./.github/scripts/pinned-bugs-must-stay-red.sh
+
 check: ## Validate the example config
 	cargo run --quiet -- --config vega.example.toml check
 
@@ -26,7 +29,7 @@ deploy-check: ## Check the shutdown timings, and prove the unit-file guard fails
 audit: ## Licence and advisory checks
 	cargo deny check
 
-ci: lint test check deploy-check ## Everything CI would run
+ci: lint test pinned-bugs check deploy-check ## Everything CI would run
 	@echo "ok"
 
 build: ## Release build

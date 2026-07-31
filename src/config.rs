@@ -18,6 +18,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, ValueEnum};
 use serde::Deserialize;
 
+use crate::tomlparse;
+
 /// Default TTL handed to records that do not specify one.
 pub const DEFAULT_TTL: u32 = 300;
 
@@ -347,7 +349,7 @@ pub enum LoadStage {
     Read,
     /// The bytes are not valid TOML, or carry a key the schema does not know.
     Parse,
-    /// Parsed, but rejected by [`Config::merge`]: empty origin, zero TTL, …
+    /// Parsed, but rejected by `Config::merge`: empty origin, zero TTL, …
     Validate,
 }
 
@@ -456,17 +458,13 @@ impl Config {
                 stage: LoadStage::Read,
                 error,
             })?;
-        toml::from_str(&raw).map_err(|error| LoadError {
+        // Through `tomlparse` like every other TOML parse in the crate: its
+        // error carries the position and not the source line, which is what
+        // keeps `admin_token` out of a `/reload` body and a WARN log (VEGA-082,
+        // then VEGA-089 for the sibling path that did not come through here).
+        tomlparse::deserialize(&raw).map_err(|error| LoadError {
             stage: LoadStage::Parse,
-            // Flattened to a string on purpose, rather than kept as a `source`:
-            // anyhow prints the whole chain for `{:#}` and `{:?}`, so a surviving
-            // `toml::de::Error` anywhere in it re-introduces the snippet at the
-            // first thing that renders this error (VEGA-082).
-            error: anyhow!(
-                "parsing config file {}: {}",
-                path.display(),
-                describe_parse_error(&error, &raw)
-            ),
+            error: anyhow!("parsing config file {}: {error}", path.display()),
         })
     }
 
@@ -690,52 +688,6 @@ fn shutdown_drain(cli: &GlobalArgs, file: Option<i64>) -> Result<Duration> {
     }
 }
 
-/// Render a TOML parse failure for an operator without quoting the file back.
-///
-/// `toml`'s own `Display` prints the offending source line under the position,
-/// with a caret beneath it. That is a good error message for a compiler and a
-/// disclosure for a name server: the line that fails to parse is very often
-/// `admin_token = "…`, and this string reaches a `/reload` response body and a
-/// WARN log that ships to whatever aggregates container stdout (VEGA-082). So
-/// the position and the parser's own description are kept — they are what makes
-/// the message actionable — and the source snippet is dropped.
-///
-/// The two ingredients are safe by construction, not by inspection: the position
-/// is a pair of integers, and `Error::message()` is the parser's description of
-/// what it expected, assembled from grammar literals rather than from input.
-fn describe_parse_error(error: &toml::de::Error, raw: &str) -> String {
-    let Some(span) = error.span() else {
-        return error.message().to_owned();
-    };
-    let (line, column) = position(raw, span.start);
-    format!(
-        "TOML parse error at line {line}, column {column}: {}",
-        error.message()
-    )
-}
-
-/// A byte offset into `raw` as the one-based line and column `toml` would report.
-///
-/// Same arithmetic as `toml`'s own `translate_position`, so the numbers an
-/// operator sees do not move: columns count characters, not bytes.
-fn position(raw: &str, offset: usize) -> (usize, usize) {
-    // The span comes from a parser reading this very string, so it is already a
-    // character boundary and in range. Clamped and floored anyway, because
-    // `/reload` reaches this from the network and `panic = "abort"` turns one
-    // slice panic into a full outage. Both loops below are bounded: the floor
-    // steps back at most three bytes (UTF-8's longest encoding) since offset 0 is
-    // always a boundary.
-    let mut offset = offset.min(raw.len());
-    while offset > 0 && !raw.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    let head = &raw[..offset];
-    let line_start = head.rfind('\n').map_or(0, |newline| newline + 1);
-    let line = head[..line_start].matches('\n').count() + 1;
-    let column = head[line_start..].chars().count() + 1;
-    (line, column)
-}
-
 fn reject_duplicates(what: &str, addrs: &[SocketAddr]) -> Result<()> {
     let mut seen = BTreeSet::new();
     for addr in addrs {
@@ -790,7 +742,7 @@ mod tests {
 
     #[test]
     fn cli_overrides_file() {
-        let file: FileConfig = toml::from_str(
+        let file: FileConfig = tomlparse::deserialize(
             r#"
             [server]
             udp = ["127.0.0.1:5300"]
@@ -843,27 +795,27 @@ mod tests {
 
     #[test]
     fn zero_ttl_is_rejected() {
-        let file: FileConfig = toml::from_str("[zone]\ndefault_ttl = 0\n").unwrap();
+        let file: FileConfig = tomlparse::deserialize("[zone]\ndefault_ttl = 0\n").unwrap();
         let err = Config::merge(&cli(&[]), file).unwrap_err();
         assert!(err.to_string().contains("default_ttl"), "{err}");
     }
 
     #[test]
     fn unknown_file_keys_are_rejected() {
-        let err = toml::from_str::<FileConfig>("[server]\nudpp = []\n").unwrap_err();
+        let err = tomlparse::deserialize::<FileConfig>("[server]\nudpp = []\n").unwrap_err();
         assert!(err.to_string().contains("udpp"), "{err}");
     }
 
     #[test]
     fn no_builtins_flag_wins_over_file() {
-        let file: FileConfig = toml::from_str("[zone]\nbuiltins = true\n").unwrap();
+        let file: FileConfig = tomlparse::deserialize("[zone]\nbuiltins = true\n").unwrap();
         let cfg = Config::merge(&cli(&["--no-builtins"]), file).unwrap();
         assert!(!cfg.zone.builtins);
     }
 
     #[test]
     fn records_round_trip_from_toml() {
-        let file: FileConfig = toml::from_str(
+        let file: FileConfig = tomlparse::deserialize(
             r#"
             [zone]
             origin = "example.com"
@@ -897,7 +849,7 @@ mod tests {
         // default_expire / default_minimum -> 0 | 1 | -1` mutant. These values
         // end up on the wire in the SOA and drive secondary and negative-cache
         // behaviour, and nothing asserted on any of them.
-        let file: FileConfig = toml::from_str(
+        let file: FileConfig = tomlparse::deserialize(
             r#"
             [zone]
             origin = "example.com"
@@ -981,7 +933,8 @@ mod tests {
 
     #[test]
     fn the_drain_window_comes_from_the_file_unless_the_command_line_states_one() {
-        let file: FileConfig = toml::from_str("[server]\nshutdown_drain_secs = 42\n").unwrap();
+        let file: FileConfig =
+            tomlparse::deserialize("[server]\nshutdown_drain_secs = 42\n").unwrap();
         let cfg = Config::merge(&cli(&[]), file.clone()).unwrap();
         assert_eq!(cfg.shutdown_drain, Duration::from_secs(42));
 
@@ -996,7 +949,8 @@ mod tests {
     fn a_zero_drain_window_is_legal() {
         // 0 is the right value for CI and `cargo run`; it must not be confused
         // with "unset", which resolves to 15.
-        let file: FileConfig = toml::from_str("[server]\nshutdown_drain_secs = 0\n").unwrap();
+        let file: FileConfig =
+            tomlparse::deserialize("[server]\nshutdown_drain_secs = 0\n").unwrap();
         assert_eq!(
             Config::merge(&cli(&[]), file).unwrap().shutdown_drain,
             Duration::ZERO
@@ -1007,7 +961,8 @@ mod tests {
     /// features/shutdown.feature:100
     #[test]
     fn a_drain_window_above_the_maximum_is_refused_naming_the_setting_and_the_limit() {
-        let file: FileConfig = toml::from_str("[server]\nshutdown_drain_secs = 301\n").unwrap();
+        let file: FileConfig =
+            tomlparse::deserialize("[server]\nshutdown_drain_secs = 301\n").unwrap();
         let error = Config::merge(&cli(&[]), file).unwrap_err().to_string();
         assert!(error.contains("shutdown_drain_secs"), "{error}");
         assert!(
@@ -1035,7 +990,8 @@ mod tests {
     #[test]
     fn the_maximum_drain_window_is_inclusive() {
         // Kills `secs <= max` -> `secs < max`, which would refuse a legal config.
-        let file: FileConfig = toml::from_str("[server]\nshutdown_drain_secs = 300\n").unwrap();
+        let file: FileConfig =
+            tomlparse::deserialize("[server]\nshutdown_drain_secs = 300\n").unwrap();
         assert_eq!(
             Config::merge(&cli(&[]), file).unwrap().shutdown_drain,
             MAX_SHUTDOWN_DRAIN
@@ -1048,7 +1004,7 @@ mod tests {
     fn a_negative_drain_window_is_refused_by_name_rather_than_by_type() {
         // The field is signed precisely so this message names the setting an
         // operator wrote, instead of the deserializer complaining about u64.
-        let file: FileConfig = toml::from_str("[server]\nshutdown_drain_secs = -1\n")
+        let file: FileConfig = tomlparse::deserialize("[server]\nshutdown_drain_secs = -1\n")
             .expect("a negative integer parses; it is the range check that rejects it");
         let error = Config::merge(&cli(&[]), file).unwrap_err().to_string();
         assert!(error.contains("shutdown_drain_secs"), "{error}");
@@ -1302,23 +1258,6 @@ mod tests {
         assert_eq!(failure.stage, LoadStage::Validate);
         assert!(!failure.to_string().contains(SECRET), "{failure}");
         assert!(failure.to_string().contains("default_ttl"), "{failure}");
-    }
-
-    /// The position we report is the position `toml` would have reported: an
-    /// operator comparing our message with their editor's gutter must not find
-    /// an off-by-one.
-    #[test]
-    fn a_byte_offset_becomes_the_same_one_based_line_and_column_toml_uses() {
-        let raw = "a\nbcd\nz";
-        assert_eq!(position(raw, 0), (1, 1));
-        assert_eq!(position(raw, 2), (2, 1));
-        assert_eq!(position(raw, 4), (2, 3));
-        assert_eq!(position(raw, 6), (3, 1));
-        // Past the end (the parser reports EOF this way) and inside a multi-byte
-        // character: neither may panic, because /reload reaches this from the
-        // network and `panic = "abort"` makes one panic an outage.
-        assert_eq!(position(raw, 99), (3, 2));
-        assert_eq!(position("héllo", 2), (1, 2));
     }
 
     #[test]

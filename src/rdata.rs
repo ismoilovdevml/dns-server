@@ -13,7 +13,15 @@
 //! (`vega record add`). The bound was first fixed in the zone only, and the
 //! editor kept aborting — the same bug with a different stack trace. So the
 //! bound and the check live here, in one function, and nothing else in the crate
-//! may call `try_from_str` on text from a file, a packet or a command line.
+//! calls `try_from_str` at all — not even a test fixture, because a rule with an
+//! exception is a rule nobody can check mechanically.
+//!
+//! That claim is not on trust. `tests/single_gate.rs` reads `src/**/*.rs` and
+//! fails if any other module names the parser; it was added when the claim had
+//! already gone stale, `zone.rs` having kept its own call behind a duplicate of
+//! [`MAX_VALUE_CHARS`] (VEGA-089's review). The `const _` assertion below is the
+//! same idea one layer down: a guard above the assertion it guards is checked by
+//! the compiler, not by a reader.
 
 use hickory_proto::{
     rr::{RData, RecordType},

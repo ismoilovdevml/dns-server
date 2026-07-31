@@ -1,10 +1,15 @@
 //! Format-preserving edits to the config file, so `vega record add` can be
 //! scripted without destroying an operator's comments and layout.
 //!
-//! Everything goes through [`toml_edit`], which keeps the original document and
-//! only rewrites the parts that changed. Writes are atomic: we render to a
-//! temporary file in the same directory and rename over the original, so a crash
-//! mid-write cannot leave a truncated config behind.
+//! Everything goes through a [`crate::tomlparse::Document`], which keeps the
+//! original document and only rewrites the parts that changed. Writes are
+//! atomic: we render to a temporary file in the same directory and rename over
+//! the original, so a crash mid-write cannot leave a truncated config behind.
+//!
+//! The parse itself belongs to [`crate::tomlparse`] and not to this module. It
+//! used to live here, and a broken config printed its offending source line —
+//! `admin_token = "…` — to the terminal of anyone who ran `vega record add` or
+//! `vega zone show` (VEGA-089, the sibling of VEGA-082 on the server path).
 
 use std::{
     fs,
@@ -13,9 +18,12 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use hickory_proto::rr::RecordType;
-use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
+use toml_edit::{Array, ArrayOfTables, Item, Table, Value};
 
-use crate::rdata::{self, ValueError};
+use crate::{
+    rdata::{self, ValueError},
+    tomlparse::{self, Document},
+};
 
 /// One record set as it appears in the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,7 +57,7 @@ pub enum Change {
 #[derive(Debug)]
 pub struct ConfigEditor {
     path: PathBuf,
-    doc: DocumentMut,
+    doc: Document,
 }
 
 impl ConfigEditor {
@@ -58,9 +66,11 @@ impl ConfigEditor {
         let path = path.into();
         let raw =
             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let doc = raw
-            .parse::<DocumentMut>()
-            .with_context(|| format!("parsing {}", path.display()))?;
+        // `tomlparse::ParseError` is safe to keep as a `source`: it carries the
+        // position and not the line, so `{:#}` and `{:?}` say where the file is
+        // broken without saying what is on that line.
+        let doc =
+            tomlparse::document(&raw).with_context(|| format!("parsing {}", path.display()))?;
         Ok(Self { path, doc })
     }
 
@@ -834,6 +844,42 @@ values = ["203.0.113.10"]
         assert!(error.to_string().contains("parsing"), "{error}");
     }
 
+    /// Scenario: No command echoes the admin_token line from a broken config
+    /// features/config-precedence.feature:481
+    ///
+    /// VEGA-089. This is the unit-level half of the CLI round in
+    /// `tests/cli.rs::no_command_that_reads_the_config_echoes_the_admin_token_line`:
+    /// every editing command reaches an operator's terminal through this one
+    /// function, and it used to hand back `toml_edit`'s rendering, which quotes
+    /// the line it stopped on — usually the one with the token on it.
+    #[test]
+    fn open_does_not_quote_the_offending_line_back() {
+        const SECRET: &str = "SUPER-SECRET-TOKEN-1";
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("broken.toml");
+        fs::write(&path, format!("[server]\nadmin_token = \"{SECRET}\n")).unwrap();
+
+        let error = ConfigEditor::open(&path).unwrap_err();
+        // Three renderings, because each is a separate way out of the process:
+        // `{}` is what a `bail!` prints, `{:#}` is what `report` prints, and
+        // `{:?}` is what a `tracing` field would.
+        for rendering in [
+            format!("{error}"),
+            format!("{error:#}"),
+            format!("{error:?}"),
+        ] {
+            assert!(
+                !rendering.contains(SECRET),
+                "the offending config line came back with the token on it: {rendering}"
+            );
+        }
+        // The position is the half that makes it actionable, and it is only in
+        // the chain, so assert on the rendering `report` actually uses.
+        let full = format!("{error:#}");
+        assert!(full.contains("line 2"), "{full}");
+        assert!(full.contains("column"), "{full}");
+    }
+
     // -----------------------------------------------------------------------
     // Regression tests from mutation testing.
     // -----------------------------------------------------------------------
@@ -994,7 +1040,7 @@ values = ["203.0.113.10"]
         }
 
         let raw = fs::read_to_string(&path).unwrap();
-        raw.parse::<toml_edit::DocumentMut>()
+        tomlparse::document(&raw)
             .unwrap_or_else(|e| panic!("config was corrupted by concurrent writers: {e}\n{raw}"));
         assert!(
             raw.contains("# A comment we must not lose."),

@@ -476,3 +476,29 @@ Feature: Configuration precedence and validation
     # leak into a help dump or a log line.
     When `vega --help` runs
     Then the output does not contain any token value
+
+  @hostile @enforced tests/cli.rs:438
+  Scenario: No command echoes the admin_token line from a broken config
+    # VEGA-089, the sibling of the scenario above. VEGA-082 fixed the two
+    # commands that parse through Config::read_file; every editing command parses
+    # the same file with toml_edit, a second crate with its own Display, and went
+    # on printing the line. The list is exhaustive on purpose — the defect was
+    # never "this one command", it was "the redaction was not at a chokepoint".
+    Given a config file whose admin_token line is not valid TOML
+    When any of `vega check`, `serve`, `record list`, `record get`, `record add`,
+      `record delete`, `zone show`, `zone export` or `zone bump-serial` runs,
+      with and without --json
+    Then the process exits non-zero
+    And the output does not contain the token
+    And the output still names the line and column the parser stopped at
+
+  @hostile @enforced tests/single_gate.rs:145
+  Scenario: A new call site cannot render a raw TOML parse error
+    # The property, not the instance: this one is checked against the source
+    # rather than against the output, because the bug was that a *second* call
+    # site existed at all. src/tomlparse.rs is the only module that may name a
+    # TOML parser, and clippy.toml refuses the same paths at compile time.
+    Given the crate's own source under src/
+    When the single-gate rules are checked
+    Then no module but src/tomlparse.rs names a TOML parser or its error type
+    And no module but src/rdata.rs names hickory's presentation-format parser

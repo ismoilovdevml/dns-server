@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
   merge_group:
+  schedule:
+    # The full cross-platform matrix, weekly. See the `test` job for why it is
+    # not on every push.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
 
 # A new push to a PR makes the in-flight run obsolete.
 concurrency:
@@ -56,8 +61,16 @@ jobs:
       fail-fast: false
       matrix:
         # The server binds sockets and handles signals, so it is worth proving it
-        # works on more than the CI default.
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # works on more than the CI default — but GitHub bills macOS at 10x and
+        # Windows at 2x the Linux rate, and the full matrix on every push ate
+        # 90% of a month's included minutes. Linux gates every change; the other
+        # two run weekly and on demand.
+        #
+        # This is a real trade, not a free saving: the Windows leg caught a
+        # genuine bug (an RSS helper that only exists on Unix) that no local
+        # gate did. A Monday run means such a bug can sit on `main` for up to a
+        # week, so treat a red scheduled run as a release blocker.
+        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","macos-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v5
 
@@ -83,6 +96,30 @@ jobs:
           run --config ci.toml record list --json
           run --config ci.toml check --json
           run --config ci.toml zone export
+
+  pinned-bugs:
+    name: Ignored tests still fail
+    # Unix only, and deliberately not in the `test` matrix: one of the pinned
+    # tests is `#[cfg(unix)]` (file permission bits), so the expected set differs
+    # on Windows and a matrix job would have to encode two lists.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pinned-bugs
+
+      # The polarity is the opposite of the `test` job: these tests are supposed
+      # to fail, and the build goes red when one of them PASSES. Eleven of them
+      # pin live bugs so whoever fixes one finds a failing test waiting, and
+      # three are a scope fence the VEGA-065 and VEGA-083 rulings depend on.
+      # Nothing ran them before VEGA-092, so a fence could be stepped over — or a
+      # bug quietly fixed and its issue left open — with CI entirely green.
+      - name: Ignored tests must still fail
+        run: ./.github/scripts/pinned-bugs-must-stay-red.sh
 
   msrv:
     name: Minimum supported Rust version
@@ -122,7 +159,8 @@ jobs:
         run: |
           shellcheck --shell=sh \
             deploy/check-shutdown-invariants.sh \
-            deploy/prove-unit-guard-fails.sh
+            deploy/prove-unit-guard-fails.sh \
+            .github/scripts/pinned-bugs-must-stay-red.sh
 
   manifests:
     name: Validate deployment manifests
@@ -187,7 +225,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [lint, test, msrv, shell, manifests]
+    needs: [lint, test, pinned-bugs, msrv, shell, manifests]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any job failed

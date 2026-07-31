@@ -26,7 +26,62 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   meeting a bucket that had never been touched, so the bucket never fired while
   every forged address cost memory.
 
+### Changed
+
+- **`POST /reload` answers with a machine-readable `code` on every failure, and
+  two status codes it never used before.** Anything parsing the old
+  `{"status":"unchanged","error":"..."}` prose still works — `status` and
+  `error` are unchanged — but a client that treated every non-`200` as the same
+  condition now needs to tell three apart:
+
+  | status | `code` | what an operator should do |
+  | --- | --- | --- |
+  | `400` | `config_read_failed`, `config_parse_failed`, `config_invalid`, `zone_build_failed` | fix the file |
+  | `409` | `origin_changed` | this needs a restart, not a reload |
+  | `409` | `reload_in_progress` | another reload holds the lock; retry |
+  | `503` | `shutting_down` | the process is draining; do not retry here |
+
+  A successful reload now also carries an `ignored` array of the TOML key paths
+  that were read but could not be applied, because they are fixed for the life
+  of the process — listen addresses, the origin, the rate limits, the admin
+  token, the log settings. Previously those were discarded in silence, so an
+  operator could edit a listen address, read `200 OK`, and believe it had taken
+  effect. `server.admin_token` appears in that array as a key path only; its
+  value is never rendered.
+
+- **A wildcard-covered name now answers `NOERROR` with an empty answer section
+  where it used to answer `NXDOMAIN`.** This is a wire-visible change and it
+  will move your metrics: if you alert on NXDOMAIN rate, expect a step down on
+  any zone that holds a wildcard, and a matching step up in NOERROR. Nothing
+  that previously resolved changes its answer — see *Fixed* below for why the
+  old behaviour was a cache-poisoning vector rather than a cosmetic bug.
+
 ### Fixed
+
+- **A wildcard-covered name answered `NXDOMAIN` for every type the wildcard did
+  not carry.** With `*.dev A 203.0.113.50` configured, `x.dev.example.com/A`
+  answered correctly while `x.dev.example.com/AAAA` — and `TXT`, `MX`, `SRV`,
+  `ANY` — answered an authoritative `NXDOMAIN`.
+
+  That is not a cosmetic wrong code. RFC 2308 §5 caches a negative answer for
+  the SOA `MINIMUM`, and RFC 8020 §2 lets a resolver conclude that *everything*
+  beneath the name is absent too. So one `AAAA` query took the wildcard's own
+  live `A` record out of service, for that resolver's whole client population,
+  for the negative TTL. No attacker was required: `AAAA` accompanies every `A`
+  from every dual-stack client, so ordinary traffic did it.
+
+  The name now answers `NOERROR` with an empty answer section and the SOA in
+  authority — RFC 2308 §2.2 NODATA — which is what RFC 1034 §4.3.2 step 3(c)
+  has always specified: the name error is set only when the `*` label does not
+  exist, and that branch was never conditioned on the query type.
+
+- **The admin token could be written to the logs by a configuration syntax
+  error.** Both TOML parsers in use render a parse failure by quoting the
+  offending source line back, so a broken or duplicated `admin_token = "..."`
+  line put the secret into the `/reload` response body, the startup error, and
+  — with `log_format = "json"`, which the shipped Kubernetes manifest and
+  Dockerfile both set — into whatever aggregates container logs. Parse errors
+  now carry the line and column but never the line's text.
 
 - **Turning rate limiting on was what made the process killable.** The limiter
   kept a `HashMap` entry per source address, created before any packet validation

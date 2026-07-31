@@ -5,6 +5,8 @@
 //! Serving:
 //!
 //! * [`config`] — CLI flags + TOML file, merged and validated up-front.
+//! * [`tomlparse`] — the one place a TOML file is parsed, and the one place a
+//!   parse failure is rendered without quoting the file back.
 //! * [`rdata`] — the one place operator text is turned into RDATA.
 //! * [`zone`] — the in-memory record store and the lookup algorithm.
 //! * [`handler`] — the [`hickory_server::server::RequestHandler`] implementation.
@@ -41,6 +43,7 @@ pub mod ratelimit;
 pub mod rdata;
 pub mod reload;
 pub mod shutdown;
+pub mod tomlparse;
 pub mod ui;
 pub mod zone;
 

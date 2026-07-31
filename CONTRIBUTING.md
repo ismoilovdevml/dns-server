@@ -28,6 +28,23 @@ CI runs the same three, plus an MSRV check, a shellcheck pass over `install.sh`,
 validation of the deployment manifests, and `cargo deny`. Running them locally is
 faster than waiting for the pipeline to tell you about a formatting nit.
 
+### The `#[ignore]`d tests
+
+`#[ignore]` means one thing here: the test states the behaviour we want, fails
+against the behaviour we have, and waits in the tree for whoever fixes the bug —
+so they find a failing test instead of having to write one. Three of them are
+also a scope fence for a design ruling.
+
+```bash
+make pinned-bugs      # runs them and requires every one to STILL FAIL
+```
+
+The polarity is deliberate: this goes red when an ignored test *passes*. If your
+change makes one pass, that is news either way. Either you fixed the bug — remove
+the `#[ignore]`, delete the test's line from
+`.github/scripts/pinned-bugs-must-stay-red.sh`, and say in the commit which issue
+it closes — or you stepped over a fence, and the change is what needs revisiting.
+
 For anything touching the query path, also try it against a real server:
 
 ```bash

@@ -676,7 +676,21 @@ fn greeting(qname: &Name, hello_zone: &LowerName) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{RecordSpec, SoaSpec, ZoneConfig};
+    use crate::{
+        config::{RecordSpec, SoaSpec, ZoneConfig},
+        rdata,
+    };
+
+    /// Presentation-format text as RDATA, for a fixture.
+    ///
+    /// Through `rdata::parse_value` rather than hickory's parser directly, so
+    /// that parser is named in exactly one module of this crate and
+    /// `tests/single_gate.rs` can hold that claim to the ground. `owner` is only
+    /// ever used in an error message these fixtures do not reach.
+    fn rdata_of(record_type: RecordType, value: &str) -> RData {
+        rdata::parse_value(record_type, "@", value)
+            .unwrap_or_else(|e| panic!("{record_type} {value:?} should parse: {e}"))
+    }
 
     fn zone_config(records: Vec<RecordSpec>, builtins: bool) -> ZoneConfig {
         ZoneConfig {
@@ -766,8 +780,7 @@ mod tests {
         ];
 
         for (rtype, value) in cases {
-            let rdata = RData::try_from_str(*rtype, value)
-                .unwrap_or_else(|e| panic!("{rtype} {value:?} should parse: {e}"));
+            let rdata = rdata_of(*rtype, value);
             let actual = rdata
                 .to_bytes()
                 .unwrap_or_else(|e| panic!("{rtype} should encode: {e}"))
@@ -1046,7 +1059,7 @@ mod tests {
         let before = h.resolve(&lower("www.example.com."), RecordType::A, client());
         assert_eq!(
             &before.answers[0].data,
-            &RData::try_from_str(RecordType::A, "203.0.113.20").unwrap()
+            &rdata_of(RecordType::A, "203.0.113.20")
         );
 
         let cfg = zone_config(vec![spec("www", "A", &["198.51.100.7"])], false);
@@ -1055,7 +1068,7 @@ mod tests {
         let after = h.resolve(&lower("www.example.com."), RecordType::A, client());
         assert_eq!(
             &after.answers[0].data,
-            &RData::try_from_str(RecordType::A, "198.51.100.7").unwrap(),
+            &rdata_of(RecordType::A, "198.51.100.7"),
             "a reload must be visible to the next query"
         );
         assert_eq!(h.zone().record_count(), 1);

@@ -6,7 +6,7 @@
 //! CancellationToken`]: being handed the server's own token was VEGA-046 — a
 //! `SIGTERM` then cancelled the DNS accept loops directly, the sockets were gone
 //! 1.3 ms later, and no readiness probe could ever be told to stop sending us
-//! traffic. [`watch`] therefore takes no arguments; the ordering of the three
+//! traffic. [`watch()`] therefore takes no arguments; the ordering of the three
 //! tokens lives in `main::serve`, where it can be read in one place.
 //!
 //! `SIGTERM` is what Docker, Kubernetes and systemd send first. `SIGINT` comes

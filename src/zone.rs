@@ -12,22 +12,14 @@ use hickory_proto::rr::{
     LowerName, Name, RData, Record, RecordType,
 };
 
-use crate::config::{RecordSpec, SoaSpec, ZoneConfig};
+use crate::{
+    config::{RecordSpec, SoaSpec, ZoneConfig},
+    rdata::{self, ValueError},
+};
 
 /// Maximum number of CNAMEs we will follow inside the zone before giving up.
 /// RFC 1034 does not set a limit; this stops a misconfigured loop from spinning.
 const MAX_CNAME_DEPTH: usize = 8;
-
-/// Longest record value we will hand to the presentation-format parser.
-///
-/// `RData::try_from_str` runs hickory's zone-file lexer, which carries
-/// `assert!(i < 4095)` over the characters of a single token
-/// (hickory-proto `serialize/txt/zone_lex.rs`). A longer value aborts the
-/// process rather than returning an error — and because `Zone::from_config` is
-/// also the reload path, that turns one oversized record in an edited config
-/// into a crash loop instead of a rejected reload. Refuse it ourselves, with a
-/// message that says what to do.
-const MAX_RECORD_VALUE_CHARS: usize = 4090;
 
 /// The most labels any DNS name can carry, and so the highest wildcard depth
 /// this zone can ever have to probe.
@@ -207,23 +199,27 @@ impl Zone {
         // are rewritten to the queried name at lookup time.
         let mut records = Vec::with_capacity(spec.values.len());
         for value in &spec.values {
-            let chars = value.chars().count();
-            if chars > MAX_RECORD_VALUE_CHARS {
-                bail!(
-                    "{} record value for {:?} is {chars} characters; the maximum is \
-                     {MAX_RECORD_VALUE_CHARS}. Split a long TXT value into several \
-                     character-strings instead.",
-                    spec.record_type,
-                    spec.name
-                );
-            }
-            let rdata = RData::try_from_str(record_type, value).map_err(|e| {
-                anyhow::anyhow!(
-                    "invalid {} record value {:?} for {:?}: {e}",
-                    spec.record_type,
-                    value,
-                    spec.name
-                )
+            // Through `rdata::parse_value` like `vega record add`, and for the
+            // same reason: hickory's lexer asserts past 4095 characters, so on
+            // this path — startup *and* every reload — an oversized value in an
+            // edited config is a crash loop, not a rejected reload. One gate,
+            // one bound, one message, whichever end the value came in through
+            // (VEGA-071).
+            let rdata = rdata::parse_value(record_type, &spec.name, value).map_err(|error| {
+                match error {
+                    // Reworded, not passed through: an operator reading this is
+                    // looking for one record set in a file that may hold
+                    // hundreds, so the value and the owner both have to be in
+                    // it. The length rule keeps `rdata`'s own wording, which is
+                    // what makes it read identically from the CLI.
+                    ValueError::Unparsable(e) => anyhow::anyhow!(
+                        "invalid {} record value {:?} for {:?}: {e}",
+                        spec.record_type,
+                        value,
+                        spec.name
+                    ),
+                    too_long @ ValueError::TooLong { .. } => anyhow::Error::new(too_long),
+                }
             })?;
             records.push(Record::from_rdata(owner.clone(), ttl, rdata));
         }
@@ -665,8 +661,12 @@ mod tests {
     }
 
     /// The A rdata a synthesised answer is expected to carry.
+    ///
+    /// Through `rdata::parse_value` like everything else, so that hickory's
+    /// presentation-format parser is named in exactly one module of this crate
+    /// and `tests/single_gate.rs` can hold that claim to the ground.
     fn a(addr: &str) -> RData {
-        RData::try_from_str(RecordType::A, addr).expect("fixture address parses")
+        rdata::parse_value(RecordType::A, "@", addr).expect("fixture address parses")
     }
 
     #[test]
@@ -799,10 +799,7 @@ mod tests {
         else {
             panic!("expected records");
         };
-        assert_eq!(
-            &records[0].data,
-            &RData::try_from_str(RecordType::A, "203.0.113.51").unwrap()
-        );
+        assert_eq!(&records[0].data, &a("203.0.113.51"));
     }
 
     /// Scenario: A wildcard does not answer a type it was not configured for,
@@ -928,7 +925,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A TXT value whose *presentation form* is exactly `chars` characters
-    /// long, which is what `MAX_RECORD_VALUE_CHARS` counts. Quoted, because
+    /// long, which is what `rdata::MAX_VALUE_CHARS` counts. Quoted, because
     /// hickory otherwise reads whitespace-free runs as separate
     /// character-strings and the length under test would not be one value.
     fn txt_of(chars: usize) -> String {
@@ -944,11 +941,13 @@ mod tests {
     #[test]
     fn a_record_value_at_the_character_limit_is_accepted() {
         let _watchdog = watchdog();
-        // Kills `chars > MAX_RECORD_VALUE_CHARS` -> `>=`. The bound is
-        // inclusive: 4090 characters is the largest value an operator may
-        // write, and moving the comparison one place rejects a config that has
-        // been valid since the limit landed.
-        let value = txt_of(MAX_RECORD_VALUE_CHARS);
+        // Kills `chars > MAX_VALUE_CHARS` -> `>=` in the guard, which now lives
+        // in `rdata::parse_value`. Kept here rather than moved there with it:
+        // this asserts the *loader* is routed through the gate, which is the
+        // half a unit test of `rdata` cannot see. The bound is inclusive — 4090
+        // characters is the largest value an operator may write, and moving the
+        // comparison one place rejects a config valid since the limit landed.
+        let value = txt_of(rdata::MAX_VALUE_CHARS);
         let zone = Zone::from_config(&ZoneConfig {
             origin: "example.com".to_owned(),
             default_ttl: 300,
@@ -956,7 +955,7 @@ mod tests {
             soa: None,
             records: vec![spec("long", "TXT", &[&value])],
         })
-        .expect("a value of exactly MAX_RECORD_VALUE_CHARS characters must build");
+        .expect("a value of exactly rdata::MAX_VALUE_CHARS characters must build");
         assert!(matches!(
             zone.lookup(&lower("long.example.com."), RecordType::TXT),
             Answer::Records(_)
@@ -965,13 +964,14 @@ mod tests {
 
     #[test]
     fn a_record_value_over_the_character_limit_is_refused_however_far_over() {
-        // Kills both `chars > MAX_RECORD_VALUE_CHARS` -> `>=` (one past the
-        // bound must fail) and -> `==` (a value *far* past the bound must fail
-        // too — an `==` rejects only the single length 4090 and waves through
-        // every larger one). Nothing in the suite asserted on this limit at
-        // all before mutation testing, so the whole check could have been
-        // deleted silently.
-        for over in [MAX_RECORD_VALUE_CHARS + 1, MAX_RECORD_VALUE_CHARS * 4] {
+        // Kills both `chars > MAX_VALUE_CHARS` -> `>=` (one past the bound must
+        // fail) and -> `==` (a value *far* past the bound must fail too — an
+        // `==` rejects only the single length 4090 and waves through every
+        // larger one), and it kills them through the loader rather than through
+        // `rdata` directly, so a zone that stopped calling the gate fails here.
+        // Nothing in the suite asserted on this limit at all before mutation
+        // testing, so the whole check could have been deleted silently.
+        for over in [rdata::MAX_VALUE_CHARS + 1, rdata::MAX_VALUE_CHARS * 4] {
             let value = txt_of(over);
             let err = Zone::from_config(&ZoneConfig {
                 origin: "example.com".to_owned(),

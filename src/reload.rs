@@ -221,12 +221,13 @@ pub fn reload(ctx: &ReloadContext) -> Result<ReloadOutcome, ReloadError> {
                 LoadStage::Parse => ReloadErrorCode::ConfigParseFailed,
                 LoadStage::Validate => ReloadErrorCode::ConfigInvalid,
             },
-            // Safe to render whole only because `Config::resolve` builds its
-            // parse failures already redacted: `toml`'s own Display quotes the
-            // offending source line, and that line is the operator's secret when
-            // the key is `server.admin_token`. This string goes into the response
-            // body and into `admin.rs`'s WARN. See `config::describe_parse_error`
-            // (VEGA-082), and do not re-wrap a raw `toml::de::Error` here.
+            // Safe to render whole only because `Config::resolve` parses through
+            // `crate::tomlparse`, the one module allowed to touch a TOML parser:
+            // a parser's own Display quotes the offending source line, and that
+            // line is the operator's secret when the key is `server.admin_token`.
+            // This string goes into the response body and into `admin.rs`'s
+            // WARN. See `crate::tomlparse` (VEGA-082, then VEGA-089), and do not
+            // reach around it for a parser error to re-wrap here.
             format!("{:#}", failure.error),
         )
     })?;

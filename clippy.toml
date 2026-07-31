@@ -1,0 +1,22 @@
+# Compile-time half of the VEGA-089 chokepoint.
+#
+# Both TOML crates print the offending *source line* in their `Display`, and on a
+# config file that line is very often `admin_token = "…`. The redaction was
+# written twice, once per call site, and leaked twice; it now lives in exactly
+# one module, `src/tomlparse.rs`, which carries the single `#![allow]` for these
+# two lints. Anywhere else, naming a parser entry point, the editable document
+# type or either error type fails `cargo clippy -- -D warnings`.
+#
+# `tests/toml_parse_chokepoint.rs` is the other half: it reads `src/**/*.rs`, so
+# it also catches a call whose error type is inferred and never named — which
+# these lints cannot see — and a second `#[allow]` added to silence them.
+
+disallowed-methods = [
+    { path = "toml::from_str", reason = "parse through crate::tomlparse::deserialize, which does not quote the offending line back (VEGA-089)" },
+]
+
+disallowed-types = [
+    { path = "toml_edit::DocumentMut", reason = "use crate::tomlparse::Document, whose only constructor redacts the offending line (VEGA-089)" },
+    { path = "toml_edit::TomlError", reason = "its Display quotes the offending source line; use crate::tomlparse::ParseError (VEGA-089)" },
+    { path = "toml::de::Error", reason = "its Display quotes the offending source line; use crate::tomlparse::ParseError (VEGA-089)" },
+]

@@ -406,6 +406,77 @@ fn a_startup_failure_does_not_echo_the_admin_token_line() {
     }
 }
 
+/// Every subcommand that can reach a TOML parser, as an argv the binary accepts.
+///
+/// Listed here rather than derived from `Cli`, because the property under test is
+/// "an operator ran this and the secret came back", and that is an argv. A
+/// command added without a line here is a command this test does not cover — see
+/// `tests/toml_parse_chokepoint.rs`, which catches the same omission from the
+/// other side, at the call site rather than at the command line.
+const COMMANDS_THAT_PARSE_THE_CONFIG: &[&[&str]] = &[
+    &["serve"],
+    &["check"],
+    &["record", "list"],
+    &["record", "get", "www"],
+    &["record", "add", "www", "A", "203.0.113.10"],
+    &["record", "delete", "www", "A"],
+    &["zone", "show"],
+    &["zone", "export"],
+    &["zone", "bump-serial"],
+];
+
+/// Scenario: No command echoes the admin_token line from a broken config
+/// features/config-precedence.feature:481
+///
+/// VEGA-082 fixed `serve` and `check`, which parse through `Config::read_file`.
+/// The editing commands parse the same file through `toml_edit`, a different
+/// crate with its own `Display`, and kept printing the line — VEGA-089. The list
+/// is exhaustive on purpose: the defect was never "this one command", it was
+/// "the redaction was not at a chokepoint", and only running all of them says
+/// otherwise.
+#[test]
+fn no_command_that_reads_the_config_echoes_the_admin_token_line() {
+    const SECRET: &str = "SUPER-SECRET-TOKEN-1";
+    let broken = [
+        format!("[server]\nadmin_token = \"{SECRET}\n[zone]\norigin = \"example.com\"\n"),
+        format!(
+            "[server]\nadmin_token = \"{SECRET}\"\nadmin_token = \"{SECRET}\"\n\
+             [zone]\norigin = \"example.com\"\n"
+        ),
+    ];
+
+    for toml in broken {
+        for command in COMMANDS_THAT_PARSE_THE_CONFIG {
+            // Both renderings, for every command: `report` writes prose to
+            // stderr and JSON to stdout, and each is a separate way out.
+            for json in [false, true] {
+                let dir = TempDir::new().unwrap();
+                std::fs::write(dir.path().join("vega.toml"), &toml).unwrap();
+                let mut args = command.to_vec();
+                if json {
+                    args.push("--json");
+                }
+
+                let output = run(dir.path(), &args);
+                assert!(!output.status.success(), "{args:?} must fail");
+                let combined = format!("{}{}", stdout(&output), stderr(&output));
+                assert!(
+                    !combined.contains(SECRET),
+                    "{args:?} echoed the offending config line back, secret and all: {combined}"
+                );
+                assert!(
+                    combined.contains("line 2") || combined.contains("line 3"),
+                    "{args:?} must still say where the file is broken: {combined}"
+                );
+                assert!(
+                    combined.contains("column"),
+                    "{args:?} must still say which column: {combined}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn zone_export_emits_zone_file_syntax() {
     let dir = workspace();
