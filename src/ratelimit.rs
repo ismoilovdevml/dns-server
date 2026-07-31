@@ -416,6 +416,27 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Budget for any one test in this module. The slowest floods two million
+    /// prefixes and the storm drives 800,000 checks across eight threads, both
+    /// in single-digit seconds; a minute is only reachable by a `check_at` whose
+    /// retry loop stopped being bounded.
+    const STORM_WATCHDOG: Duration = Duration::from_secs(60);
+
+    /// Bound the rest of the calling test by the *process* clock.
+    ///
+    /// `CAS_ATTEMPTS` is the only bound standing between a contended slot and an
+    /// unbounded loop on the query path, and the failure mode of losing it is a
+    /// spin, not a wrong answer. The storm test used to bound a channel and
+    /// leave eight worker threads and their coordinator spinning behind it —
+    /// which reports a failure while nine threads keep burning cores, and has a
+    /// mutation harness score the mutant as a timeout instead of as caught. See
+    /// `src/testutil.rs`.
+    #[track_caller]
+    #[must_use]
+    fn watchdog() -> crate::testutil::Guard {
+        crate::testutil::arm(STORM_WATCHDOG)
+    }
+
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
@@ -484,6 +505,7 @@ mod tests {
     /// features/rate-limiting.feature:201
     #[test]
     fn burst_is_allowed_then_traffic_is_denied() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 3);
         let now = Instant::now();
         assert!(rl.check_at(ip("198.51.100.1"), now));
@@ -496,6 +518,7 @@ mod tests {
     /// features/rate-limiting.feature:208
     #[test]
     fn tokens_refill_over_time() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(10, 1);
         let t0 = Instant::now();
         assert!(rl.check_at(ip("198.51.100.2"), t0));
@@ -508,6 +531,7 @@ mod tests {
     /// features/rate-limiting.feature:215
     #[test]
     fn refill_is_capped_at_burst() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(100, 2);
         let t0 = Instant::now();
         // Idle for an hour, then only `burst` queries should get through.
@@ -529,6 +553,7 @@ mod tests {
     /// would then pass for the opposite reason.
     #[test]
     fn out_of_order_clock_readings_do_not_grant_extra_tokens() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let t1 = Instant::now() + Duration::from_secs(10);
         assert!(rl.check_at(ip("198.51.100.8"), t1));
@@ -552,6 +577,7 @@ mod tests {
     /// and what lets an IPv6 /64 walk past the limiter untouched.
     #[test]
     fn two_addresses_in_one_slash_24_share_a_bucket() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
         assert!(rl.check_at(ip("198.51.100.1"), now));
@@ -566,6 +592,7 @@ mod tests {
     /// features/rate-limiting.feature:69
     #[test]
     fn two_addresses_in_different_slash_24s_keep_separate_buckets() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
         assert!(rl.check_at(ip("198.51.100.1"), now));
@@ -579,6 +606,7 @@ mod tests {
     /// features/rate-limiting.feature:75
     #[test]
     fn the_first_and_last_address_of_a_slash_24_share_a_bucket() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
         assert!(rl.check_at(ip("203.0.113.0"), now));
@@ -592,6 +620,7 @@ mod tests {
     /// in the shift — passes the test above and fails this one.
     #[test]
     fn addresses_either_side_of_a_slash_24_boundary_do_not_share() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
         assert!(rl.check_at(ip("203.0.113.255"), now));
@@ -602,6 +631,7 @@ mod tests {
     /// features/rate-limiting.feature:87
     #[test]
     fn two_addresses_in_one_slash_56_share_a_bucket() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
         assert!(rl.check_at(ip("2001:db8:0:0::1"), now));
@@ -615,6 +645,7 @@ mod tests {
     /// features/rate-limiting.feature:94
     #[test]
     fn addresses_either_side_of_a_slash_56_boundary_do_not_share() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
         assert!(rl.check_at(ip("2001:db8:0:0000::1"), now));
@@ -629,6 +660,7 @@ mod tests {
     /// features/rate-limiting.feature:101
     #[test]
     fn an_ipv4_mapped_source_shares_the_bucket_of_its_bare_ipv4_form() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
         assert!(rl.check_at(ip("198.51.100.1"), now));
@@ -650,6 +682,7 @@ mod tests {
     /// Ruling §2.4 and failure mode F6; same shape as VEGA-016.
     #[test]
     fn two_ipv4_mapped_sources_in_different_slash_24s_do_not_share() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
         assert!(rl.check_at(ip("::ffff:198.51.100.1"), now));
@@ -673,6 +706,7 @@ mod tests {
     /// deviations out while a missing tag gives all 256.
     #[test]
     fn an_ipv6_prefix_never_aliases_the_ipv4_prefix_with_the_same_payload() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
         let mut shared = 0;
@@ -701,6 +735,8 @@ mod tests {
     #[test]
     fn a_flood_across_one_slash_64_is_limited_as_a_single_source() {
         const FLOOD: u128 = 65_536;
+
+        let _watchdog = watchdog();
 
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
@@ -733,6 +769,8 @@ mod tests {
     #[test]
     fn the_slot_table_is_the_same_size_before_and_after_a_two_million_source_flood() {
         const FLOOD: u32 = 2_000_000;
+
+        let _watchdog = watchdog();
 
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
@@ -783,6 +821,8 @@ mod tests {
         const FLOOD: u32 = 2_000_000;
         const CEILING_KIB: u64 = 32 * 1024;
 
+        let _watchdog = watchdog();
+
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
         let before = resident_kib();
@@ -823,6 +863,8 @@ mod tests {
     fn random_addresses_of_both_families_never_index_outside_the_table() {
         const CASES: u32 = 1_000_000;
 
+        let _watchdog = watchdog();
+
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
         let mut rng = Xorshift(0x5DEE_CE66_D5DE_ECE6);
@@ -845,6 +887,8 @@ mod tests {
     fn a_mixed_family_flood_stays_bounded() {
         const PER_FAMILY: u32 = 500_000;
         const CEILING_KIB: u64 = 32 * 1024;
+
+        let _watchdog = watchdog();
 
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
@@ -883,6 +927,7 @@ mod tests {
     /// rounding question.
     #[test]
     fn a_partial_refill_below_one_token_does_not_admit_a_query() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let t0 = Instant::now();
         assert!(rl.check_at(ip("198.51.100.9"), t0));
@@ -896,6 +941,7 @@ mod tests {
     /// is a factor of 1000 out: 999 ms denies, 1000 ms admits exactly one.
     #[test]
     fn exactly_one_token_of_elapsed_time_admits_exactly_one_query() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let t0 = Instant::now();
         assert!(rl.check_at(ip("198.51.100.10"), t0));
@@ -919,6 +965,7 @@ mod tests {
     /// refill can paper over the encoding.
     #[test]
     fn a_never_touched_slot_starts_full_rather_than_empty() {
+        let _watchdog = watchdog();
         let at_or_before_epoch = Instant::now();
         let rl = RateLimiter::new(1, 5);
         for i in 0..5 {
@@ -948,6 +995,8 @@ mod tests {
     fn two_prefixes_on_one_slot_share_the_bucket_without_resetting_it() {
         const VICTIMS: u32 = 4096;
         const PROBES: u32 = 4096;
+
+        let _watchdog = watchdog();
 
         let rl = RateLimiter::new(1, 1);
         let now = Instant::now();
@@ -990,6 +1039,8 @@ mod tests {
     fn the_set_of_colliding_prefixes_differs_between_limiters() {
         const VICTIMS: u32 = 4096;
         const PROBES: u32 = 4096;
+
+        let _watchdog = watchdog();
 
         let now = Instant::now();
         let first = RateLimiter::new(1, 1);
@@ -1043,6 +1094,7 @@ mod tests {
     /// it would carry a different timestamp.
     #[test]
     fn a_denied_query_leaves_its_slot_word_byte_identical() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let t0 = Instant::now();
         let prefix = ip("198.51.100.40");
@@ -1072,6 +1124,8 @@ mod tests {
     #[test]
     fn no_write_ever_touches_the_two_reserved_slot_bits() {
         const RESERVED: u64 = 0b11 << 62;
+
+        let _watchdog = watchdog();
 
         let rl = RateLimiter::new(MAX_RATE, MAX_RATE);
         let t0 = Instant::now();
@@ -1115,6 +1169,7 @@ mod tests {
     /// clock backwards and hand the next reader a longer gap than really passed.
     #[test]
     fn a_reading_that_moved_backwards_grants_nothing_and_stores_nothing() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         // Comfortably after the limiter's epoch, so stepping back stays positive.
         let t0 = Instant::now() + Duration::from_secs(120);
@@ -1142,6 +1197,195 @@ mod tests {
         );
     }
 
+    /// The half of the backwards band that nothing pinned: the reading that is
+    /// backwards **and still allowed**.
+    ///
+    /// `Band::Backwards => (deficit, last_ms)` -> `(deficit, now_ms)` and
+    /// `pack(charged, stamp)` -> `pack(charged, now_ms)` BOTH SURVIVED the whole
+    /// suite. `a_reading_that_moved_backwards_grants_nothing_and_stores_nothing`
+    /// looks like it covers this and does not: its bucket is already empty, so
+    /// the query is denied, and the denied path stores nothing at all — the
+    /// stamp the mutants change is never written, so both mutants pass it.
+    ///
+    /// With any headroom in the bucket the backwards query is *allowed*, and
+    /// then the stamp is written. Writing the backwards reading is the
+    /// last-writer-wins hazard `Band::Backwards` exists to stop: the slot's
+    /// clock moves back, and the next reader computes a gap longer than the
+    /// time that really passed and refills for free. Here that is worth a whole
+    /// bucket — a 30-second step back at 1 qps hands the prefix 30 tokens it
+    /// never earned, so a source that can nudge the clock (or simply lose a CAS
+    /// while holding a stale `now`) gets its limiter reset.
+    #[test]
+    fn a_backwards_reading_that_is_allowed_must_not_drag_the_slots_clock_back() {
+        let _watchdog = watchdog();
+        // Burst of 5 so the second query has headroom and is admitted, which is
+        // the whole point: an empty bucket denies, and a denial writes nothing.
+        let rl = RateLimiter::new(1, 5);
+        let t0 = Instant::now() + Duration::from_secs(300);
+        let prefix = ip("198.51.100.44");
+        let idx = rl.slot_of(prefix);
+
+        assert!(rl.check_at(prefix, t0), "the bucket starts full");
+        // Same field extraction as `unpack`: the stamp is the low 32 bits.
+        #[allow(clippy::cast_possible_truncation)]
+        let stamp_at_t0 = rl.slot_word(idx) as u32;
+
+        let backwards = t0
+            .checked_sub(Duration::from_secs(30))
+            .expect("instant is in range");
+        assert!(
+            rl.check_at(prefix, backwards),
+            "four tokens are left, so even a backwards reading is admitted; it is \
+             the stamp it leaves behind that is under test"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let stamp_now = rl.slot_word(idx) as u32;
+        assert_eq!(
+            stamp_now, stamp_at_t0,
+            "the slot's clock was dragged backwards by an out-of-order reading: \
+             {stamp_at_t0} became {stamp_now}. The next reader now sees 30 \
+             seconds of elapsed time that never happened"
+        );
+
+        // And the observable consequence, so this cannot be satisfied by a
+        // cosmetic change to the stored word: at `t0` no time has passed since
+        // the slot's stamp, so exactly the three remaining tokens are left.
+        for i in 0..3 {
+            assert!(
+                rl.check_at(prefix, t0),
+                "query {i} of the three tokens still owed was denied"
+            );
+        }
+        assert!(
+            !rl.check_at(prefix, t0),
+            "the bucket refilled from a gap that never elapsed: two queries plus \
+             three is the whole burst of five"
+        );
+    }
+
+    /// The three wrap bands, asserted on the classifier at its exact boundaries.
+    ///
+    /// `elapsed < WRAP_GUARD_MS` -> `<=`, `elapsed >= BACKWARDS_FLOOR_MS` -> `>`
+    /// and `BACKWARDS_FLOOR_MS = u32::MAX - STALE_MAX_MS + 1` -> `- STALE_MAX_MS`
+    /// all survived the whole suite. Each moves a band edge by one millisecond,
+    /// and no test in the tree lands within a millisecond of an edge — the
+    /// behavioural tests use 24 days, 25 days, 30 and 90 seconds, which is right
+    /// for what they assert and useless for where the splits sit.
+    ///
+    /// Two of the three are not observable through `check_at` at all: at an
+    /// apparent gap of 2^31 ms even 1 qps refills 2.1e9 milli-tokens, which is
+    /// past any capacity `MAX_RATE` allows, so `Ordinary` and `LongIdle` produce
+    /// the same full bucket. The split is still a documented contract and the
+    /// place a future SLIP or occupancy change will read, so it is asserted
+    /// where it lives.
+    #[test]
+    fn the_three_wrap_bands_split_exactly_at_the_documented_boundaries() {
+        // `band` only ever sees `now_ms.wrapping_sub(last_ms)`, so a `last_ms`
+        // of zero makes the gap and the reading the same number.
+        assert!(
+            matches!(band(WRAP_GUARD_MS - 1, 0), Band::Ordinary(e) if e == WRAP_GUARD_MS - 1),
+            "one millisecond short of 24.86 days is an ordinary gap and must \
+             refill normally"
+        );
+        assert!(
+            matches!(band(WRAP_GUARD_MS, 0), Band::LongIdle),
+            "2^31 ms exactly is the first apparent gap that cannot be trusted as \
+             elapsed time"
+        );
+        assert!(
+            matches!(band(BACKWARDS_FLOOR_MS - 1, 0), Band::LongIdle),
+            "one millisecond short of the stale window is still read as a long \
+             idle, so the bucket is full"
+        );
+        assert!(
+            matches!(band(BACKWARDS_FLOOR_MS, 0), Band::Backwards),
+            "2^32 - STALE_MAX exactly is the first reading treated as backwards"
+        );
+        assert!(matches!(band(u32::MAX, 0), Band::Backwards));
+
+        // Stated the other way round, as a step *backwards*, which is how the
+        // ruling words it and how an operator would reason about it: a step back
+        // of up to and including STALE_MAX is backwards, one further is a long
+        // idle. This is the assertion that pins BACKWARDS_FLOOR_MS's `+ 1`.
+        assert!(
+            matches!(band(0, 1), Band::Backwards),
+            "1 ms back is backwards"
+        );
+        assert!(
+            matches!(band(0, STALE_MAX_MS), Band::Backwards),
+            "a step back of exactly the 60-second stale window is still backwards"
+        );
+        assert!(
+            matches!(band(0, STALE_MAX_MS + 1), Band::LongIdle),
+            "one millisecond beyond the stale window is indistinguishable from \
+             49.7 days of idleness, and the ruling favours the overwhelmingly \
+             more likely reading"
+        );
+        assert_eq!(
+            u32::MAX - BACKWARDS_FLOOR_MS + 1,
+            STALE_MAX_MS,
+            "the backwards band must be exactly STALE_MAX_MS wide"
+        );
+    }
+
+    /// `pack` promises bits 63..62 are always written as zero, and it is the
+    /// `& DEFICIT_MASK` that delivers it.
+    ///
+    /// `DEFICIT_MASK: (1 << 30) - 1` -> `(1 << 32) - 1` and dropping the mask
+    /// altogether both survived. `no_write_ever_touches_the_two_reserved_slot_bits`
+    /// drives the largest deficit a *configured* limiter can reach, and
+    /// `MAX_RATE` keeps that under 2^30, so the mask never has anything to do —
+    /// the test passes because of the clamp, not because of the mask, and it
+    /// cannot tell which one it is relying on. VEGA-041's SLIP counter is going
+    /// to write those two bits; if the mask is the thing keeping them clear, it
+    /// needs its own test, and if the clamp is, that has to be said out loud.
+    /// Both are asserted here.
+    #[test]
+    fn pack_never_writes_the_reserved_bits_whatever_deficit_it_is_handed() {
+        const RESERVED: u64 = 0b11 << 62;
+
+        for deficit in [
+            0,
+            1,
+            u64::from(MAX_RATE) * MILLI, // the largest configurable
+            DEFICIT_MASK,
+            DEFICIT_MASK + 1,
+            1 << 30,
+            1 << 31,
+            1 << 62,
+            u64::MAX,
+        ] {
+            let word = pack(deficit, 0xdead_beef);
+            assert_eq!(
+                word & RESERVED,
+                0,
+                "pack({deficit}) wrote {word:#018x}, which reaches the two bits \
+                 reserved for VEGA-041's SLIP counter"
+            );
+            // The truncation IS the field extraction: `last_ms` is the low
+            // 32 bits of the word by construction.
+            #[allow(clippy::cast_possible_truncation)]
+            let stored_stamp = word as u32;
+            assert_eq!(
+                stored_stamp, 0xdead_beef,
+                "pack({deficit}) corrupted the timestamp in the low 32 bits"
+            );
+            assert_eq!(
+                unpack(word),
+                (deficit & DEFICIT_MASK, 0xdead_beef),
+                "pack/unpack must round-trip the field, truncated to its width"
+            );
+        }
+
+        // The clamp is the other half of the guarantee, and the one the doc
+        // comment on MAX_RATE claims: a fully configured limiter's capacity
+        // cannot reach the field's width, let alone the reserved bits.
+        assert!(
+            u64::from(MAX_RATE) * MILLI <= DEFICIT_MASK,
+            "MAX_RATE * MILLI must fit the 30-bit deficit field"
+        );
+    }
+
     /// Scenario: A genuinely long idle slot is full, not stuck
     /// features/rate-limiting.feature:338
     ///
@@ -1163,6 +1407,7 @@ mod tests {
     /// resolver or a throttled attack source does before going quiet.
     #[test]
     fn a_long_idle_slot_is_full_rather_than_stuck() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let t0 = Instant::now();
         let prefix = ip("198.51.100.42");
@@ -1206,6 +1451,7 @@ mod tests {
     /// reason.
     #[test]
     fn a_backwards_step_beyond_the_stale_window_is_read_as_a_long_idle() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let t0 = Instant::now() + Duration::from_secs(300);
         let prefix = ip("198.51.100.43");
@@ -1230,6 +1476,7 @@ mod tests {
     /// say — denies a legitimate resolver that went quiet over a long weekend.
     #[test]
     fn a_gap_just_short_of_the_wrap_guard_still_refills() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(1, 1);
         let t0 = Instant::now();
         assert!(rl.check_at(ip("198.51.100.13"), t0));
@@ -1251,6 +1498,7 @@ mod tests {
     /// zero clamps to one (ruling §5.6).
     #[test]
     fn a_zero_qps_and_burst_are_clamped_instead_of_panicking() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(0, 0);
         let now = Instant::now();
         assert!(
@@ -1268,6 +1516,7 @@ mod tests {
     /// MAX_RATE = 1,000,000 and burst*1000 stays under 2^30.
     #[test]
     fn a_u32_max_qps_and_burst_are_clamped_instead_of_overflowing() {
+        let _watchdog = watchdog();
         let rl = RateLimiter::new(u32::MAX, u32::MAX);
         let now = Instant::now();
         for i in 0..1000 {
@@ -1306,6 +1555,8 @@ mod tests {
         const THREADS: usize = 16;
         const PER_THREAD: usize = 200;
         const BURST: u32 = 500;
+
+        let _watchdog = watchdog();
 
         let rl = Arc::new(RateLimiter::new(1, BURST));
         let allowed = Arc::new(AtomicUsize::new(0));
@@ -1353,6 +1604,8 @@ mod tests {
     fn a_single_threaded_run_hands_out_exactly_the_burst() {
         const BURST: u32 = 500;
 
+        let _watchdog = watchdog();
+
         let rl = RateLimiter::new(1, BURST);
         let now = Instant::now();
         let source = ip("198.51.100.31");
@@ -1375,6 +1628,8 @@ mod tests {
         const THREADS: usize = 2;
         const PER_THREAD: usize = 400;
         const BURST: u32 = 500;
+
+        let _watchdog = watchdog();
 
         let rl = Arc::new(RateLimiter::new(1, BURST));
         let allowed = Arc::new(AtomicUsize::new(0));
@@ -1401,59 +1656,311 @@ mod tests {
         assert_eq!(allowed.load(Ordering::Relaxed), BURST as usize);
     }
 
+    /// The retry itself, with no slack to hide a lost attempt in.
+    ///
+    /// `CAS_ATTEMPTS: 8 -> 1` SURVIVED the whole suite. The test above is what
+    /// should have caught it and cannot: it issues 800 checks for a burst of
+    /// 500, so up to 300 of them may fail spuriously and the total is still
+    /// exactly 500. One attempt per check means every lost compare-exchange is
+    /// a query refused for no reason — a legitimate resolver dropped, silently,
+    /// because another host in its /24 happened to be mid-update.
+    ///
+    /// Here the checks and the tokens are the same number, so a single lost
+    /// attempt is one token undelivered and the assertion is exact. The bound
+    /// still has to be a bound: eight consecutive failures with two writers
+    /// means one thread lost the line eight times inside its own load-to-CAS
+    /// window, which is why `<= 8` fails closed and `== 1` does not.
+    #[test]
+    fn a_contended_slot_still_hands_out_every_token_when_attempts_equal_tokens() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier,
+        };
+
+        const THREADS: usize = 2;
+        const BURST: u32 = 2_000;
+        const PER_THREAD: usize = BURST as usize / THREADS;
+
+        let _watchdog = watchdog();
+
+        let rl = Arc::new(RateLimiter::new(1, BURST));
+        let allowed = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let now = Instant::now();
+        let source = ip("198.51.100.34");
+
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let (rl, allowed, barrier) =
+                (Arc::clone(&rl), Arc::clone(&allowed), Arc::clone(&barrier));
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..PER_THREAD {
+                    if rl.check_at(source, now) {
+                        allowed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker finishes");
+        }
+
+        assert_eq!(
+            allowed.load(Ordering::Relaxed),
+            BURST as usize,
+            "{THREADS} threads issued exactly {BURST} checks against a bucket \
+             holding exactly {BURST} tokens, and some were refused. Every one of \
+             those is a compare-exchange the retry loop gave up on: the loop is \
+             not retrying enough to absorb ordinary contention"
+        );
+    }
+
     /// Scenario: A sustained storm against a single slot completes in bounded time
     /// features/rate-limiting.feature:433
     ///
     /// CLAUDE.md bounds every loop on the query path, and a CAS loop is the
-    /// classic place that rule is broken. Run off-thread behind a channel
-    /// timeout so a mutant that removes the 8-attempt cap fails this test instead
-    /// of hanging the whole binary. 800,000 in-process checks, no sockets, no
-    /// sleeping.
+    /// classic place that rule is broken. 800,000 in-process checks, no sockets,
+    /// no sleeping.
+    ///
+    /// This used to run the whole storm on a detached thread and bound the
+    /// *channel* with `recv_timeout`. That guard was worse than none: a mutant
+    /// that removes the 8-attempt cap leaves eight workers and their coordinator
+    /// spinning after the test has already reported, so the suite goes green-ish
+    /// while nine threads burn cores in a process nobody reaps. The storm now
+    /// runs on this thread under the process watchdog, which can actually stop
+    /// it — see `src/testutil.rs`.
     #[test]
     fn a_storm_against_a_single_slot_completes_in_bounded_time() {
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
-            mpsc, Arc, Barrier,
+            Arc, Barrier,
         };
 
         const THREADS: usize = 8;
         const PER_THREAD: usize = 100_000;
 
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let rl = Arc::new(RateLimiter::new(1, 1));
-            let allowed = Arc::new(AtomicUsize::new(0));
-            let barrier = Arc::new(Barrier::new(THREADS));
-            let now = Instant::now();
-            let source = ip("198.51.100.33");
+        let _watchdog = watchdog();
+        let rl = Arc::new(RateLimiter::new(1, 1));
+        let allowed = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let now = Instant::now();
+        let source = ip("198.51.100.33");
 
-            let mut handles = Vec::new();
-            for _ in 0..THREADS {
-                let (rl, allowed, barrier) =
-                    (Arc::clone(&rl), Arc::clone(&allowed), Arc::clone(&barrier));
-                handles.push(std::thread::spawn(move || {
-                    barrier.wait();
-                    for _ in 0..PER_THREAD {
-                        if rl.check_at(source, now) {
-                            allowed.fetch_add(1, Ordering::Relaxed);
-                        }
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let (rl, allowed, barrier) =
+                (Arc::clone(&rl), Arc::clone(&allowed), Arc::clone(&barrier));
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..PER_THREAD {
+                    if rl.check_at(source, now) {
+                        allowed.fetch_add(1, Ordering::Relaxed);
                     }
-                }));
-            }
-            for h in handles {
-                h.join().expect("worker finishes");
-            }
-            let _ = tx.send(allowed.load(Ordering::Relaxed));
-        });
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker finishes");
+        }
 
-        let allowed = rx
-            .recv_timeout(Duration::from_secs(60))
-            .expect("a storm on one slot must terminate: the CAS loop is bounded at 8 attempts");
         assert_eq!(
-            allowed, 1,
+            allowed.load(Ordering::Relaxed),
+            1,
             "a frozen clock and a burst of one admit exactly one query however \
              many threads race for it"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Properties. Stated over pseudo-random traffic rather than over a handful
+    // of chosen addresses, with the seed written down so any failure replays
+    // exactly. `Xorshift` rather than proptest because these need `slot_of` and
+    // `slot_word`, which are `#[cfg(test)]` and cannot leave this crate.
+    // -----------------------------------------------------------------------
+
+    /// A pseudo-random address of either family, plus a clock offset in ms.
+    ///
+    /// The offsets deliberately straddle every band: ordinary gaps, gaps past
+    /// the 24.86-day guard, and steps backwards inside and outside the stale
+    /// window.
+    fn traffic(rng: &mut Xorshift) -> (IpAddr, i64) {
+        let a = rng.next_u64();
+        let b = rng.next_u64();
+        let addr = match a % 3 {
+            #[allow(clippy::cast_possible_truncation)]
+            0 => IpAddr::V4(Ipv4Addr::from(a as u32)),
+            1 => IpAddr::V6(Ipv6Addr::from((u128::from(a) << 64) | u128::from(b))),
+            // IPv4-mapped, which is what a `[::]`-bound socket hands us.
+            #[allow(clippy::cast_possible_truncation)]
+            _ => IpAddr::V6(Ipv4Addr::from(b as u32).to_ipv6_mapped()),
+        };
+        #[allow(clippy::cast_possible_wrap)]
+        let offset = match b % 5 {
+            0 => 0,
+            1 => (b >> 8) as i64 % 5_000,
+            2 => (b >> 8) as i64 % 3_000_000_000,
+            3 => -((b >> 8) as i64 % 90_000),
+            _ => -((b >> 8) as i64 % 500),
+        };
+        (addr, offset)
+    }
+
+    /// PROPERTY: over any traffic at all, every slot word the limiter writes
+    /// leaves bits 63..62 clear, never lets the deficit exceed `capacity_milli`,
+    /// and never writes anything on the path that refuses a query.
+    ///
+    /// The three invariants VEGA-003's encoding rests on, checked after every
+    /// single call rather than at the end, so the first violating call is the
+    /// one reported. The bit-63..62 half is what VEGA-041's SLIP counter is
+    /// going to build on; the deficit half is the token bucket actually being a
+    /// bound; the no-write half is the reason a flood does not bounce a cache
+    /// line between every core.
+    #[test]
+    fn the_slot_encoding_holds_over_pseudo_random_traffic() {
+        const RESERVED: u64 = 0b11 << 62;
+        const SEED: u64 = 0x0BAD_C0FF_EE0D_DF00;
+        const CASES: u32 = 200_000;
+
+        let _watchdog = watchdog();
+        // Deliberately not the smallest configuration: a large burst leaves
+        // headroom, so a good fraction of these calls are ALLOWED and actually
+        // exercise the store, while the rest exercise the refusal.
+        let rl = RateLimiter::new(1_000, 64);
+        let capacity = u64::from(rl.capacity_milli);
+        let base = Instant::now() + Duration::from_secs(3_600);
+        let mut rng = Xorshift(SEED);
+
+        for case in 0..CASES {
+            let (addr, offset) = traffic(&mut rng);
+            let now = if offset >= 0 {
+                #[allow(clippy::cast_sign_loss)]
+                let d = Duration::from_millis(offset as u64);
+                base + d
+            } else {
+                #[allow(clippy::cast_sign_loss)]
+                let d = Duration::from_millis((-offset) as u64);
+                base.checked_sub(d).expect("instant is in range")
+            };
+
+            let idx = rl.slot_of(addr);
+            let before = rl.slot_word(idx);
+            let allowed = rl.check_at(addr, now);
+            let after = rl.slot_word(idx);
+
+            assert_eq!(
+                after & RESERVED,
+                0,
+                "seed {SEED:#x} case {case}: {addr} at {offset} ms wrote \
+                 {after:#018x}, which reaches the two reserved slot bits"
+            );
+            assert!(
+                unpack(after).0 <= capacity,
+                "seed {SEED:#x} case {case}: {addr} at {offset} ms left a deficit \
+                 of {} against a capacity of {capacity}; the bucket is not a bound",
+                unpack(after).0
+            );
+            assert!(
+                allowed || after == before,
+                "seed {SEED:#x} case {case}: {addr} at {offset} ms was REFUSED and \
+                 still wrote its slot: {before:#018x} became {after:#018x}. Under a \
+                 flood the refusal path is the hot one, and a token bucket that \
+                 refuses has not consumed anything"
+            );
+        }
+    }
+
+    /// PROPERTY: the slot is a function of the *prefix* and of nothing else.
+    ///
+    /// Every host inside one /24 or /56 must land on one slot, hosts across the
+    /// boundary must not be forced to, an IPv4-mapped address must key exactly
+    /// as its bare form, and the canonical key's payload must never reach the
+    /// family tag in bits 63..62. Stated over random addresses rather than the
+    /// four hand-picked pairs above, which between them cover eight of the 2^32
+    /// IPv4 addresses and none of the awkward ones.
+    #[test]
+    fn the_key_is_a_function_of_the_prefix_over_pseudo_random_addresses() {
+        const SEED: u64 = 0x5EED_0BEE_F00D_1234;
+        const CASES: u32 = 100_000;
+        const TAG_BITS: u64 = 0b11 << 62;
+
+        let _watchdog = watchdog();
+        let rl = RateLimiter::new(1, 1);
+        let mut rng = Xorshift(SEED);
+
+        for case in 0..CASES {
+            let a = rng.next_u64();
+            let b = rng.next_u64();
+            #[allow(clippy::cast_possible_truncation)]
+            let v4 = Ipv4Addr::from(a as u32);
+            let v6 = Ipv6Addr::from((u128::from(a) << 64) | u128::from(b));
+
+            // The family tag, asserted on what it is FOR rather than against
+            // `KEY_TAG_V4` / `KEY_TAG_V6`. An earlier draft of this test compared
+            // against the constants, and `KEY_TAG_V6: 1 << 62 -> 0` — which
+            // deletes the tag outright — passed it, because the expectation
+            // moved with the mutation.
+            //
+            // First: whatever the two values are, each family's tag is the same
+            // for every address in it, so no prefix payload has overflowed into
+            // bits 63..62.
+            assert_eq!(
+                canonical_key(IpAddr::V4(v4)) & TAG_BITS,
+                canonical_key(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) & TAG_BITS,
+                "seed {SEED:#x} case {case}: the /24 payload of {v4} reached the \
+                 family tag in bits 63..62"
+            );
+            assert_eq!(
+                canonical_key(IpAddr::V6(v6)) & TAG_BITS,
+                canonical_key(IpAddr::V6(Ipv6Addr::from(1u128 << 72))) & TAG_BITS,
+                "seed {SEED:#x} case {case}: the /56 payload of {v6} reached the \
+                 family tag in bits 63..62"
+            );
+
+            // Second, and the reason the tag exists: the IPv6 /56 whose 56-bit
+            // payload is bit-for-bit an IPv4 /24 must not be the same bucket.
+            // Without a tag an IPv6 attacker denies an unrelated IPv4 network by
+            // arithmetic. `>> 8` is the /24 payload, hard-coded so this stays a
+            // real collision if IPV4_PREFIX_BITS moves.
+            let aliasing_v6 = Ipv6Addr::from(u128::from(u32::from(v4) >> 8) << 72);
+            assert_ne!(
+                canonical_key(IpAddr::V4(v4)),
+                canonical_key(IpAddr::V6(aliasing_v6)),
+                "seed {SEED:#x} case {case}: the /24 of {v4} and the /56 of \
+                 {aliasing_v6} produced one key; an IPv6 source can now drain an \
+                 unrelated IPv4 network's bucket"
+            );
+
+            // Same /24, whatever the host octet: one key, one slot.
+            #[allow(clippy::cast_possible_truncation)]
+            let sibling = Ipv4Addr::from((u32::from(v4) & 0xffff_ff00) | (b as u32 & 0xff));
+            assert_eq!(
+                rl.slot_of(IpAddr::V4(v4)),
+                rl.slot_of(IpAddr::V4(sibling)),
+                "seed {SEED:#x} case {case}: {v4} and {sibling} are in one /24 and \
+                 got different slots; keying on the host octet is what let an \
+                 attacker mint a bucket per forged address"
+            );
+
+            // Same /56, whatever the low 72 bits.
+            let v6_sibling =
+                Ipv6Addr::from((u128::from(v6) & !((1u128 << 72) - 1)) | u128::from(b));
+            assert_eq!(
+                rl.slot_of(IpAddr::V6(v6)),
+                rl.slot_of(IpAddr::V6(v6_sibling)),
+                "seed {SEED:#x} case {case}: {v6} and {v6_sibling} are in one /56 \
+                 and got different slots"
+            );
+
+            // Mapped and bare are the same source, so they are the same bucket.
+            assert_eq!(
+                rl.slot_of(IpAddr::V4(v4)),
+                rl.slot_of(IpAddr::V6(v4.to_ipv6_mapped())),
+                "seed {SEED:#x} case {case}: {v4} and its IPv4-mapped form got \
+                 different slots, so any client reaching a [::] socket has two \
+                 buckets instead of one"
+            );
+        }
     }
 
     /// Scenario: Concurrent checks across many distinct prefixes all land
@@ -1474,6 +1981,8 @@ mod tests {
 
         const THREADS: u32 = 8;
         const PER_THREAD: u32 = 500;
+
+        let _watchdog = watchdog();
 
         let rl = Arc::new(RateLimiter::new(1, 1));
         let allowed = Arc::new(AtomicUsize::new(0));
@@ -1524,6 +2033,8 @@ mod tests {
     fn the_configured_qps_covers_a_whole_slash_24_not_each_host_in_it() {
         const HOSTS: u32 = 200;
         const BURST: u32 = 50;
+
+        let _watchdog = watchdog();
 
         let rl = RateLimiter::new(50, BURST);
         let now = Instant::now();

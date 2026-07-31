@@ -345,6 +345,11 @@ mod tests {
     fn concurrent_transitions_settle_on_the_furthest_phase() {
         use std::sync::{Arc, Barrier};
 
+        // `enter` is a CAS retry loop, so the failure mode of losing its exit
+        // condition is four threads spinning and this `join` never returning —
+        // a hang, not a failure. Bounded by the process, not by a channel; see
+        // `src/testutil.rs`.
+        let _watchdog = crate::testutil::arm(Duration::from_secs(30));
         let lifecycle = Arc::new(Lifecycle::new());
         let barrier = Arc::new(Barrier::new(4));
         let mut handles = Vec::new();
@@ -365,5 +370,75 @@ mod tests {
             handle.join().expect("worker finishes");
         }
         assert_eq!(lifecycle.phase(), Phase::Closing);
+    }
+
+    #[test]
+    fn a_storm_of_transitions_terminates_and_never_loses_the_furthest_phase() {
+        // `Err(actual) => current = actual` -> `Err(_) => {}` SURVIVED the whole
+        // suite. Without the write-back `current` is stale for ever, so every
+        // subsequent compare-exchange fails and `enter` spins — a wedged
+        // shutdown, on the path that publishes `draining` to `/readyz`. The test
+        // above cannot catch it: four threads racing one atomic once each almost
+        // never produce a failed exchange, and `compare_exchange_weak` may fail
+        // spuriously even when nobody else is writing.
+        //
+        // Contention here is structural rather than hoped for: every thread
+        // walks the *same* array of lifecycles in the same order, so they stay
+        // in step and collide on each one, and each of the four is trying to
+        // write a different phase so none of them can take the `current >=
+        // target` early return. 20,000 transitions across 5,000 cells.
+        //
+        // The bound is the process watchdog, not a channel: a spin has to fail
+        // this test, not leak four threads and report anyway. See
+        // `src/testutil.rs`.
+        use std::sync::{Arc, Barrier};
+
+        const CELLS: usize = 5_000;
+        const PHASES: [Phase; 4] = [
+            Phase::Serving,
+            Phase::Draining,
+            Phase::Stopping,
+            Phase::Closing,
+        ];
+
+        let _watchdog = crate::testutil::arm(Duration::from_secs(30));
+        let cells: Arc<Vec<Lifecycle>> = Arc::new((0..CELLS).map(|_| Lifecycle::new()).collect());
+        let barrier = Arc::new(Barrier::new(PHASES.len()));
+
+        let mut handles = Vec::new();
+        for phase in PHASES {
+            let cells = Arc::clone(&cells);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut won = 0usize;
+                for cell in cells.iter() {
+                    if cell.enter(phase) {
+                        won += 1;
+                    }
+                }
+                won
+            }));
+        }
+        let won: usize = handles
+            .into_iter()
+            .map(|h| h.join().expect("worker finishes"))
+            .sum();
+
+        for (i, cell) in cells.iter().enumerate() {
+            assert_eq!(
+                cell.phase(),
+                Phase::Closing,
+                "lifecycle {i} settled on {} rather than the furthest phase any \
+                 thread published: a compare-exchange result was dropped",
+                cell.phase()
+            );
+        }
+        assert!(
+            won >= CELLS,
+            "only {won} of {} transitions reported that they made the move; \
+             every cell must be advanced at least once",
+            CELLS * PHASES.len()
+        );
     }
 }

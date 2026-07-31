@@ -6,6 +6,7 @@
 //! bug report.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use hickory_proto::rr::{LowerName, Name, RData, Record, RecordType};
 use proptest::prelude::*;
@@ -14,6 +15,19 @@ use vega::{
     editor::{Change, ConfigEditor},
     zone::{Answer, Zone},
 };
+
+/// The process watchdog, shared by path rather than copied.
+///
+/// Proptest is the worst possible place to leave a spin unguarded: it drives
+/// hundreds of generated zones and query names through `Zone::lookup`, so it is
+/// far more likely than any example-based test to *find* the input that does not
+/// terminate — and without a guard it finds it by hanging.
+#[path = "../src/testutil.rs"]
+mod testutil;
+
+/// Per-property budget. 512 cases of zone construction and lookup take single
+/// -digit seconds; two minutes is only reachable by a case that never returns.
+const WATCHDOG: Duration = Duration::from_secs(120);
 
 const ORIGIN: &str = "example.test";
 
@@ -136,6 +150,7 @@ proptest! {
     /// never a synthesised wildcard answer, and never a mixture.
     #[test]
     fn a_wildcard_never_shadows_an_exact_name(cfg in zone_config()) {
+        let _watchdog = testutil::arm(WATCHDOG);
         let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
 
         for spec in &cfg.records {
@@ -187,6 +202,7 @@ proptest! {
         name in query_name(),
         qtype in query_type(),
     ) {
+        let _watchdog = testutil::arm(WATCHDOG);
         let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
         let queried = lower(&name);
 
@@ -213,6 +229,7 @@ proptest! {
         name in query_name(),
         qtype in query_type(),
     ) {
+        let _watchdog = testutil::arm(WATCHDOG);
         let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
         let queried = lower(&name);
 
@@ -245,6 +262,7 @@ proptest! {
         name in query_name(),
         qtype in query_type(),
     ) {
+        let _watchdog = testutil::arm(WATCHDOG);
         let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
         let queried = lower(&name);
         let answer = zone.lookup(&queried, qtype);
@@ -269,6 +287,7 @@ proptest! {
         name in query_name(),
         qtype in query_type(),
     ) {
+        let _watchdog = testutil::arm(WATCHDOG);
         let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
         let queried = lower(&name);
 
@@ -297,6 +316,7 @@ proptest! {
     /// see `an_rrset_never_mixes_ttls` below.
     #[test]
     fn answers_carry_the_configured_ttl(cfg in zone_config()) {
+        let _watchdog = testutil::arm(WATCHDOG);
         let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
 
         for spec in &cfg.records {
@@ -709,6 +729,7 @@ proptest! {
         name in walk_query_name(),
         qtype in walk_query_type(),
     ) {
+        let _watchdog = testutil::arm(WATCHDOG);
         let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
         let Some(naive) = NaiveZone::build(&cfg) else { return Ok(()); };
         let queried = lower(&name);
@@ -744,6 +765,7 @@ proptest! {
         extra in 0usize..40,
         qtype in walk_query_type(),
     ) {
+        let _watchdog = testutil::arm(WATCHDOG);
         let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
 
         let base = if tail.is_empty() {
@@ -813,6 +835,7 @@ proptest! {
         name in query_name(),
         qtype in query_type(),
     ) {
+        let _watchdog = testutil::arm(WATCHDOG);
         let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
 
         if let Answer::Records(records) = zone.lookup(&lower(&name), qtype) {
@@ -894,6 +917,89 @@ proptest! {
         prop_assert!(
             Zone::from_config(&cfg).is_err(),
             "a CNAME sharing {clash:?} with another type must be rejected at build time"
+        );
+    }
+
+    /// INVARIANT (RFC 4592 §2.2, RFC 2308 §2.2.1, RFC 8020 §2): if the zone
+    /// synthesises an answer for a name from a wildcard, then **that name
+    /// exists**, and every other query at it is NODATA — never NXDOMAIN.
+    ///
+    /// BUG — VEGA-083, corroborated on the wire and WIDER THAN FILED. The issue
+    /// reports the asymmetry for QTYPE=ANY. It is not confined to ANY: it is
+    /// every qtype the wildcard does not carry. Against a server holding
+    /// `*.dev A 203.0.113.50` and `*.dev TXT "hello"`, over UDP on
+    /// 127.0.0.1, hickory 0.26.1 client, one process:
+    ///
+    /// ```text
+    ///   a.dev.example.com A     -> rcode=NOERROR  aa=1 an=1 ns=0   A 203.0.113.50
+    ///   a.dev.example.com TXT   -> rcode=NOERROR  aa=1 an=1 ns=0   TXT "hello"
+    ///   a.dev.example.com AAAA  -> rcode=NXDOMAIN aa=1 an=0 ns=1   SOA (minimum 60)
+    ///   a.dev.example.com ANY   -> rcode=NXDOMAIN aa=1 an=0 ns=1   SOA (minimum 60)
+    /// ```
+    ///
+    /// AAAA is the one that matters operationally. ANY is rare and increasingly
+    /// refused outright (RFC 8482); AAAA is sent by every dual-stack client
+    /// alongside every A. So the *ordinary* resolution of a wildcard-covered
+    /// name emits an authoritative NXDOMAIN as a matter of course, and RFC 2308
+    /// §5 says that answer is cached for the SOA MINIMUM — 60 s here, commonly
+    /// 3600 in the wild. Under RFC 8020 a resolver may then answer NXDOMAIN for
+    /// the whole subtree beneath it. The wildcard's own A record goes out of
+    /// service at any resolver that happened to ask for AAAA first.
+    ///
+    /// Two different code paths, one root cause — a wildcard-covered name is
+    /// absent from `Zone::names`:
+    ///   * ANY is answered in `handler.rs` from `Zone::has_name`, which is
+    ///     `self.names.contains(name)` and knows nothing about synthesis;
+    ///   * every other type falls out of `Zone::resolve`'s wildcard walk with
+    ///     `Resolution::NxDomain` when no wildcard of that type matches.
+    ///
+    /// `features/zone-lookup.feature:174` ("An ANY query does not synthesise a
+    /// wildcard answer") currently writes this down as intended behaviour, with
+    /// the code as its justification. It is a bug, not a contract, and the
+    /// scenario should be inverted when VEGA-083 is fixed.
+    #[test]
+    #[ignore = "BUG VEGA-083: a wildcard-covered name answers NXDOMAIN for any type the wildcard does not carry (RFC 4592 s2.2, RFC 2308 s2.2.1)"]
+    fn a_wildcard_covered_name_exists_for_every_type(
+        cfg in zone_config(),
+        name in query_name(),
+        qtype in query_type(),
+    ) {
+        let _watchdog = testutil::arm(WATCHDOG);
+        let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
+        let queried = lower(&name);
+
+        // Only names the zone actually synthesises for are in scope: the name
+        // must be answered from a wildcard for at least one type, and must not
+        // have an exact record set of its own.
+        let covered = [
+            RecordType::A, RecordType::AAAA, RecordType::TXT,
+            RecordType::MX, RecordType::CNAME, RecordType::NS,
+        ]
+        .into_iter()
+        .any(|t| {
+            matches!(zone.lookup(&queried, t), Answer::Records(records)
+                if !records.is_empty()
+                    && !cfg.records.iter().any(|s| {
+                        !is_wildcard(&s.name)
+                            && qualify(&s.name).to_lowercase() == name.to_lowercase()
+                    }))
+        });
+        prop_assume!(covered);
+
+        prop_assert!(
+            zone.has_name(&queried),
+            "{name} is synthesised from a wildcard, so it exists (RFC 4592 §2.2); \
+             `has_name` says otherwise, which is what makes QTYPE=ANY there an \
+             authoritative NXDOMAIN"
+        );
+        prop_assert_ne!(
+            zone.lookup(&queried, qtype),
+            Answer::NxDomain,
+            "{} at {} is NXDOMAIN even though the name has a source of synthesis. \
+             RFC 2308 §2.2.1 makes this NODATA; as NXDOMAIN it is cached for the \
+             SOA MINIMUM and, under RFC 8020, poisons the whole subtree",
+            qtype,
+            name
         );
     }
 }

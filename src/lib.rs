@@ -44,6 +44,13 @@ pub mod shutdown;
 pub mod ui;
 pub mod zone;
 
+/// The test harness's own guard rail: a watchdog that bounds the *process*, so
+/// a test for "this loop terminates" fails loudly instead of leaking a spinning
+/// thread. Compiled only under `cfg(test)`; integration tests pull the same file
+/// in by path so there is one implementation of the rule.
+#[cfg(test)]
+mod testutil;
+
 /// Crate version, as reported by `--version`, `/version` and the `version.<zone>` record.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

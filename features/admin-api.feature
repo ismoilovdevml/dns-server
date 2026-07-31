@@ -131,13 +131,91 @@ Feature: Admin HTTP API
     When the Prometheus exposition is rendered
     Then dns_zone_records is 3
 
+  # -------------------------------- WHAT WAS COUNTED VS WHAT WAS SENT
+  #
+  # dns_responses_total is the series an operator pages on, so it has to mean
+  # what its HELP text says it means. Two branches make "the rcode we resolved"
+  # and "the rcode the client received" differ, and neither is reachable from a
+  # packet. hickory's MessageResponse::encode catches an emit failure, throws
+  # the part-built buffer away, puts a bare SERVFAIL header on the wire and
+  # reports Ok(ResponseInfo{ServFail}); and a write to a socket that has gone
+  # away sends nothing at all. Both are driven by a ResponseHandler double in
+  # src/handler.rs's test module, because Vega clamps every encoder budget to at
+  # least 512 bytes (VEGA-001) while a question is at most ~272, so no client
+  # can provoke either one and no wire test can reach them by accident.
+
+  @happy @enforced src/handler.rs:1425
+  Scenario: A response that is written is counted under the rcode it carried
+    Given a zone with an A record for "www"
+    When a client queries "www.example.com" for A and the write succeeds
+    Then the datagram on the wire carries rcode NOERROR
+    And dns_responses_total for rcode noerror is 1
+    And dns_send_errors_total is 0
+
+  @boundary @enforced src/handler.rs:1458
+  Scenario: An answer the encoder cannot fit is counted as the SERVFAIL that was sent
+    # This is VEGA-014 itself. The encoder ran out of room, so what reached the
+    # client was a bare SERVFAIL header - and counting the NOERROR we had
+    # resolved left dns_responses_total{rcode="servfail"} reading zero during
+    # exactly the failure it exists to reveal.
+    Given a zone with an A record for "www"
+    When the response encoder runs out of room and a bare SERVFAIL header is sent
+    Then the datagram on the wire carries rcode SERVFAIL
+    And dns_responses_total for rcode servfail is 1
+    And dns_responses_total for rcode noerror is 0
+
+  @malformed @enforced src/handler.rs:1510
+  Scenario: A response that cannot be written is counted as a send error
+    # src/metrics.rs send_error and the handler's serve_failed were both 0%
+    # covered, so dns_send_errors_total was dead instrumentation: the one series
+    # that separates "we are answering SERVFAIL" from "we are answering nothing".
+    Given a client whose socket has gone away
+    When the response is written and the write fails
+    Then nothing is put on the wire
+    And dns_send_errors_total is 1
+    And the handler reports SERVFAIL back to the server
+
+  @boundary @enforced src/handler.rs:1550
+  Scenario: A response that never reached the socket is still counted in dns_responses_total
+    # DECIDED, and decided against what the code does today - see VEGA-088.
+    # dns_responses_total is documented as "DNS responses sent". A write that
+    # failed sent nothing; the client will time out rather than see a SERVFAIL,
+    # and the rate-limiter drop below books no response at all for the same
+    # outcome. The two conventions disagree. This scenario pins the one in force
+    # so that changing it has to be deliberate, because it changes the meaning
+    # of a series operators alert on.
+    Given a client whose socket has gone away
+    When the response is written and the write fails
+    Then dns_responses_total for rcode servfail is 1
+
+  @empty @enforced src/handler.rs:1583
+  Scenario: A query dropped by the rate limiter is counted as no response at all
+    # The other half of that disagreement. A rate-limited UDP query is answered
+    # with silence on purpose, so no forged source receives a packet from us,
+    # and it books nothing in dns_responses_total.
+    Given a rate limiter whose bucket for the source is empty
+    When a UDP client queries "www.example.com" for A
+    Then nothing is put on the wire
+    And dns_rate_limited_total is 1
+    And every dns_responses_total series is 0
+
+  @hostile @enforced src/handler.rs:1627
+  Scenario: Every failed write is counted, not just the first
+    # A downstream outage produces these in bursts. A counter that moved once
+    # and then latched would make a total outage look like one dropped packet.
+    Given a client whose socket has gone away
+    When 5 queries are handled and every write fails
+    Then dns_send_errors_total is 5
+
   @boundary @gap
-  Scenario: A failure writing a response is counted
-    # src/metrics.rs:117-119 (send_error) is uncovered, as is the handler branch
-    # that calls it. dns_send_errors_total is dead instrumentation today.
-    Given a client that disappears before the response is written
-    When the response send fails
-    Then dns_send_errors_total is 1
+  Scenario: A response that never left the socket is not counted as a response sent
+    # VEGA-088, the target behaviour. This replaces the pinned scenario above
+    # once rust-dev makes the two silent paths agree: dns_responses_total counts
+    # what a client received, dns_send_errors_total counts what it did not.
+    Given a client whose socket has gone away
+    When the response is written and the write fails
+    Then every dns_responses_total series is 0
+    And dns_send_errors_total is 1
 
   # ------------------------------------------------------------- VERSION
 

@@ -25,6 +25,18 @@ use vega::{
     zone::{Answer, Zone},
 };
 
+/// The process watchdog, shared by path rather than copied, so there is one
+/// implementation of "a test that hangs must fail" in the tree.
+#[path = "../src/testutil.rs"]
+mod testutil;
+
+/// This binary builds a 100,000-record zone and then runs 50,000 lookups of a
+/// 123-label name, so it is the slowest guarded test in the tree — but it is
+/// still seconds, and a deep-name lookup is exactly the shape an unbounded
+/// wildcard walk spins on. Three minutes is generous enough that a loaded CI
+/// runner cannot trip it and tight enough that a spin is not an orphan.
+const WATCHDOG: Duration = Duration::from_secs(180);
+
 /// Big enough that a per-query cost buried in zone-wide work would show, small
 /// enough that the zone builds in a couple of seconds under `--release`.
 const ZONE_SIZE: usize = 100_000;
@@ -150,6 +162,11 @@ fn best_of(rounds: usize, iters: usize, mut f: impl FnMut()) -> Duration {
 /// take it after VEGA-002 or re-baseline the ratio on the CI runner first.
 #[test]
 fn a_deep_name_does_not_cost_more_than_a_shallow_one() {
+    // A wildcard walk that stops being bounded does not make this budget fail,
+    // it makes it never finish: the 50,000 deep lookups below never return.
+    // Without the guard that is a hung binary and, under a mutation harness, a
+    // mutant scored as a timeout instead of as caught.
+    let _watchdog = testutil::arm(WATCHDOG);
     let z = wildcard_zone();
     let shallow = lower("nope.example.com.");
     let deep = {
@@ -182,5 +199,75 @@ fn a_deep_name_does_not_cost_more_than_a_shallow_one() {
         r < 25.0,
         "a {MAX_QUERY_LABELS}-label NXDOMAIN costs {r:.1}x a 1-label one \
          (budget 25x, measured {d:?} vs {s:?}); the wildcard walk is unbounded again"
+    );
+}
+
+/// BUDGET (CLAUDE.md, "Performance budget"): **no `O(n)` scan over the record
+/// map per query, for any query type.**
+///
+/// `Zone::resolve`'s ANY branch is
+/// `for ((owner, _), records) in &self.exact { if owner == name { … } }` — a
+/// linear walk of every record set in the zone, with a `LowerName` comparison
+/// each time, for one query. It is the only lookup path in the tree that is not
+/// keyed.
+///
+/// # Status: FAILS TODAY, and is `#[ignore]`d for that reason
+///
+/// This is a live budget violation, not an acceptance criterion waiting on a
+/// feature. Measured `--release` on this machine, `h1.example.com` against zones
+/// of three sizes, best-of-3 over 200 iterations each:
+///
+/// ```text
+///   zone   1,000 records:  A 219.6 ns   ANY    31.5 µs   ratio     143.5x
+///   zone  10,000 records:  A 134.2 ns   ANY   176.0 µs   ratio   1,311.8x
+///   zone 100,000 records:  A 100.4 ns   ANY 1,831.4 µs   ratio  18,238.7x
+/// ```
+///
+/// Ten times the records is ten times the cost, which is the definition of the
+/// thing the budget forbids. At 100,000 records one ANY lookup is **1.83 ms**,
+/// 201x VEGA-065's 9.1 µs per-query CPU budget — an order of magnitude worse
+/// than the 174.7 µs wildcard walk that VEGA-065 was raised to fix.
+///
+/// # What keeps this off the packet path today, and why that is not enough
+///
+/// `DnsHandler::resolve` never calls `Zone::lookup(_, ANY)`: RFC 8482 minimal
+/// -ANY intercepts first (`handler.rs`, `if qtype.is_any()`), answering from
+/// `has_name` plus a CNAME lookup. So this is **not** a live remote DoS — it is
+/// a 1.8 ms landmine in a `pub fn` with no guard and no test, one routing change
+/// away from being one. VEGA-041's SLIP, an AXFR path, or anything that decides
+/// to consult the zone for ANY re-arms it.
+///
+/// The fix is the record-map re-key (VEGA-002): with owner-major keying, "every
+/// RRset at this name" is a map hit rather than a scan. Until then the budget
+/// belongs here, failing, so it is not rediscovered a third time.
+#[test]
+#[ignore = "BUG: Zone::lookup(_, ANY) scans every record set in the zone; 1.83 ms at 100k records (CLAUDE.md performance budget, VEGA-002)"]
+fn an_any_lookup_does_not_scan_the_whole_record_map() {
+    let _watchdog = testutil::arm(WATCHDOG);
+    let z = wildcard_zone();
+    let name = lower("h1.example.com.");
+
+    // Both find the same record set at the same name, so the only difference
+    // measured is how the lookup gets there.
+    assert!(matches!(z.lookup(&name, RecordType::A), Answer::Records(_)));
+    assert!(matches!(
+        z.lookup(&name, RecordType::ANY),
+        Answer::Records(_)
+    ));
+
+    let a = best_of(3, 200, || {
+        std::hint::black_box(z.lookup(std::hint::black_box(&name), RecordType::A));
+    });
+    let any = best_of(3, 200, || {
+        std::hint::black_box(z.lookup(std::hint::black_box(&name), RecordType::ANY));
+    });
+
+    let r = any.as_secs_f64() / a.as_secs_f64();
+    println!("zone {ZONE_SIZE} records:  A {a:?}  ANY {any:?}  ratio {r:.1}x");
+    assert!(
+        r < 25.0,
+        "ANY costs {r:.1}x A at {ZONE_SIZE} records ({any:?} vs {a:?}). A ratio \
+         that grows with the zone is an O(n) scan over the record map, which the \
+         performance budget forbids for every query type"
     );
 }

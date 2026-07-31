@@ -465,8 +465,39 @@ pub fn ns_record(owner: Name, ttl: u32, target: &str) -> Result<Record> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::config::ZoneConfig;
+
+    /// How long any single test in this module may take before the process
+    /// watchdog concludes something is spinning and kills the binary.
+    ///
+    /// The tests here are microseconds of work each — the slowest builds a
+    /// thirty-label zone — so thirty seconds is six orders of magnitude of
+    /// headroom and can only be reached by a loop that is not terminating.
+    /// Generous on purpose: a false trip on a loaded machine costs a re-run,
+    /// while a guard set tight enough to flake gets deleted.
+    const WALK_WATCHDOG: Duration = Duration::from_secs(30);
+
+    /// Bound the rest of the calling test by the *process* clock.
+    ///
+    /// Every test below that reaches [`Zone::lookup`] arms this. The failure
+    /// mode `Zone::resolve`'s wildcard-depth walk and its CNAME chase guard
+    /// against is a **spin**, and a spin cannot be observed by returning from
+    /// the thing that is spinning: the guard has to be able to end the process.
+    /// Bounding a channel with `recv_timeout` and leaving the walk on a detached
+    /// thread — what this module used to do, and only on two of these tests — is
+    /// worse than no guard, because the suite reports and moves on while a core
+    /// keeps burning and a mutation harness scores the mutant as a timeout
+    /// rather than as caught. See `src/testutil.rs`.
+    ///
+    /// Bind the result: `let _watchdog = watchdog();`. Dropping it disarms.
+    #[track_caller]
+    #[must_use]
+    fn watchdog() -> crate::testutil::Guard {
+        crate::testutil::arm(WALK_WATCHDOG)
+    }
 
     fn spec(name: &str, ty: &str, values: &[&str]) -> RecordSpec {
         RecordSpec {
@@ -537,6 +568,7 @@ mod tests {
 
     #[test]
     fn apex_a_record_resolves() {
+        let _watchdog = watchdog();
         let z = zone(vec![spec("@", "A", &["203.0.113.10", "203.0.113.11"])]);
         let Answer::Records(records) = z.lookup(&lower("example.com."), RecordType::A) else {
             panic!("expected records");
@@ -548,6 +580,7 @@ mod tests {
 
     #[test]
     fn subdomain_is_qualified_against_the_origin() {
+        let _watchdog = watchdog();
         let z = zone(vec![spec("www", "A", &["203.0.113.20"])]);
         assert!(matches!(
             z.lookup(&lower("www.example.com."), RecordType::A),
@@ -557,6 +590,7 @@ mod tests {
 
     #[test]
     fn per_record_ttl_overrides_the_zone_default() {
+        let _watchdog = watchdog();
         let mut s = spec("api", "A", &["203.0.113.30"]);
         s.ttl = Some(30);
         let z = zone(vec![s]);
@@ -568,6 +602,7 @@ mod tests {
 
     #[test]
     fn existing_name_wrong_type_is_nodata_not_nxdomain() {
+        let _watchdog = watchdog();
         let z = zone(vec![spec("www", "A", &["203.0.113.20"])]);
         assert_eq!(
             z.lookup(&lower("www.example.com."), RecordType::AAAA),
@@ -577,6 +612,7 @@ mod tests {
 
     #[test]
     fn missing_name_is_nxdomain() {
+        let _watchdog = watchdog();
         let z = zone(vec![spec("www", "A", &["203.0.113.20"])]);
         assert_eq!(
             z.lookup(&lower("nope.example.com."), RecordType::A),
@@ -586,6 +622,7 @@ mod tests {
 
     #[test]
     fn out_of_zone_name_is_nxdomain() {
+        let _watchdog = watchdog();
         let z = zone(vec![]);
         assert_eq!(
             z.lookup(&lower("example.org."), RecordType::A),
@@ -595,6 +632,7 @@ mod tests {
 
     #[test]
     fn cname_is_chased_within_the_zone() {
+        let _watchdog = watchdog();
         let z = zone(vec![
             spec("www", "CNAME", &["origin.example.com."]),
             spec("origin", "A", &["203.0.113.40"]),
@@ -609,6 +647,7 @@ mod tests {
 
     #[test]
     fn cname_to_external_target_returns_only_the_cname() {
+        let _watchdog = watchdog();
         let z = zone(vec![spec("cdn", "CNAME", &["cdn.provider.net."])]);
         let Answer::Records(records) = z.lookup(&lower("cdn.example.com."), RecordType::A) else {
             panic!("expected records");
@@ -619,6 +658,7 @@ mod tests {
 
     #[test]
     fn cname_loop_terminates() {
+        let _watchdog = watchdog();
         let z = zone(vec![
             spec("a", "CNAME", &["b.example.com."]),
             spec("b", "CNAME", &["a.example.com."]),
@@ -632,6 +672,7 @@ mod tests {
 
     #[test]
     fn wildcard_matches_and_is_rewritten_to_the_query_name() {
+        let _watchdog = watchdog();
         let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
         let Answer::Records(records) = z.lookup(&lower("anything.dev.example.com."), RecordType::A)
         else {
@@ -646,6 +687,7 @@ mod tests {
 
     #[test]
     fn exact_match_beats_wildcard() {
+        let _watchdog = watchdog();
         let z = zone(vec![
             spec("*.dev", "A", &["203.0.113.50"]),
             spec("special.dev", "A", &["203.0.113.51"]),
@@ -662,6 +704,7 @@ mod tests {
 
     #[test]
     fn wildcard_does_not_answer_a_different_type() {
+        let _watchdog = watchdog();
         let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
         assert_eq!(
             z.lookup(&lower("x.dev.example.com."), RecordType::TXT),
@@ -671,6 +714,7 @@ mod tests {
 
     #[test]
     fn any_query_returns_every_type_at_the_name() {
+        let _watchdog = watchdog();
         let z = zone(vec![
             spec("multi", "A", &["203.0.113.60"]),
             spec("multi", "TXT", &["\"hello\""]),
@@ -692,6 +736,7 @@ mod tests {
 
     #[test]
     fn mx_and_txt_parse_in_presentation_format() {
+        let _watchdog = watchdog();
         let z = zone(vec![
             spec("@", "MX", &["10 mail.example.com."]),
             spec("@", "TXT", &["\"v=spf1 -all\""]),
@@ -763,6 +808,7 @@ mod tests {
 
     #[test]
     fn a_record_value_at_the_character_limit_is_accepted() {
+        let _watchdog = watchdog();
         // Kills `chars > MAX_RECORD_VALUE_CHARS` -> `>=`. The bound is
         // inclusive: 4090 characters is the largest value an operator may
         // write, and moving the comparison one place rejects a config that has
@@ -814,6 +860,7 @@ mod tests {
 
     #[test]
     fn a_fully_qualified_in_zone_record_name_is_accepted() {
+        let _watchdog = watchdog();
         // Kills `delete !` in Zone::qualify: with the `!` gone, an in-zone FQDN
         // is rejected and an out-of-zone one is silently accepted instead.
         let z = zone(vec![spec("www.example.com.", "A", &["203.0.113.20"])]);
@@ -847,6 +894,7 @@ mod tests {
 
     #[test]
     fn the_apex_exists_even_in_an_empty_zone() {
+        let _watchdog = watchdog();
         // Kills deleting `zone.names.insert(zone.lower_origin)`: without it the
         // zone answers NXDOMAIN for its own origin.
         let z = zone(vec![]);
@@ -862,6 +910,7 @@ mod tests {
 
     #[test]
     fn a_wildcard_matches_names_several_labels_below_it() {
+        let _watchdog = watchdog();
         // Kills `==` -> `!=` on the origin check in the wildcard walk: with the
         // mutation the walk gives up after a single step and this is NXDOMAIN.
         let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
@@ -878,25 +927,55 @@ mod tests {
 
     #[test]
     fn a_wildcard_walk_that_matches_nothing_terminates() {
-        // Kills `||` -> `&&` in the wildcard-walk break condition. With `&&`
-        // the loop calls base_name() on the root for ever; without this timeout
-        // the whole test binary hangs instead of reporting a failure.
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
-            let _ = tx.send(z.lookup(&lower("nope.example.com."), RecordType::A));
-        });
-        let answer = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the wildcard walk must terminate");
-        assert_eq!(answer, Answer::NxDomain);
+        // Kills `mask &= !(1u128 << depth)` -> `|=`, and `||` -> `&&` in the
+        // break condition of the `base_name()` climb this replaced. Both spin.
+        //
+        // This test used to bound a *channel* with `recv_timeout` and leave the
+        // walk on a detached thread. That reports a failure and leaves the walk
+        // spinning: `cargo test` returns while a core keeps burning, and a
+        // mutation harness scores the mutant as a timeout instead of as caught —
+        // so the mutants that produce this exact defect were the ones scored
+        // wrong. The walk now runs on this thread and the guard is allowed to
+        // end the process.
+        //
+        // THE FIXTURE IS AS LOAD-BEARING AS THE GUARD. This test used to ask a
+        // zone holding only `*.dev` about `nope.example.com.`, and that probe
+        // window is EMPTY: the query's parent depth is 2, the origin floor is
+        // 2, so the window is bit 2 alone while the only wildcard sits at depth
+        // 3 — `mask` is zero on entry and the loop body never executes. It
+        // would pass with the whole walk deleted, and it did pass, measured,
+        // against `mask |= !(1u128 << depth)`. Every name below is chosen to
+        // enter the loop and then miss at every depth it probes; do not
+        // "simplify" one back to a shallow name.
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            // Parents at depths 3 and 4, so a query can probe more than once.
+            spec("*.dev", "A", &["203.0.113.50"]),
+            spec("*.dev.ops", "A", &["203.0.113.51"]),
+        ]);
+        for query in [
+            // Window is bits 2..=4, mask is bits 3 and 4: two probes, two
+            // misses, then the loop must run out of bits.
+            lower("q.w.e.example.com."),
+            // One probe, one miss.
+            lower("nope.other.example.com."),
+            // The longest name that can reach `resolve` at all. This is the
+            // shape that turned the old detached-thread guard into an
+            // eleven-minute spinning orphan.
+            deep_name(123),
+        ] {
+            assert_eq!(
+                z.lookup(&query, RecordType::A),
+                Answer::NxDomain,
+                "{query} matches no wildcard, so the walk must exhaust its \
+                 window and stop rather than spin"
+            );
+        }
     }
 
     #[test]
     fn a_cname_loop_is_cut_off_after_a_handful_of_hops() {
+        let _watchdog = watchdog();
         // Kills `MAX_CNAME_DEPTH: 8 -> 800`. `cname_loop_terminates` expressed
         // its bound in terms of the constant, so it stayed green for any value
         // of it; this bound is deliberately hard-coded.
@@ -917,6 +996,7 @@ mod tests {
 
     #[test]
     fn a_cname_chain_of_exactly_the_depth_limit_reaches_the_address() {
+        let _watchdog = watchdog();
         let mut records = Vec::new();
         for i in 0..MAX_CNAME_DEPTH {
             records.push(spec(
@@ -937,6 +1017,7 @@ mod tests {
 
     #[test]
     fn a_cname_chain_one_hop_too_long_stops_short_of_the_address() {
+        let _watchdog = watchdog();
         // Pins the behaviour on the far side of the limit, so that moving
         // MAX_CNAME_DEPTH has to be a deliberate act.
         let mut records = Vec::new();
@@ -1011,6 +1092,7 @@ mod tests {
 
     #[test]
     fn a_wildcard_never_creates_a_record_at_its_own_parent() {
+        let _watchdog = watchdog();
         // Kills `if is_wildcard` -> `if !is_wildcard` in insert_spec.
         let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
         assert_eq!(
@@ -1022,6 +1104,7 @@ mod tests {
 
     #[test]
     fn an_out_of_zone_name_is_nxdomain_not_nodata() {
+        let _watchdog = watchdog();
         // Kills the out-of-zone `Resolution::NxDomain` -> `NoData`.
         let z = zone(vec![spec("www", "A", &["203.0.113.20"])]);
         assert_eq!(
@@ -1053,6 +1136,7 @@ mod tests {
 
     #[test]
     fn an_apex_wildcard_answers_a_query_for_the_wildcard_name_itself() {
+        let _watchdog = watchdog();
         // RFC 4592 §2.3: "When a wildcard domain name appears in a message's
         // query section, no special processing occurs." The QNAME is an
         // ordinary name that happens to contain an asterisk label, it matches
@@ -1074,6 +1158,7 @@ mod tests {
 
     #[test]
     fn a_wildcard_answers_a_query_for_its_own_name() {
+        let _watchdog = watchdog();
         // Same rule one level down: `*.dev` is stored under `dev.example.com.`,
         // and a query for the literal name `*.dev.example.com.` walks to that
         // parent and is answered.
@@ -1095,6 +1180,7 @@ mod tests {
 
     #[test]
     fn a_nested_asterisk_wildcard_still_synthesises() {
+        let _watchdog = watchdog();
         // RFC 4592 §2.1.3 deleted RFC 1035 §4.3.3's "<anydomain> should not
         // contain other `*` labels" restriction: "A wildcard domain name can
         // have subdomains." Vega strips only the leftmost asterisk, so `*.*.dev`
@@ -1117,6 +1203,7 @@ mod tests {
 
     #[test]
     fn a_query_for_the_nested_wildcard_name_itself_is_answered() {
+        let _watchdog = watchdog();
         // The two miscounts compounded: the key `*.dev.example.com.` is one
         // short on the build side *and* the QNAME `*.*.dev.example.com.`
         // (5 raw labels, num_labels() == 4) is one short on the query side.
@@ -1139,6 +1226,7 @@ mod tests {
 
     #[test]
     fn an_apex_wildcard_covers_a_name_many_labels_deep() {
+        let _watchdog = watchdog();
         // The bitmap probe must still reach the origin depth from a name far
         // below it. Kills a window whose floor is computed from the query name
         // rather than the origin.
@@ -1156,6 +1244,7 @@ mod tests {
 
     #[test]
     fn the_deepest_wildcard_wins_when_several_could_match() {
+        let _watchdog = watchdog();
         // Today's walk starts at the query name's parent and descends, so the
         // closest wildcard answers. The bitmap must be consumed deepest-set-bit
         // first to preserve that. Kills `leading_zeros` -> `trailing_zeros`,
@@ -1180,6 +1269,7 @@ mod tests {
 
     #[test]
     fn wildcards_at_non_adjacent_depths_are_both_reachable() {
+        let _watchdog = watchdog();
         // Depths 2 (the apex `*`) and 8 (`*.a.b.c.d.e.f`), with five empty
         // depths between them. A `max_wildcard_labels` bound handles this by
         // probing the whole range; the bitmap handles it by construction. Both
@@ -1203,6 +1293,7 @@ mod tests {
 
     #[test]
     fn wildcards_at_one_two_and_three_levels_are_each_reachable() {
+        let _watchdog = watchdog();
         // The failure mode the ruling calls the worst one: `wildcard_depths`
         // silently out of step with the `wildcard` map produces NXDOMAIN for a
         // configured wildcard, with nothing in the logs. Every populated depth
@@ -1236,6 +1327,8 @@ mod tests {
         // 30 labels is comfortably past a plausible wrong value and comfortably
         // inside the octet limit: 28 * 2 + 8 + 4 + 1 = 69.
         const DEPTH: usize = 30;
+
+        let _watchdog = watchdog();
         let parent: String = std::iter::repeat_n("a", DEPTH - 2)
             .collect::<Vec<_>>()
             .join(".");
@@ -1254,6 +1347,7 @@ mod tests {
 
     #[test]
     fn a_maximum_length_query_name_is_answered() {
+        let _watchdog = watchdog();
         // 123 labels is the most a name under `example.com.` can carry inside
         // RFC 1035 §2.3.4's 255 octets, and therefore the most that can ever
         // reach `Zone::resolve`. MAX_LABELS = 127 must leave this in range and
@@ -1269,6 +1363,7 @@ mod tests {
 
     #[test]
     fn a_maximum_length_query_name_of_the_wrong_type_is_nxdomain() {
+        let _watchdog = watchdog();
         // The type-mismatch path at maximum depth: the walk runs its full
         // window, hits nothing, and must return rather than run off the end of
         // the bitmap. (NXDOMAIN rather than NODATA is VEGA-010's defect, not
@@ -1278,7 +1373,123 @@ mod tests {
     }
 
     #[test]
+    fn the_true_deepest_name_the_wire_can_carry_is_127_labels_and_is_answered() {
+        // CORRECTS a boundary the rest of this module gets wrong. `deep_name`
+        // and `tests/perf_budget.rs` both call 123 labels "the most that can
+        // ever reach `Zone::resolve`", but 123 is only the ceiling for names
+        // under `example.com.`, whose 13-octet suffix eats the budget. The
+        // ceiling for the *decoder* is 127: RFC 1035 §3.1 encodes a
+        // single-octet label in two octets and terminates with one, so
+        // 127 * 2 + 1 = 255 exactly. Measured against hickory 0.26.1 — a
+        // hand-built 271-byte query carrying 127 one-octet labels decodes to a
+        // 127-label name, and 128 labels is rejected with
+        // `name label data exceed 255`.
+        //
+        // That matters because `wildcard_window` computes `1u128 << (start + 1)`
+        // with `start = labels - 1`, so this is the input that drives the shift
+        // to its largest reachable value, 127. A shift of 128 aborts the process
+        // under `panic = "abort"`. Nothing else in the suite goes past 123.
+        let _watchdog = watchdog();
+        let z = zone_with_origin(".", vec![spec("*", "A", &["203.0.113.1"])]);
+        let name = lower(&("a.".repeat(127)));
+        assert_eq!(
+            label_count(&name),
+            127,
+            "the fixture must be at the decoder's ceiling, not near it"
+        );
+
+        let Answer::Records(records) = z.lookup(&name, RecordType::A) else {
+            panic!("a 127-label name is decodable off the wire and must be answered");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(LowerName::from(records[0].name.clone()), name);
+    }
+
+    #[test]
+    fn a_wildcard_parent_at_the_label_ceiling_is_registered_not_silently_dropped() {
+        // The bit-127 boundary of `wildcard_depths`, which nothing else reaches.
+        //
+        // `MAX_LABELS: 127 -> 126`, `127 -> 128` and `depth <= MAX_LABELS` ->
+        // `<` ALL SURVIVED the whole suite before this test existed. Each drops
+        // a wildcard out of the depth bitmap while leaving it in `self.wildcard`
+        // — a configured wildcard that is silently unreachable for the life of
+        // the process, with nothing in the logs.
+        //
+        // The ceiling is hard-coded rather than written as `MAX_LABELS`, because
+        // a test that builds its fixture from the constant it is checking moves
+        // with the mutation and pins nothing. 127 is derived, not tuned: RFC
+        // 1035 §2.3.4 caps a name at 255 octets and §3.1 spends two octets on a
+        // single-character label plus one terminator, so 2n + 1 <= 255.
+        const CEILING: usize = 127;
+
+        let _watchdog = watchdog();
+        assert_eq!(
+            MAX_LABELS, CEILING,
+            "MAX_LABELS is the arithmetic consequence of RFC 1035 §2.3.4 and \
+             §3.1, and it is also the highest bit of the u128 the depth bitmap \
+             lives in. Moving it is not a tuning decision"
+        );
+
+        // 127 single-octet labels in a root-origin zone is 255 octets exactly:
+        // the deepest wildcard parent that can be configured at all.
+        let parent = std::iter::repeat_n("a", CEILING)
+            .collect::<Vec<_>>()
+            .join(".");
+        let z = zone_with_origin(
+            ".",
+            vec![spec(&format!("*.{parent}"), "A", &["203.0.113.1"])],
+        );
+
+        assert_ne!(
+            z.wildcard_depths & (1u128 << CEILING),
+            0,
+            "a wildcard whose parent sits at exactly {CEILING} labels was left \
+             out of the depth bitmap; it is in the wildcard map and the walk \
+             will never probe for it"
+        );
+    }
+
+    #[test]
+    fn the_wildcard_probe_window_never_reaches_below_the_origin() {
+        // `wildcard_window` documents two bounds. The upper one — the query's
+        // parent depth, because RFC 4592 §3.3.1 makes a wildcard's parent a
+        // *proper* ancestor — is exercised by every wildcard test here. The
+        // lower one is not, and dropping it (`hi & !((1 << floor) - 1)` -> `hi`)
+        // SURVIVED the entire suite: no wildcard can be registered above the
+        // origin, because `qualify` refuses to build an out-of-zone key, so the
+        // extra bits never intersect `wildcard_depths` and no answer changes.
+        //
+        // The bound is still a contract, and the redundancy that hides it is
+        // exactly the kind that stops being true when somebody adds a second
+        // insertion point. Asserted on the function rather than through
+        // `lookup`, which is the only place it is visible.
+        let _watchdog = watchdog();
+        let z = zone_with_origin(
+            "a.b.c.d.example.com",
+            vec![spec("*", "A", &["203.0.113.1"])],
+        );
+
+        // Eight labels queried, so the parent depth is 7; the origin is six
+        // labels, so the floor is 6. Bits 6 and 7, and nothing else.
+        let window = z.wildcard_window(&lower("x.y.a.b.c.d.example.com."));
+        assert_eq!(
+            window,
+            (1u128 << 6) | (1u128 << 7),
+            "the probe window must be exactly [origin depth, query parent depth]; \
+             got {window:#034x}"
+        );
+        assert_eq!(
+            window & ((1u128 << 6) - 1),
+            0,
+            "the window reaches below the origin: every one of those depths is a \
+             guaranteed miss, and a key there would be outside the zone we are \
+             authoritative for"
+        );
+    }
+
+    #[test]
     fn a_zone_with_no_wildcards_never_probes() {
+        let _watchdog = watchdog();
         // `wildcard_depths == 0` replaces `!self.wildcard.is_empty()` as the
         // "are there any wildcards" test. A deep NXDOMAIN in a wildcard-free
         // zone must stay a plain miss — this is the 1.13 µs control against
@@ -1293,6 +1504,7 @@ mod tests {
 
     #[test]
     fn a_name_above_the_origin_is_nxdomain_even_with_a_wildcard_present() {
+        let _watchdog = watchdog();
         // `com.` is a proper ancestor of the origin, not a descendant, so the
         // probe window is empty: its start (the query's parent depth, 0) is
         // below the floor (the origin depth, 2). Kills a `wildcard_window` that
@@ -1309,38 +1521,24 @@ mod tests {
         // floor to 0. The rejected patch's `while labels >= floor { … labels -=
         // 1 }` shape only survives that because of an extra `if labels == 0 {
         // break }`; a bitmap loop that clears the bit it just probed terminates
-        // structurally. Run off-thread with a timeout so a non-terminating walk
-        // fails this test instead of hanging the whole binary.
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let z = zone_with_origin(".", vec![spec("*", "A", &["203.0.113.1"])]);
-            let _ = tx.send(z.lookup(&lower("nope.example.com."), RecordType::TXT));
-        });
-        let answer = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("a root-origin wildcard walk must terminate");
-        assert_eq!(answer, Answer::NxDomain);
+        // structurally. Bounded by the process watchdog, not by a channel, so a
+        // non-terminating walk fails this test rather than leaking a thread.
+        let _watchdog = watchdog();
+        let z = zone_with_origin(".", vec![spec("*", "A", &["203.0.113.1"])]);
+        assert_eq!(
+            z.lookup(&lower("nope.example.com."), RecordType::TXT),
+            Answer::NxDomain
+        );
     }
 
     #[test]
     fn a_root_origin_wildcard_answers_a_name_it_covers() {
         // The other half: with floor == 0 the window must still include depth 0,
         // or a root-origin zone's apex wildcard becomes unreachable. Also
-        // timed out, because the failure mode of a bad floor is a spin.
-        use std::sync::mpsc;
-        use std::time::Duration;
-
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let z = zone_with_origin(".", vec![spec("*", "A", &["203.0.113.1"])]);
-            let _ = tx.send(z.lookup(&lower("nope.example.com."), RecordType::A));
-        });
-        let answer = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("a root-origin wildcard walk must terminate");
+        // guarded, because the failure mode of a bad floor is a spin.
+        let _watchdog = watchdog();
+        let z = zone_with_origin(".", vec![spec("*", "A", &["203.0.113.1"])]);
+        let answer = z.lookup(&lower("nope.example.com."), RecordType::A);
         let Answer::Records(records) = answer else {
             panic!("a `*` in a root-origin zone must cover `nope.example.com.`");
         };
@@ -1363,6 +1561,7 @@ mod tests {
     #[test]
     #[ignore = "BUG: empty non-terminals answer NXDOMAIN instead of NODATA (RFC 2308 s2.2.1)"]
     fn an_empty_non_terminal_is_nodata_not_nxdomain() {
+        let _watchdog = watchdog();
         // `a.b.ent.example.com` exists, so `ent.example.com` and
         // `b.ent.example.com` exist too, as empty non-terminals. Answering
         // NXDOMAIN for them is not cosmetic: under RFC 8020 a resolver that
@@ -1384,6 +1583,7 @@ mod tests {
     #[test]
     #[ignore = "BUG: a wildcard is applied below a name that exists (RFC 4592 s3.3.1)"]
     fn a_wildcard_does_not_apply_below_a_name_that_exists() {
+        let _watchdog = watchdog();
         // RFC 4592: the source of synthesis is `*` under the *closest
         // encloser*. For `a.deep.dev.example.com` the closest encloser is
         // `deep.dev.example.com`, which exists, so the source of synthesis is
@@ -1403,6 +1603,7 @@ mod tests {
     #[test]
     #[ignore = "BUG: an empty non-terminal created by a wildcard is NXDOMAIN too"]
     fn the_parent_of_a_wildcard_is_not_nxdomain() {
+        let _watchdog = watchdog();
         // `*.apps.example.com` implies `apps.example.com` exists. Answering
         // NXDOMAIN for the parent lets an RFC 8020 resolver conclude the whole
         // wildcard subtree is empty.
