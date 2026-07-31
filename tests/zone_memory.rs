@@ -123,9 +123,14 @@ fn lower(name: &str) -> LowerName {
 }
 
 fn config(with_wildcard: bool) -> ZoneConfig {
-    let mut records = Vec::with_capacity(ZONE_SIZE + 2);
+    let mut records = Vec::with_capacity(ZONE_SIZE + 3);
     if with_wildcard {
         records.push(spec("*.dev", "A", "203.0.113.50"));
+        // An empty non-terminal in the zone the negative paths are measured
+        // against (VEGA-032 S2). The zero-allocation guarantee is a property of
+        // the probe rather than of the node set, and this is what holds it to
+        // that claim rather than to a zone shape.
+        records.push(spec("a.b.ent", "A", "203.0.113.41"));
     }
     for i in 0..ZONE_SIZE {
         records.push(spec(
@@ -167,7 +172,7 @@ fn mib(bytes: i64) -> String {
 }
 
 /// The live heap a freshly built zone holds, and the budget verdict.
-fn heap_budget(unmet: &mut Vec<String>) -> Zone {
+fn heap_budget(unmet: &mut Vec<String>) -> (Zone, i64) {
     // The config is built before the region opens: it is the operator's input,
     // not the zone's representation, and counting it would measure the fixture.
     let cfg = config(false);
@@ -204,7 +209,7 @@ fn heap_budget(unmet: &mut Vec<String>) -> Zone {
             HEAP_BUDGET_BYTES / (1024 * 1024),
         ));
     }
-    zone
+    (zone, live)
 }
 
 /// The answer vector for a single-record RRset.
@@ -306,6 +311,107 @@ fn negative_path_budget(unmet: &mut Vec<String>) {
     }
 }
 
+/// How many empty non-terminals the deep fixture implies: `_tcp.hN` and `hN`
+/// for each of the [`ZONE_SIZE`] owners. Exact, not estimated — it is what makes
+/// the per-node figure below a measurement rather than a ratio of two totals.
+const ENTS_IN_THE_DEEP_FIXTURE: i64 = 2 * ZONE_SIZE_I64;
+
+/// [`ZONE_SIZE`] as the signed type the byte arithmetic uses. `as` on a byte
+/// count is a clippy denial and the lint is right to ask: these numbers appear
+/// in a failure message an operator reads.
+const ZONE_SIZE_I64: i64 = 100_000;
+
+/// What one empty non-terminal may cost, in bytes of live heap.
+///
+/// MEASURED at `e7b8dba`, by solving for the marginal cost of one node over
+/// zones that differ in exactly one of {nodes, RRsets, RDATA}: **102 B** — 96 for
+/// the `Node` itself (an 80-byte `Name`, an 8-byte range, a flag byte, padded)
+/// plus ~6 amortised for its `HashTable` slot. The budget is 110 rather than 102
+/// because the index's bucket count is a power of two, so the amortised slot
+/// cost swings between ~5 B and ~11 B depending on where the node count falls
+/// against the next doubling.
+///
+/// It is stated **per empty non-terminal** rather than as a total, because that
+/// is where the cost actually lives: the same 100,000 records cost 28.8 MiB in a
+/// flat zone and ~48 MiB in a zone of `_sip._tcp.host` names. A single global
+/// MiB ceiling would either fail the second shape or stop constraining the
+/// first. The ruling's §7.1 estimate was 112 B; it is 10 B high here and 62 B
+/// LOW for an owner name whose labels exceed hickory's 32-octet inline buffer,
+/// where a node costs 174 B — worth knowing before someone materialises
+/// ancestors for a zone of long names.
+const BYTES_PER_EMPTY_NON_TERMINAL: i64 = 110;
+
+/// The deep fixture: the same records at the same count, at names that imply two
+/// empty non-terminals each. Same record type and same rdata as [`config`], so
+/// the only thing that differs is the shape of the owner name.
+fn deep_config() -> ZoneConfig {
+    let mut cfg = config(false);
+    cfg.records = (0..ZONE_SIZE)
+        .map(|i| {
+            spec(
+                &format!("_sip._tcp.h{i}"),
+                "A",
+                &format!("10.{}.{}.{}", (i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff),
+            )
+        })
+        .collect();
+    cfg
+}
+
+/// Scenario: An empty non-terminal costs one node and nothing else
+/// features/empty-non-terminals.feature:410
+///
+/// AC-2.6's memory half, and the number the release note owes an operator: RSS
+/// grows on upgrade with no config change at all, and "roughly" is not good
+/// enough when the deployment is sized.
+///
+/// Two zones, same record count, same type, same rdata, differing only in the
+/// shape of the owner name — so the difference between them **is** the cost of
+/// the empty non-terminals, with nothing else varying to explain it away.
+fn empty_non_terminal_budget(flat_live: i64, unmet: &mut Vec<String>) {
+    let cfg = deep_config();
+    let region = Region::new(GLOBAL);
+    let zone = Zone::from_config(&cfg).expect("deep zone builds");
+    let stats = region.change();
+    let live = i64::try_from(stats.bytes_allocated).expect("byte count fits")
+        - i64::try_from(stats.bytes_deallocated).expect("byte count fits");
+
+    let delta = live - flat_live;
+    let per_ent = delta / ENTS_IN_THE_DEEP_FIXTURE;
+    println!(
+        "deep zone heap: {live} B live ({} MiB) against {flat_live} B flat; \
+         {delta} B for {ENTS_IN_THE_DEEP_FIXTURE} empty non-terminals \
+         ({per_ent} B each)",
+        mib(live),
+    );
+
+    // The gate is meaningless unless the empty non-terminals are actually there.
+    // Asserted first and for a name in the middle of the arena, not the first or
+    // last, so an off-by-one at either end of the build is still caught.
+    for ent in ["_tcp.h50000.example.com.", "h50000.example.com."] {
+        if !zone.exists(&lower(ent)) {
+            unmet.push(format!(
+                "\"An empty non-terminal costs one node and nothing else\": \
+                 {ent} does not exist, so this measured the cost of NOT \
+                 materialising ancestors. The record beneath it is configured \
+                 and, under RFC 8020 §2, one cached NXDOMAIN here takes it out \
+                 of service"
+            ));
+        }
+    }
+
+    if per_ent > BYTES_PER_EMPTY_NON_TERMINAL {
+        unmet.push(format!(
+            "\"An empty non-terminal costs one node and nothing else\": \
+             {ENTS_IN_THE_DEEP_FIXTURE} of them cost {delta} bytes, {per_ent} B \
+             each, against a budget of {BYTES_PER_EMPTY_NON_TERMINAL} B. A node \
+             is 96 B plus its index slot; anything above that is an RRset, an \
+             RDATA entry or a second copy of the owner name that an empty \
+             non-terminal has no business holding"
+        ));
+    }
+}
+
 /// Scenario: A 100,000-record zone costs at most 40 MiB of live heap
 /// features/zone-data-model.feature:345
 ///
@@ -315,21 +421,29 @@ fn negative_path_budget(unmet: &mut Vec<String>) {
 /// Scenario: A negative answer in a wildcard zone allocates nothing at all
 /// features/zone-data-model.feature:370
 ///
-/// Three scenarios in one test because they share a 100,000-record zone that
+/// Scenario: An empty non-terminal costs one node and nothing else
+/// features/empty-non-terminals.feature:410
+///
+/// Scenario: A negative answer still allocates nothing after ancestors are
+/// materialised
+/// features/empty-non-terminals.feature:448
+///
+/// Several scenarios in one test because they share a 100,000-record zone that
 /// costs seconds to build, and because a `#[global_allocator]` makes a second
 /// test in this binary a second source of counts.
 ///
 /// Every budget is collected and reported together at the end. Failing at the
-/// first would hide the other two behind it, and a reader given one number
-/// cannot tell whether the rest are met.
+/// first would hide the others behind it, and a reader given one number cannot
+/// tell whether the rest are met.
 #[test]
 fn the_zone_and_its_answers_cost_what_the_ruling_budgets() {
     let _watchdog = testutil::arm(WATCHDOG);
 
     let mut unmet: Vec<String> = Vec::new();
-    let zone = heap_budget(&mut unmet);
+    let (zone, flat_live) = heap_budget(&mut unmet);
     answer_vector_budget(&zone, &mut unmet);
     drop(zone);
+    empty_non_terminal_budget(flat_live, &mut unmet);
     negative_path_budget(&mut unmet);
 
     assert!(

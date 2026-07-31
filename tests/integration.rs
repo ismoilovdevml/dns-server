@@ -1023,7 +1023,7 @@ async fn a_wildcard_still_answers_the_type_it_carries_over_the_wire() {
 /// features/zone-lookup.feature:240
 /// Scenario: A wildcard of the wrong type produces NOERROR with the SOA over the
 /// wire
-/// features/wildcards.feature:118
+/// features/wildcards.feature:144
 ///
 /// THE REGRESSION TEST FOR THIS ISSUE. AAAA is checked first because it is the
 /// half that fires without an attacker: every dual-stack client sends one

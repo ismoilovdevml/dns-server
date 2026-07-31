@@ -1,8 +1,28 @@
-//! VEGA-032 **S1** — the node arena, differentially.
+//! VEGA-032 **S1 and S2** — the node arena, differentially.
 //!
 //! Spec: `features/zone-data-model.feature`, section "S1 — THE ARENA,
-//! BEHAVIOUR-PRESERVING".
-//! Ruling: `.claude/backlog/decisions/VEGA-032-zone-data-model.md` §10.2, §13 AC-1.1.
+//! BEHAVIOUR-PRESERVING", and `features/empty-non-terminals.feature` (S2).
+//! Ruling: `.claude/backlog/decisions/VEGA-032-zone-data-model.md` §10.2, §13
+//! AC-1.1 and AC-2.1 … AC-2.4.
+//!
+//! # S2 re-arms this file rather than retiring it
+//!
+//! S1's claim was "zero permitted transitions". S2 deliberately changes answers,
+//! so a differential with zero permitted transitions would simply go red and
+//! stop being a gate. The oracle is therefore **not** edited: [`FrozenZone`] is
+//! still the transcription of `src/zone.rs` at `ebe1fbf`, algorithm untouched.
+//! What changes is the **data** it is run over — its node set is closed under
+//! ancestry, and the closure is computed **from the config** by
+//! [`ancestor_closure`], never from the code under test.
+//!
+//! That distinction is the whole point. A whitelist of the shape "any NXDOMAIN
+//! may become NODATA" would also make this file pass — and would let S3's
+//! closest-encloser bug through, because that bug is *also* an NXDOMAIN that
+//! ought to be something else. Deriving the closure from the config instead
+//! means the permitted transitions are exactly the ones ancestor materialisation
+//! can produce, and they are additionally **classified**: every difference
+//! between the pre-S2 and post-S2 oracles must fall into one of three named
+//! classes ([`Transition`]), and the fixture proves all three are reached.
 //!
 //! # The only claim S1 makes
 //!
@@ -35,6 +55,11 @@
 //! the only mechanised check on the largest diff in the sequence. It is retired
 //! only when a ruling says a behaviour changes, and then in that ruling's own
 //! commit, the way VEGA-065's oracle is retired at S3.
+//!
+//! S2 does not edit it. `materialise_ancestors` adds **names** to the node set
+//! and touches no branch of `resolve`; the pre-S2 oracle is still available and
+//! is still compared against, so what S2 changed is visible as a diff between
+//! two runs of one algorithm rather than as a diff between two algorithms.
 //!
 //! # Cases are constructed, never filtered
 //!
@@ -340,6 +365,223 @@ impl FrozenZone {
         };
         hi & !((1u128 << floor) - 1)
     }
+
+    /// Close the node set under ancestry — **the whole of S2**, expressed as
+    /// data over the transcription above rather than as a change to it.
+    ///
+    /// `ents` comes from [`ancestor_closure`], which reads the *config*. A name
+    /// whose leftmost label is `*` joins the wildcard side, exactly as a
+    /// declared wildcard does, because RFC 4592 §2.1.1 makes a wildcard a name
+    /// with a leftmost asterisk and says nothing about how the name came to
+    /// exist. Anything else joins `names`, where the pre-existing
+    /// `names.contains(name) -> NoData` arm answers it.
+    ///
+    /// Nothing here touches `exact`, `wildcard` or `record_count`: an empty
+    /// non-terminal contributes no records to any answer and does not move the
+    /// `dns_zone_records` gauge (AC-2.4).
+    fn materialise_ancestors(mut self, ents: &[LowerName]) -> Self {
+        for ent in ents {
+            if is_wildcard_name(ent) {
+                let parent = ent.base_name();
+                let depth = label_count(&parent);
+                if depth <= MAX_LABELS {
+                    self.wildcard_depths |= 1u128 << depth;
+                    self.wildcard_parents.insert(parent);
+                }
+            } else {
+                self.names.insert(ent.clone());
+            }
+        }
+        self
+    }
+}
+
+// ===========================================================================
+// S2: the ancestor closure, computed from the CONFIG
+// ===========================================================================
+
+/// True when the leftmost label of `name` is exactly `*` (RFC 4592 §2.1.1).
+fn is_wildcard_name(name: &LowerName) -> bool {
+    Name::from(name.clone())
+        .iter()
+        .next()
+        .is_some_and(|first| first == b"*")
+}
+
+/// The node name each record spec declares, as `Zone` keys it.
+///
+/// Transcribed from `insert_spec`, including the two cases that produce no node
+/// at all: a spec that does not qualify (the build fails, and the caller only
+/// reaches here when both builds agreed it failed) and a wildcard whose parent
+/// sits within two octets of RFC 1035 §2.3.4's 255, so `*.<parent>` has no
+/// representable name and S1 warns and serves the zone without it.
+fn declared_node_names(cfg: &ZoneConfig) -> Vec<LowerName> {
+    let Ok(mut origin) = cfg.origin.parse::<Name>() else {
+        return Vec::new();
+    };
+    origin.set_fqdn(true);
+    let lower_origin = LowerName::from(origin.clone());
+
+    let mut out = vec![lower_origin.clone()];
+    for spec in &cfg.records {
+        let label = spec.name.trim();
+        let is_wildcard = label == "*" || label.starts_with("*.");
+        let owner_label = if is_wildcard {
+            label
+                .strip_prefix('*')
+                .unwrap_or("")
+                .trim_start_matches('.')
+        } else {
+            label
+        };
+
+        let owner = if owner_label.is_empty() || owner_label == "@" {
+            origin.clone()
+        } else if owner_label.ends_with('.') {
+            let Ok(mut name) = owner_label.parse::<Name>() else {
+                continue;
+            };
+            name.set_fqdn(true);
+            if !lower_origin.zone_of(&LowerName::from(name.clone())) {
+                continue;
+            }
+            name
+        } else {
+            let Ok(name) = Name::parse(owner_label, Some(&origin)) else {
+                continue;
+            };
+            name
+        };
+
+        if is_wildcard {
+            // A wildcard with no representable owner name is not served, so it
+            // implies no ancestors either. Pinned by
+            // `src/zone.rs::a_wildcard_whose_owner_name_exceeds_the_octet_limit_materialises_no_ancestors`.
+            let Ok(name) = owner.prepend_label("*") else {
+                continue;
+            };
+            out.push(LowerName::from(name));
+        } else {
+            out.push(LowerName::from(owner));
+        }
+    }
+    out
+}
+
+/// Every name that becomes a node **only** because something exists beneath it:
+/// the strict ancestors of every declared node name, up to and including the
+/// origin, minus the names the config declares outright.
+///
+/// This is the closure S2 must materialise, derived from the operator's input
+/// alone. It is what makes the permitted transitions below *derived* rather than
+/// *whitelisted*.
+fn ancestor_closure(cfg: &ZoneConfig) -> HashSet<LowerName> {
+    let declared: HashSet<LowerName> = declared_node_names(cfg).into_iter().collect();
+    let Ok(mut origin) = cfg.origin.parse::<Name>() else {
+        return HashSet::new();
+    };
+    origin.set_fqdn(true);
+    let lower_origin = LowerName::from(origin);
+    let origin_depth = label_count(&lower_origin);
+
+    let mut ents = HashSet::new();
+    for name in &declared {
+        let full = Name::from(name.clone());
+        let depth = full.iter().len();
+        // Strict ancestors only, down to the origin's own depth. `trim_to`
+        // indexes raw labels, asterisks counted — the index space VEGA-065's
+        // ban on `num_labels` exists to protect.
+        for d in origin_depth..depth {
+            let ancestor = LowerName::from(full.trim_to(d));
+            if !declared.contains(&ancestor) {
+                ents.insert(ancestor);
+            }
+        }
+    }
+    ents
+}
+
+/// The three ways S2 may change an answer, and the only three.
+///
+/// Each is decided from the config-derived closure, never from what the
+/// implementation returned. A difference that matches none of them fails the
+/// property, which is what stops this from degenerating into "NXDOMAIN may
+/// become NODATA" — the loose rule that would also let VEGA-009's
+/// closest-encloser defect through at S3.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum Transition {
+    /// **T1** — the queried name is itself an empty non-terminal, so it exists
+    /// and the answer is NODATA (RFC 4592 §2.2.2, RFC 2308 §2.2).
+    ///
+    /// This covers two shapes that look different and are the same rule: a name
+    /// that was NXDOMAIN, and a name a wildcard used to synthesise for — RFC
+    /// 4592 §2.2.2 is explicit that synthesis does not apply at a name that
+    /// exists, so `Records -> NoData` here is required, not tolerated.
+    EmptyNonTerminalExists,
+    /// **T2** — the queried name is covered by a wildcard that is itself an
+    /// empty non-terminal (`x.*.dev` makes `*.dev` exist), so a source of
+    /// synthesis exists carrying no RRset and RFC 1034 §4.3.2 step 3(c) forbids
+    /// the name error. `NxDomain -> NoData`, and only that.
+    CoveredByAWildcardEmptyNonTerminal,
+    /// **T3** — a CNAME chase whose target is now an empty non-terminal stops
+    /// there, so the answer keeps the CNAME and loses the records that used to
+    /// be appended behind it. A strict prefix of the old answer, never a
+    /// reordering and never a different record.
+    CnameChaseStopsAtAnEmptyNonTerminal,
+}
+
+/// Which transition, if any, explains `before -> after`. `None` means "not a
+/// transition S2 is allowed to make", and the caller must fail.
+fn classify(
+    ents: &HashSet<LowerName>,
+    origin_depth: usize,
+    queried: &LowerName,
+    before: &Answer,
+    after: &Answer,
+) -> Option<Transition> {
+    if rendered(before) == rendered(after) {
+        return None;
+    }
+
+    // T1. The strongest of the three: it does not care what the old answer was,
+    // only that the name now exists, and it demands NODATA exactly.
+    if ents.contains(queried) {
+        return matches!(after, Answer::NoData).then_some(Transition::EmptyNonTerminalExists);
+    }
+
+    // T2. A source of synthesis that is an empty non-terminal covers this name.
+    // The window is RFC 4592 §3.3.1's: a wildcard's parent is a *proper*
+    // ancestor of the names it covers, so depths run from the origin up to the
+    // query's own parent.
+    if matches!(before, Answer::NxDomain) && matches!(after, Answer::NoData) {
+        let full = Name::from(queried.clone());
+        let depth = full.iter().len();
+        for d in origin_depth..depth {
+            let Ok(star) = full.trim_to(d).prepend_label("*") else {
+                continue;
+            };
+            if ents.contains(&LowerName::from(star)) {
+                return Some(Transition::CoveredByAWildcardEmptyNonTerminal);
+            }
+        }
+    }
+
+    // T3. The chase stopped at a name that now exists. The surviving answer must
+    // be a strict prefix of the old one ending on the CNAME whose target became
+    // an empty non-terminal — a truncation, never a reordering or a rewrite.
+    if let (Answer::Records(old), Answer::Records(new)) = (before, after) {
+        let (_, old_rendered) = rendered(before);
+        let (_, new_rendered) = rendered(after);
+        if new.len() < old.len() && old_rendered.starts_with(new_rendered.as_slice()) {
+            if let Some(RData::CNAME(target)) = new.last().map(|r| &r.data) {
+                if ents.contains(&LowerName::from(target.0.clone())) {
+                    return Some(Transition::CnameChaseStopsAtAnEmptyNonTerminal);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 // ===========================================================================
@@ -561,7 +803,7 @@ struct QueryPlan {
 
 fn query_plan() -> impl Strategy<Value = QueryPlan> {
     (
-        0u8..12,
+        0u8..15,
         0usize..64,
         prop::collection::vec(label(), 1..4),
         0usize..=120,
@@ -632,6 +874,42 @@ fn query_name(cfg: &ZoneConfig, plan: &QueryPlan) -> String {
         }
         // Asterisk-leading, the shape a label count that discounts `*` breaks.
         10 => format!("*.{}.{origin_dot}", plan.prefix.join(".")),
+        // ---------------------------------------------------------------- S2
+        // An empty non-terminal, taken straight out of the config-derived
+        // closure. CONSTRUCTED, not filtered: empty non-terminals are rarer
+        // than wildcards, so generating a name and hoping it is one is how a
+        // property reaches 1,024 global rejects on CI. Sorted before picking so
+        // that a `HashSet`'s iteration order cannot make the case a coin flip
+        // between runs of the same seed.
+        12 => {
+            let mut ents: Vec<String> = ancestor_closure(cfg)
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            ents.sort();
+            pick(&ents).unwrap_or(origin_dot)
+        }
+        // A name covered by a wildcard that is itself an empty non-terminal:
+        // the T2 shape, which arises from `x.*.dev` and from nothing else the
+        // generator produces.
+        13 => {
+            let mut parents: Vec<String> = ancestor_closure(cfg)
+                .iter()
+                .filter(|n| is_wildcard_name(n))
+                .map(|n| n.base_name().to_string())
+                .collect();
+            parents.sort();
+            pick(&parents).map_or(origin_dot, |p| stack(&p))
+        }
+        // Under an empty non-terminal: the name whose closest encloser is one.
+        14 => {
+            let mut ents: Vec<String> = ancestor_closure(cfg)
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect();
+            ents.sort();
+            pick(&ents).map_or(origin_dot, |e| stack(&e))
+        }
         // A name the zone does not hold in any form. Labels are joined with a
         // dot, never fused: hickory rejects a label that mixes an asterisk with
         // other octets, and the alphabet contains one.
@@ -660,16 +938,22 @@ fn query_type() -> impl Strategy<Value = RecordType> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
-    /// INVARIANT (AC-1.1): S1 changes the data structure and nothing else.
+    /// INVARIANT (AC-1.1, AC-2.1 … AC-2.4): the arena answers what the
+    /// transcription answers over the **ancestor-closed** node set, and every
+    /// difference from the pre-closure node set is one of three named classes.
     ///
     /// Scenario: The arena answers exactly what today's implementation answers,
     /// for every zone and every query
     /// features/zone-data-model.feature:263
     ///
+    /// Scenario: S2 changes the answer at an empty non-terminal and nowhere else
+    /// features/empty-non-terminals.feature:370
+    ///
     /// Also carries, in the same pass:
     ///
     ///   * Scenario: A config the transcription refuses is a config the arena
-    ///     refuses — features/zone-data-model.feature:458
+    ///     refuses — features/zone-data-model.feature:458 and
+    ///     features/empty-non-terminals.feature:297
     ///   * Scenario: A zone whose config declares no records at all still agrees
     ///     with the transcription — features/zone-data-model.feature:437
     ///
@@ -683,7 +967,7 @@ proptest! {
     /// machinery will read, so it must not quietly widen when node existence
     /// stops meaning what it means today.
     #[test]
-    fn the_arena_agrees_with_the_pre_s1_implementation_on_every_zone_and_every_query(
+    fn the_arena_agrees_with_the_transcription_over_an_ancestor_closed_node_set(
         cfg in zone_config(),
         plan in query_plan(),
         qtype in query_type(),
@@ -712,11 +996,25 @@ proptest! {
 
         let (Ok(real), Ok(frozen)) = (real, frozen) else { return Ok(()); };
 
+        // The S2 oracle: the same algorithm, over a node set closed under
+        // ancestry. The closure comes from the config; `frozen` is kept
+        // alongside it so that what S2 changed is a diff between two runs of one
+        // transcription rather than a diff between two transcriptions.
+        let ents = ancestor_closure(&cfg);
+        let mut ent_list: Vec<LowerName> = ents.iter().cloned().collect();
+        ent_list.sort_by_key(std::string::ToString::to_string);
+        let s2 = FrozenZone::build(&cfg)
+            .expect("the transcription built once, so it builds twice")
+            .materialise_ancestors(&ent_list);
+        let origin_depth = label_count(&frozen.lower_origin);
+
         prop_assert_eq!(
             real.record_count(),
             frozen.record_count,
             "record_count moved; it is the dns_zone_records metric and an \
-             operator's only view of whether a reload truncated the zone\n  zone: {:?}",
+             operator's only view of whether a reload truncated the zone. S2 \
+             permits ZERO transitions here: an empty non-terminal is a node, not \
+             a record (AC-2.4)\n  zone: {:?}",
             shape
         );
         prop_assert_eq!(
@@ -732,21 +1030,31 @@ proptest! {
 
         prop_assert_eq!(
             real.exists(&queried),
-            frozen.exists(&queried),
+            s2.exists(&queried),
             "Zone::exists disagreed for {}. It is the RFC 1034 §4.3.2 step 3(c) \
-             name-error determination (VEGA-083) and the ruling keeps its \
-             contract through the rewrite\n  zone: {:?}",
+             name-error determination (VEGA-083), the ruling keeps its contract \
+             through the rewrite, and it is the one predicate the DNSSEC proof \
+             machinery will read\n  zone: {:?}",
+            name,
+            shape
+        );
+        // Existence may only *widen*, and only over the closure. A name that
+        // existed before and does not now is a record taken out of service.
+        prop_assert!(
+            !frozen.exists(&queried) || real.exists(&queried),
+            "{} existed before S2 and does not now. Ancestor closure adds names \
+             to the node set; it can never remove one\n  zone: {:?}",
             name,
             shape
         );
 
         let actual = real.lookup(&queried, qtype);
-        let expected = frozen.lookup(&queried, qtype);
+        let expected = s2.lookup(&queried, qtype);
         prop_assert_eq!(
             rendered(&actual),
             rendered(&expected),
-            "{} {} (shape {}) disagreed with the pre-S1 implementation. S1 \
-             permits ZERO transitions: same variant, same records, same owner \
+            "{} {} (shape {}) disagreed with the transcription run over the \
+             ancestor-closed node set. Same variant, same records, same owner \
              names, same TTLs, same rdata, same order\n  zone: {:?}\n  got:      \
              {:?}\n  expected: {:?}",
             name,
@@ -756,34 +1064,48 @@ proptest! {
             actual,
             expected
         );
+
+        // …and the closure itself is held to three named classes. Without this
+        // the property above would pass against an oracle that had quietly
+        // grown a second behaviour change, which is exactly how a differential
+        // stops being a gate.
+        let before = frozen.lookup(&queried, qtype);
+        if rendered(&before) != rendered(&expected) {
+            prop_assert!(
+                classify(&ents, origin_depth, &queried, &before, &expected).is_some(),
+                "{} {} changed between the pre-S2 and post-S2 node sets, and the \
+                 change is not one of the three transitions ancestor closure can \
+                 produce (T1 the name is an empty non-terminal, T2 it is covered \
+                 by a wildcard that is one, T3 a CNAME chase stops at one). An \
+                 unclassifiable difference means the closure is doing something \
+                 other than closing the node set under ancestry\n  zone: {:?}\n  \
+                 before: {:?}\n  after:  {:?}",
+                name,
+                qtype,
+                shape,
+                before,
+                expected
+            );
+        }
     }
 }
 
-/// Scenario: The differential covers ANY, CNAME chasing and the negative paths,
-/// not only wildcards
-/// features/zone-data-model.feature:280
+/// The deterministic fixture, shared by the branch sweep and by the
+/// transition-class check so that neither can drift from the other.
 ///
-/// The generated property above will reach these, but it reaches them at a rate
-/// the generator decides. This walks them deterministically, so a regression in
-/// the CNAME chase cannot be hidden by a seed that happened not to build a
-/// chain, and so a reader can see the branch list without running proptest.
-///
-/// Each name/type pair below lands on a different arm of `Zone::resolve`:
-/// exact hit, CNAME substitution, CNAME chase into a second name, chase to an
-/// out-of-zone target, chase to a dangling target, NODATA at an existing name,
-/// wildcard synthesis, wildcard type-miss (NODATA, VEGA-083), uncovered
-/// NXDOMAIN, ANY at each of those, and the apex.
-#[test]
-fn every_branch_of_the_lookup_agrees_with_the_pre_s1_implementation() {
-    let _watchdog = testutil::arm(WATCHDOG);
-
+/// Every record here reaches a named branch. The last four are S2's, one per
+/// transition class, and they are in the fixture rather than left to the
+/// generator because empty non-terminals are rarer than wildcards: a shape the
+/// generator reaches at a rate it chooses is a shape that is untested on the run
+/// that matters.
+fn s2_fixture() -> ZoneConfig {
     let spec = |name: &str, ty: &str, value: &str| RecordSpec {
         name: name.to_owned(),
         record_type: ty.to_owned(),
         ttl: None,
         values: vec![value.to_owned()],
     };
-    let cfg = ZoneConfig {
+    ZoneConfig {
         origin: ORIGIN.to_owned(),
         default_ttl: 300,
         builtins: false,
@@ -807,16 +1129,39 @@ fn every_branch_of_the_lookup_agrees_with_the_pre_s1_implementation() {
             spec("*.dev", "A", "203.0.113.50"),
             spec("*", "A", "203.0.113.1"),
             spec("deep.dev", "A", "203.0.113.51"),
+            // S2 shapes, one per transition class.
+            // T1: `_tcp.host` and `svc` exist only as ancestors.
+            spec("_sip._tcp.host", "SRV", "10 10 5060 host.example.test."),
+            spec("a.b.svc", "A", "203.0.113.70"),
+            // T2: makes `*.zone.example.test.` an empty non-terminal that is
+            // also a wildcard (RFC 4592 §2.1.1, §2.1.3).
+            spec("x.*.zone", "A", "203.0.113.71"),
+            // T3: a CNAME whose target becomes an empty non-terminal, so the
+            // chase that used to append the apex wildcard's synthesised record
+            // now stops at the CNAME.
+            spec("toent", "CNAME", &format!("b.svc.{ORIGIN}.")),
         ],
-    };
+    }
+}
 
-    let real = Zone::from_config(&cfg).expect("fixture zone builds");
-    let frozen = FrozenZone::build(&cfg).expect("transcription builds the same fixture");
+/// A zone with **no apex wildcard**, which is what T2 needs to be visible at
+/// all.
+///
+/// An apex `*` covers every name in the zone, so nothing under it is ever
+/// NXDOMAIN and the "a wildcard that is an empty non-terminal starts covering
+/// this name" transition can never be observed there. That is a fact about the
+/// shape of the zone rather than about the fix, and it is exactly the kind of
+/// masking that makes a one-fixture test report a class as unreachable when it
+/// is merely hidden — this file's first run of the class check found it.
+fn t2_fixture() -> ZoneConfig {
+    let mut cfg = s2_fixture();
+    cfg.records.retain(|r| r.name.trim() != "*");
+    cfg
+}
 
-    assert_eq!(real.record_count(), frozen.record_count);
-    assert_eq!(render_soa(real.soa()), render_soa(frozen.soa.as_ref()));
-
-    let names = [
+/// The names swept against [`s2_fixture`], one per branch of the lookup.
+fn fixture_names() -> Vec<String> {
+    vec![
         ORIGIN.to_owned() + ".",
         format!("host.{ORIGIN}."),
         format!("alias.{ORIGIN}."),
@@ -825,8 +1170,9 @@ fn every_branch_of_the_lookup_agrees_with_the_pre_s1_implementation() {
         format!("outside.{ORIGIN}."),
         format!("x.dev.{ORIGIN}."),
         format!("deep.dev.{ORIGIN}."),
-        // VEGA-009's shape: a wildcard leaking below a name that exists. S1
-        // must keep answering it exactly as non-conformantly as today.
+        // VEGA-009's shape: a wildcard leaking below a name that exists. S2 must
+        // keep answering it exactly as non-conformantly as today; the fix is
+        // S3's.
         format!("a.deep.dev.{ORIGIN}."),
         format!("dev.{ORIGIN}."),
         format!("*.dev.{ORIGIN}."),
@@ -834,7 +1180,59 @@ fn every_branch_of_the_lookup_agrees_with_the_pre_s1_implementation() {
         format!("a.b.c.d.{ORIGIN}."),
         "example.invalid.".to_owned(),
         ".".to_owned(),
-    ];
+        // S2: the empty non-terminals themselves, a name beneath one, the
+        // wildcard-shaped one, a name it covers, and the CNAME into one.
+        format!("_tcp.host.{ORIGIN}."),
+        format!("b.svc.{ORIGIN}."),
+        format!("svc.{ORIGIN}."),
+        format!("under.b.svc.{ORIGIN}."),
+        format!("*.zone.{ORIGIN}."),
+        format!("zone.{ORIGIN}."),
+        format!("covered.zone.{ORIGIN}."),
+        format!("toent.{ORIGIN}."),
+    ]
+}
+
+/// Scenario: The differential covers ANY, CNAME chasing and the negative paths,
+/// not only wildcards
+/// features/zone-data-model.feature:280
+///
+/// The generated property above will reach these, but it reaches them at a rate
+/// the generator decides. This walks them deterministically, so a regression in
+/// the CNAME chase cannot be hidden by a seed that happened not to build a
+/// chain, and so a reader can see the branch list without running proptest.
+///
+/// Each name/type pair below lands on a different arm of `Zone::resolve`:
+/// exact hit, CNAME substitution, CNAME chase into a second name, chase to an
+/// out-of-zone target, chase to a dangling target, NODATA at an existing name,
+/// wildcard synthesis, wildcard type-miss (NODATA, VEGA-083), uncovered
+/// NXDOMAIN, ANY at each of those, and the apex.
+///
+/// It also carries the anti-vacuity half of the S2 property above: a
+/// classification that nothing exercises permits everything, so the three
+/// transition classes are counted here and every one must be observed at least
+/// once. The fixture is built to produce them — `_sip._tcp.host` for T1,
+/// `x.*.dev` for T2, and a CNAME whose target is an empty non-terminal for T3 —
+/// rather than left to a generator that reaches them at a rate it chooses.
+#[test]
+fn every_branch_of_the_lookup_agrees_with_the_transcription_over_an_ancestor_closed_node_set() {
+    let _watchdog = testutil::arm(WATCHDOG);
+
+    let cfg = s2_fixture();
+    let real = Zone::from_config(&cfg).expect("fixture zone builds");
+    let frozen = FrozenZone::build(&cfg).expect("transcription builds the same fixture");
+    let ents = ancestor_closure(&cfg);
+    let mut ent_list: Vec<LowerName> = ents.iter().cloned().collect();
+    ent_list.sort_by_key(std::string::ToString::to_string);
+    let s2 = FrozenZone::build(&cfg)
+        .expect("the transcription builds twice")
+        .materialise_ancestors(&ent_list);
+    let origin_depth = label_count(&frozen.lower_origin);
+
+    assert_eq!(real.record_count(), frozen.record_count);
+    assert_eq!(render_soa(real.soa()), render_soa(frozen.soa.as_ref()));
+
+    let names = fixture_names();
     let types = [
         RecordType::A,
         RecordType::AAAA,
@@ -845,21 +1243,36 @@ fn every_branch_of_the_lookup_agrees_with_the_pre_s1_implementation() {
     ];
 
     let mut compared = 0usize;
+    let mut seen: HashSet<Transition> = HashSet::new();
     for name in &names {
         let queried = lower(name);
         assert_eq!(
             real.exists(&queried),
-            frozen.exists(&queried),
+            s2.exists(&queried),
             "Zone::exists disagreed for {name}"
         );
         for qtype in types {
             let actual = real.lookup(&queried, qtype);
-            let expected = frozen.lookup(&queried, qtype);
+            let expected = s2.lookup(&queried, qtype);
             assert_eq!(
                 rendered(&actual),
                 rendered(&expected),
-                "{name} {qtype} disagreed with the pre-S1 implementation"
+                "{name} {qtype} disagreed with the transcription over the \
+                 ancestor-closed node set"
             );
+
+            let before = frozen.lookup(&queried, qtype);
+            if rendered(&before) != rendered(&expected) {
+                let class = classify(&ents, origin_depth, &queried, &before, &expected)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{name} {qtype} changed between the pre-S2 and post-S2 \
+                             node sets and the change is not one ancestor closure \
+                             can produce\n  before: {before:?}\n  after:  {expected:?}"
+                        )
+                    });
+                seen.insert(class);
+            }
             compared += 1;
         }
     }
@@ -870,4 +1283,207 @@ fn every_branch_of_the_lookup_agrees_with_the_pre_s1_implementation() {
         "the branch sweep did not run every pair; a loop that silently skips is \
          a gate that silently passes"
     );
+    assert!(
+        !seen.is_empty(),
+        "the fixture produced no S2 transition at all, so this sweep is \
+         measuring S1 and calling it S2"
+    );
+}
+
+/// Scenario: A wildcard still applies below a name that exists — S2 does not fix
+/// VEGA-009
+/// features/empty-non-terminals.feature:327
+///
+/// **The proof that the permitted transition set is not too loose**, and the
+/// reason it is three named classes rather than "NXDOMAIN may become NODATA".
+///
+/// S3 fixes VEGA-009: `*.dev` stops applying below `deep.dev`, so
+/// `a.deep.dev.example.test.` goes from a synthesised A record to NXDOMAIN.
+/// S2 must not do that, and a differential that permitted it would let the fix
+/// land a step early, un-reviewed, with S3's own differential never written.
+/// Here the classifier is handed that exact transition and must refuse it.
+///
+/// The blanket rule is refused in the same test: an NXDOMAIN that becomes NODATA
+/// at a name which is neither an empty non-terminal nor covered by one is *not*
+/// a transition ancestor closure can produce, whatever it looks like from the
+/// outside. This is the assertion that would have to be deleted, not merely
+/// weakened, for a wrong S2 to pass.
+#[test]
+fn the_classifier_refuses_transitions_ancestor_closure_cannot_produce() {
+    let cfg = s2_fixture();
+    let ents = ancestor_closure(&cfg);
+    let origin_depth = 2; // example.test.
+
+    let synthesised = Answer::Records(vec![Record::from_rdata(
+        Name::from(lower(&format!("a.deep.dev.{ORIGIN}."))),
+        300,
+        rdata::parse_value(RecordType::A, "*.dev", "203.0.113.50").expect("fixture rdata parses"),
+    )]);
+    assert_eq!(
+        classify(
+            &ents,
+            origin_depth,
+            &lower(&format!("a.deep.dev.{ORIGIN}.")),
+            &synthesised,
+            &Answer::NxDomain,
+        ),
+        None,
+        "the classifier accepted VEGA-009's fix as an S2 transition. \
+         `deep.dev` exists, so RFC 4592 §3.3.1 makes `*.deep.dev` the only \
+         source of synthesis and this name NXDOMAIN — but that is S3's change, \
+         and a differential that permits it here lets the closest-encloser \
+         rewrite land a commit early with nothing checking it"
+    );
+
+    assert_eq!(
+        classify(
+            &ents,
+            origin_depth,
+            &lower(&format!("nothing.{ORIGIN}.")),
+            &Answer::NxDomain,
+            &Answer::NoData,
+        ),
+        None,
+        "the classifier accepted a blanket NXDOMAIN -> NODATA. Nothing exists \
+         at or below `nothing.{ORIGIN}.`, so a name error there is correct; \
+         permitting the transition wherever it appears is the loose rule that \
+         would also pass a zone which had stopped denying anything at all"
+    );
+
+    assert_eq!(
+        classify(
+            &ents,
+            origin_depth,
+            &lower(&format!("svc.{ORIGIN}.")),
+            &Answer::NxDomain,
+            &synthesised,
+        ),
+        None,
+        "the classifier accepted RECORDS at an empty non-terminal. It is a node \
+         with no RRsets (RFC 4592 §2.2.2) — NODATA and nothing else. Accepting \
+         any answer here would let a build that filed a descendant's records at \
+         its ancestor through the differential"
+    );
+
+    // …and the control: the transition it must accept, so this test cannot pass
+    // by refusing everything.
+    let ent = lower(&format!("svc.{ORIGIN}."));
+    assert!(
+        ents.contains(&ent),
+        "the fixture must actually declare something beneath {ent}"
+    );
+    assert_eq!(
+        classify(
+            &ents,
+            origin_depth,
+            &ent,
+            &Answer::NxDomain,
+            &Answer::NoData
+        ),
+        Some(Transition::EmptyNonTerminalExists),
+    );
+}
+
+/// Scenario: All three transition classes are actually reached
+/// features/empty-non-terminals.feature:395
+///
+/// The anti-vacuity half of the differential, and **it does not touch the
+/// implementation at all**: it runs the fixture through the transcription twice,
+/// once over the declared node set and once over the ancestor-closed one, and
+/// requires each of the three permitted transitions to appear.
+///
+/// Kept separate from the sweep above for one reason: the sweep is RED until S2
+/// lands, so an assertion buried at its end would not run until then — and a
+/// classification nobody has ever exercised is a whitelist, not a gate. This one
+/// is green today. If it goes red, either the fixture stopped producing a shape
+/// or `classify` stopped recognising one, and in both cases the property that
+/// depends on it has quietly widened.
+#[test]
+fn each_permitted_transition_class_is_reached_by_the_fixture() {
+    let _watchdog = testutil::arm(WATCHDOG);
+
+    let mut seen: HashSet<Transition> = HashSet::new();
+    let mut unclassified: Vec<String> = Vec::new();
+
+    for cfg in [s2_fixture(), t2_fixture()] {
+        let frozen = FrozenZone::build(&cfg).expect("fixture builds");
+        let ents = ancestor_closure(&cfg);
+        let mut ent_list: Vec<LowerName> = ents.iter().cloned().collect();
+        ent_list.sort_by_key(std::string::ToString::to_string);
+        let s2 = FrozenZone::build(&cfg)
+            .expect("fixture builds twice")
+            .materialise_ancestors(&ent_list);
+        let origin_depth = label_count(&frozen.lower_origin);
+
+        assert!(
+            !ents.is_empty(),
+            "the fixture declares no name with a strict ancestor, so it cannot \
+             exercise ancestor closure"
+        );
+        // The closure's DEPTH, pinned. `a.b.svc` implies `b.svc` *and* `svc`,
+        // and a loop that stops one level short still produces all three
+        // transition classes below — so without this the class check passes
+        // against a closure that leaves every grandparent NXDOMAIN, which is
+        // the same RFC 8020 §2 denial one label higher. Found by hand-applying
+        // exactly that mutant.
+        for required in [
+            format!("b.svc.{ORIGIN}."),
+            format!("svc.{ORIGIN}."),
+            format!("_tcp.host.{ORIGIN}."),
+        ] {
+            assert!(
+                ents.contains(&lower(&required)),
+                "{required} is a strict ancestor of a configured owner and is \
+                 not in the closure. Every ancestor up to the origin is a node \
+                 (RFC 4592 §2.2.2, ruling I-3), not just the immediate parent"
+            );
+        }
+
+        for name in fixture_names() {
+            let queried = lower(&name);
+            for qtype in [
+                RecordType::A,
+                RecordType::AAAA,
+                RecordType::TXT,
+                RecordType::SRV,
+                RecordType::CNAME,
+                RecordType::ANY,
+            ] {
+                let before = frozen.lookup(&queried, qtype);
+                let after = s2.lookup(&queried, qtype);
+                if rendered(&before) == rendered(&after) {
+                    continue;
+                }
+                match classify(&ents, origin_depth, &queried, &before, &after) {
+                    Some(class) => {
+                        seen.insert(class);
+                    }
+                    None => unclassified.push(format!("{name} {qtype}: {before:?} -> {after:?}")),
+                }
+            }
+        }
+    }
+
+    assert!(
+        unclassified.is_empty(),
+        "ancestor closure alone produced a difference that `classify` does not \
+         recognise. Either the closure is doing more than closing the node set \
+         under ancestry, or there is a fourth transition class that has to be \
+         named and specced before S2 can be accepted:\n  - {}",
+        unclassified.join("\n  - ")
+    );
+
+    for required in [
+        Transition::EmptyNonTerminalExists,
+        Transition::CoveredByAWildcardEmptyNonTerminal,
+        Transition::CnameChaseStopsAtAnEmptyNonTerminal,
+    ] {
+        assert!(
+            seen.contains(&required),
+            "{required:?} was never observed on this fixture, so the \
+             classification in the property above permits it without ever \
+             checking it. A transition class nothing exercises is a whitelist \
+             entry, not a gate. Observed: {seen:?}"
+        );
+    }
 }

@@ -5,6 +5,10 @@
 //! answers wrongly. They are written to the RFC rather than to the code, so
 //! they stay meaningful after the fix.
 //!
+//! The empty-non-terminal pair is un-`#[ignore]`d at VEGA-032 S2, which closes
+//! VEGA-006. The wildcard closest-encloser test below it is VEGA-009's and stays
+//! red until S3 — if it goes green at S2, S2 went outside its fence.
+//!
 //! Run them with `cargo test --test rfc_conformance -- --ignored`.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -276,13 +280,22 @@ async fn an_unsupported_edns_version_is_answered_badvers() {
     }
 }
 
+/// Scenario: An empty non-terminal answers NOERROR with the SOA in the
+/// authority section over the wire
+/// features/empty-non-terminals.feature:137
+///
+/// Un-`#[ignore]`d at VEGA-032 S2, which closes VEGA-006.
 #[tokio::test]
-#[ignore = "BUG: empty non-terminals answer NXDOMAIN instead of NODATA (RFC 2308 s2.2.1)"]
 async fn an_empty_non_terminal_answers_nodata_over_the_wire() {
     // The wire-level counterpart of the zone unit test. This matters more than
     // it looks: RFC 8020 lets a resolver that has cached NXDOMAIN for
     // `ent.example.test` answer NXDOMAIN for everything below it, which takes
     // the record that does exist out of service.
+    //
+    // The SOA in the authority section is not decoration either: RFC 2308 §3
+    // requires it for a negative answer to be cacheable at all, and §5 makes its
+    // MINIMUM the lifetime. Without it every miss comes back — which is the load
+    // profile a random-subdomain flood wants.
     let server = start(vec![spec("a.b.ent", "A", &["203.0.113.41"])]).await;
 
     for name in [format!("ent.{ZONE}"), format!("b.ent.{ZONE}")] {
@@ -301,6 +314,73 @@ async fn an_empty_non_terminal_answers_nodata_over_the_wire() {
             Some(RecordType::SOA)
         );
     }
+}
+
+/// Scenario: Asking for the empty non-terminal first does not deny the record
+/// beneath it
+/// features/empty-non-terminals.feature:148
+///
+/// AC-2.5 — RFC 8020 §2 as an experiment rather than as a citation, and the
+/// reason VEGA-006 is a blocker rather than a conformance nit.
+///
+/// The ORDER is the test. A resolver that asks for the service name before the
+/// instance name — which is what walking down from the apex does, and what a
+/// human debugging with `dig` does — gets an authoritative NXDOMAIN today,
+/// caches it for the SOA MINIMUM (RFC 2308 §5), and is then licensed by RFC 8020
+/// §2 to answer NXDOMAIN for everything beneath it. The SRV record that is
+/// configured and serving goes out of service without anything having changed.
+///
+/// Two queries, one server, in sequence, over UDP: the first must be NOERROR
+/// with an empty answer section and the second must carry the record.
+#[tokio::test]
+async fn asking_for_the_empty_non_terminal_first_does_not_deny_the_record_beneath_it() {
+    let server = start(vec![spec(
+        "_sip._tcp",
+        "SRV",
+        &["10 10 5060 sip.example.test."],
+    )])
+    .await;
+
+    let parent = ask(
+        &server,
+        &format!("_tcp.{ZONE}"),
+        RecordType::SRV,
+        DNSClass::IN,
+    )
+    .await;
+    assert_eq!(
+        parent.metadata.response_code,
+        ResponseCode::NoError,
+        "_tcp.{ZONE} exists because _sip._tcp.{ZONE} does (RFC 4592 §2.2.2); an \
+         NXDOMAIN here is cached and, under RFC 8020 §2, denies the SRV below it"
+    );
+    assert!(
+        parent.answers.is_empty(),
+        "an empty non-terminal holds no records of any type"
+    );
+    assert_eq!(
+        parent
+            .authorities
+            .first()
+            .map(hickory_proto::rr::Record::record_type),
+        Some(RecordType::SOA),
+        "RFC 2308 §3: the SOA is what makes the negative answer cacheable"
+    );
+
+    let child = ask(
+        &server,
+        &format!("_sip._tcp.{ZONE}"),
+        RecordType::SRV,
+        DNSClass::IN,
+    )
+    .await;
+    assert_eq!(child.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        child.answers.len(),
+        1,
+        "the configured SRV must still answer after its parent was asked for"
+    );
+    assert_eq!(child.answers[0].record_type(), RecordType::SRV);
 }
 
 #[tokio::test]

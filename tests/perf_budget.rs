@@ -308,6 +308,99 @@ fn an_any_lookup_does_not_scan_the_whole_record_map() {
     );
 }
 
+/// BUDGET (VEGA-032 §13, AC-2.6): an empty non-terminal is found by the same
+/// single probe as any other node.
+///
+/// Scenario: An empty non-terminal is answered as cheaply as any other existing
+/// name
+/// features/empty-non-terminals.feature:437
+///
+/// An empty non-terminal is "a node with no RRsets" (RFC 4592 §2.2.2), so
+/// answering one is a hash probe, a hit, and an empty RRset range — strictly
+/// *less* work than an exact hit, which additionally binary-searches the type
+/// and copies rdata into a `Vec`. If it costs more, the node is not being found
+/// and the lookup is falling through to the wildcard walk before it answers,
+/// which is a different bug wearing the right rcode.
+///
+/// Ratio-budgeted like every other case in this file so that a shared or slow
+/// runner cannot make it flap. 2x rather than 1x because the exact hit is the
+/// *faster* of the two operations to mis-measure: it allocates, so it is the
+/// side with the larger constant, and a budget of 1.0 would be measuring
+/// `malloc` rather than the probe.
+///
+/// # Status: FAILS TODAY, and for the right reason
+///
+/// `_tcp.h1.example.com.` is NXDOMAIN before S2, so the assertion that it is
+/// NODATA fails before any timing is taken. That is deliberate: a timing
+/// comparison between an exact hit and a name error is a comparison of two
+/// different code paths, and it would report a perfectly healthy ratio while
+/// measuring nothing at all.
+#[test]
+fn an_empty_non_terminal_costs_no_more_than_an_exact_hit() {
+    let _watchdog = testutil::arm(WATCHDOG);
+
+    let mut records = Vec::with_capacity(ZONE_SIZE);
+    for i in 0..ZONE_SIZE {
+        records.push(spec(
+            &format!("_sip._tcp.h{i}"),
+            "A",
+            &[&format!(
+                "10.{}.{}.{}",
+                (i >> 16) & 0xff,
+                (i >> 8) & 0xff,
+                i & 0xff
+            )],
+        ));
+    }
+    let z = Zone::from_config(&ZoneConfig {
+        origin: "example.com".to_owned(),
+        default_ttl: 300,
+        builtins: false,
+        soa: Some(SoaSpec {
+            mname: "ns1.example.com.".to_owned(),
+            rname: "hostmaster.example.com.".to_owned(),
+            serial: 1,
+            refresh: 3600,
+            retry: 900,
+            expire: 604_800,
+            minimum: 60,
+        }),
+        records,
+    })
+    .expect("zone builds");
+
+    let owner = lower("_sip._tcp.h1.example.com.");
+    let ent = lower("_tcp.h1.example.com.");
+
+    assert!(
+        matches!(z.lookup(&owner, RecordType::A), Answer::Records(_)),
+        "the exact owner must answer, or the baseline is not an exact hit"
+    );
+    assert_eq!(
+        z.lookup(&ent, RecordType::A),
+        Answer::NoData,
+        "the empty non-terminal must be NODATA before its cost means anything: \
+         timing an NXDOMAIN against an exact hit compares two different paths"
+    );
+
+    let hit = best_of(5, 5_000, || {
+        std::hint::black_box(z.lookup(std::hint::black_box(&owner), RecordType::A));
+    });
+    let empty = best_of(5, 5_000, || {
+        std::hint::black_box(z.lookup(std::hint::black_box(&ent), RecordType::A));
+    });
+
+    let r = empty.as_secs_f64() / hit.as_secs_f64();
+    println!("exact hit {hit:?}  empty non-terminal {empty:?}  ratio {r:.2}x");
+    assert!(
+        r < 2.0,
+        "an empty non-terminal costs {r:.2}x an exact hit ({empty:?} vs \
+         {hit:?}). It is one probe into an empty RRset range and must be the \
+         cheaper of the two; a higher cost means the node is not found and the \
+         answer is coming out of the wildcard walk"
+    );
+}
+
 /// BUDGET (VEGA-032 §5.2, AC-1.7): the same claim at the **protocol** ceiling
 /// rather than at this zone's.
 ///

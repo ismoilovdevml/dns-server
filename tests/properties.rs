@@ -213,6 +213,65 @@ fn has_a_source_of_synthesis(cfg: &ZoneConfig, name: &LowerName) -> bool {
         })
 }
 
+/// Every node name the config declares: the owner of each record set, with a
+/// wildcard keyed at its own name (`*.dev.example.test.`, RFC 4592 §2.1.1), plus
+/// the apex.
+///
+/// Derived from the configuration, like every other oracle in this file.
+fn declared_node_names(cfg: &ZoneConfig) -> BTreeSet<LowerName> {
+    let mut out = BTreeSet::new();
+    out.insert(lower(&qualify("@")));
+    for spec in &cfg.records {
+        let name = spec.name.trim();
+        out.insert(lower(&qualify(name)));
+    }
+    out
+}
+
+/// Is `name` an **empty non-terminal**: a strict ancestor of some declared node
+/// name, inside the zone, that the config does not declare outright?
+///
+/// RFC 4592 §2.2.2. This is VEGA-032 S2's whole behaviour change, decided from
+/// the config so that the implementation gets no vote in which of the
+/// differential's disagreements are permitted. Compare
+/// [`has_a_source_of_synthesis`]: that one asks whether a wildcard covers the
+/// name, this one asks whether the name is in the zone at all.
+fn is_an_empty_non_terminal(cfg: &ZoneConfig, name: &LowerName) -> bool {
+    let declared = declared_node_names(cfg);
+    if declared.contains(name) {
+        return false;
+    }
+    // Strictly inside the zone. The root is an ancestor of every owner name in
+    // existence and is not a node in this zone — a closure that runs past the
+    // origin is the off-by-one that would make the server claim `com.`, and
+    // this predicate must not model it.
+    let origin = lower(&qualify("@"));
+    if !origin.zone_of(name) || label_count(name) <= label_count(&origin) {
+        return false;
+    }
+    declared
+        .iter()
+        .any(|owner| name.zone_of(owner) && label_count(name) < label_count(owner))
+}
+
+/// Is `name` covered by a wildcard that exists **only** as an empty
+/// non-terminal — the `x.*.dev` shape, which makes `*.dev` a node with no RRset?
+///
+/// A source of synthesis that carries no records still forbids the name error
+/// (RFC 1034 §4.3.2 step 3(c)), so these names move from NXDOMAIN to NODATA at
+/// S2 even though they are not themselves empty non-terminals.
+fn is_covered_by_a_wildcard_empty_non_terminal(cfg: &ZoneConfig, name: &LowerName) -> bool {
+    let declared = declared_node_names(cfg);
+    let full = Name::from(name.clone());
+    let origin_depth = label_count(&lower(&qualify("@")));
+    (origin_depth..full.iter().len()).any(|d| {
+        full.trim_to(d).prepend_label("*").is_ok_and(|star| {
+            let star = LowerName::from(star);
+            !declared.contains(&star) && is_an_empty_non_terminal(cfg, &star)
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Properties
 // ---------------------------------------------------------------------------
@@ -796,7 +855,7 @@ proptest! {
     ///
     /// Scenario: The bounded walk agrees with the naive walk on every zone and
     /// every name
-    /// features/wildcards.feature:477
+    /// features/wildcards.feature:503
     ///
     /// This is the property that would have rejected the proposed patch: it
     /// derived probe depths from `LowerName::num_labels()`, which discounts a
@@ -823,6 +882,26 @@ proptest! {
     /// The transition is also *required* where it applies, so this direction of
     /// the property is the fix itself and not merely permission for it. That is
     /// what lets a reviewer trust the diff without re-deriving §6.2 by hand.
+    ///
+    /// VEGA-032 S2 — A SECOND PERMITTED TRANSITION, added in the commit that
+    /// makes it true. The naive reference is still the pre-VEGA-065 walk and is
+    /// still not updated. What is added is the transition ancestor closure
+    /// produces, again decided from the config rather than from the code:
+    ///
+    ///   * a name that exists as an **empty non-terminal** is `NoData`,
+    ///     whatever the naive walk said. That covers `NxDomain -> NoData` (the
+    ///     RFC 8020 §2 denial this fixes) *and* `Records -> NoData`, because RFC
+    ///     4592 §2.2.2 forbids a wildcard synthesising at a name that exists —
+    ///     the naive walk happily synthesises at a wildcard's parent;
+    ///   * a name covered by a wildcard that exists only as an empty
+    ///     non-terminal (`x.*.dev` makes `*.dev` a node) moves `NxDomain ->
+    ///     NoData` by RFC 1034 §4.3.2 step 3(c), exactly as a declared wildcard
+    ///     would.
+    ///
+    /// This oracle is retired outright at S3 and replaced by an RFC 4592 §3.3.1
+    /// closest-encloser reference (ruling §13, AC-3.4). It is kept here because
+    /// it is still the only mechanised check that S2 did not change the
+    /// *wildcard* walk while changing the node set.
     #[test]
     fn the_wildcard_walk_agrees_with_a_naive_base_name_walk(
         cfg in walk_zone_config(),
@@ -840,8 +919,32 @@ proptest! {
             .map(|r| format!("{} {}", r.name, r.record_type))
             .collect::<Vec<_>>();
 
-        if matches!(expected, Answer::NxDomain) && has_a_source_of_synthesis(&cfg, &queried) {
-            // The one permitted transition, and here it is mandatory.
+        if is_an_empty_non_terminal(&cfg, &queried) {
+            // VEGA-032 S2's transition, and here it is mandatory. It subsumes
+            // the VEGA-083 arm below at these names: an empty non-terminal is a
+            // name that EXISTS, so no wildcard may synthesise for it at all
+            // (RFC 4592 §2.2.2), whatever the naive walk did.
+            prop_assert_eq!(
+                canonical(&actual),
+                canonical(&Answer::NoData),
+                "{} {} exists as an empty non-terminal — something is configured \
+                 beneath it — so it is NODATA. NXDOMAIN here lets an RFC 8020 §2 \
+                 resolver deny the whole subtree including the configured record, \
+                 and a synthesised answer here is a wildcard applied at a name \
+                 that exists\n  zone: {:?}\n  got: {:?}",
+                name,
+                qtype,
+                zone_shape,
+                actual
+            );
+        } else if matches!(expected, Answer::NxDomain)
+            && (has_a_source_of_synthesis(&cfg, &queried)
+                || is_covered_by_a_wildcard_empty_non_terminal(&cfg, &queried))
+        {
+            // VEGA-083's transition, plus its S2 sibling: a source of synthesis
+            // that exists only as an empty non-terminal (`x.*.dev` makes `*.dev`
+            // a node) forbids the name error for the names it covers just as a
+            // declared one does.
             prop_assert_eq!(
                 canonical(&actual),
                 canonical(&Answer::NoData),
@@ -856,9 +959,11 @@ proptest! {
             prop_assert_eq!(
                 canonical(&actual),
                 canonical(&expected),
-                "{} {} disagreed with the naive walk, and not by the one \
-                 transition VEGA-083 permits (NXDOMAIN -> NODATA for a name a \
-                 wildcard covers)\n  zone: {:?}\n  got:      {:?}\n  expected: {:?}",
+                "{} {} disagreed with the naive walk, and not by one of the \
+                 transitions permitted here: VEGA-083's (NXDOMAIN -> NODATA for \
+                 a name a wildcard covers) or VEGA-032 S2's (a name that exists \
+                 as an empty non-terminal is NODATA)\n  zone: {:?}\n  got:      \
+                 {:?}\n  expected: {:?}",
                 name,
                 qtype,
                 zone_shape,
@@ -1376,5 +1481,164 @@ proptest! {
                 .collect(),
         };
         prop_assert!(Zone::from_config(&cfg).is_ok(), "{}", raw);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VEGA-032 S2 — empty non-terminals (closes VEGA-006)
+//
+// Spec: features/empty-non-terminals.feature
+//
+// CASES ARE CONSTRUCTED, NOT FILTERED. The deep owner name is generated first
+// and the queried ancestor is DERIVED from it by dropping labels, so every case
+// is a real empty non-terminal. Generating a zone and a name independently and
+// discarding the pairs that do not interact is what took
+// `a_wildcard_covered_name_exists_for_every_type` to 247 successes and 1,024
+// global rejects on CI while it passed locally on a luckier seed — and empty
+// non-terminals are rarer than wildcard-covered names, so the same mistake here
+// would bite harder. There is no `prop_assume!` below.
+// ---------------------------------------------------------------------------
+
+/// An owner name deep enough to have at least one strict ancestor inside the
+/// zone, wildcards included — `*.a.b` implies `a.b` and `b` exactly as `x.a.b`
+/// does, because a wildcard is a node named `*.a.b` (RFC 4592 §2.1.1).
+fn deep_owner_name() -> impl Strategy<Value = String> {
+    prop_oneof![
+        4 => prop::collection::vec(label(), 2..5).prop_map(|ls| ls.join(".")),
+        2 => prop::collection::vec(label(), 1..4)
+            .prop_map(|ls| format!("*.{}", ls.join("."))),
+        1 => prop::collection::vec(label(), 1..3)
+            .prop_map(|ls| format!("{}.*.{}", ls[0], ls.join("."))),
+    ]
+}
+
+/// A zone whose every record set sits at a name with ancestors, plus the two
+/// indices that pick which owner and which of its ancestors to query.
+fn ancestor_case() -> impl Strategy<Value = (ZoneConfig, usize, usize)> {
+    (
+        prop::collection::vec(
+            (
+                deep_owner_name(),
+                typed_value(),
+                prop::option::of(1u32..7200),
+            ),
+            1..5,
+        ),
+        0usize..64,
+        0usize..64,
+    )
+        .prop_map(|(owners, which, depth)| {
+            let records = owners
+                .into_iter()
+                .map(|(name, (record_type, value), ttl)| RecordSpec {
+                    name,
+                    record_type,
+                    ttl,
+                    values: vec![value],
+                })
+                .collect();
+            (
+                ZoneConfig {
+                    origin: ORIGIN.to_owned(),
+                    default_ttl: 300,
+                    builtins: false,
+                    soa: None,
+                    records,
+                },
+                which,
+                depth,
+            )
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// INVARIANT (RFC 4592 §2.2.2, RFC 8020 §2): no strict ancestor of a
+    /// configured owner name is ever a name error.
+    ///
+    /// Scenario: No strict ancestor of any configured owner is ever NXDOMAIN
+    /// features/empty-non-terminals.feature:355
+    ///
+    /// This is VEGA-006 stated as a property rather than as the four example
+    /// zones anyone would think to write. The blocker is not that one rcode is
+    /// wrong: it is that RFC 8020 §2 lets a resolver turn one wrong NXDOMAIN
+    /// into a denial of every name beneath it for the SOA MINIMUM, so the
+    /// records that DO exist go out of service. The property therefore asserts
+    /// the negative for every type, including the ones no wildcard in the zone
+    /// carries, because a dual-stack client asking AAAA is enough to trigger it.
+    #[test]
+    fn no_strict_ancestor_of_a_configured_owner_is_ever_nxdomain(
+        (cfg, which, depth) in ancestor_case(),
+        qtype in query_type(),
+    ) {
+        let _watchdog = testutil::arm(WATCHDOG);
+        let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
+
+        let owners: Vec<LowerName> = declared_node_names(&cfg).into_iter().collect();
+        let owner = owners[which % owners.len()].clone();
+        let full = Name::from(owner.clone());
+        let origin_depth = label_count(&lower(&qualify("@")));
+        let labels = full.iter().len();
+
+        // Every case is a real ancestor: the owner came first and the depth is
+        // taken modulo the range that exists for it. When the owner is the apex
+        // the range is empty and the apex itself is the case — which is also a
+        // name that must never be NXDOMAIN.
+        let span = labels.saturating_sub(origin_depth);
+        let d = if span == 0 { origin_depth } else { origin_depth + depth % span };
+        let ancestor = LowerName::from(full.trim_to(d));
+
+        let answer = zone.lookup(&ancestor, qtype);
+        prop_assert!(
+            !matches!(answer, Answer::NxDomain),
+            "{} {} is NXDOMAIN, but {} is configured beneath it so it exists \
+             (RFC 4592 §2.2.2). Under RFC 8020 §2 a resolver may cache that \
+             denial and apply it to the whole subtree, taking the configured \
+             record out of service for the SOA MINIMUM\n  zone: {:?}",
+            ancestor,
+            qtype,
+            owner,
+            cfg.records.iter().map(|r| format!("{} {}", r.name, r.record_type)).collect::<Vec<_>>()
+        );
+        prop_assert!(
+            zone.exists(&ancestor),
+            "Zone::exists says {} does not exist, while {} is configured \
+             beneath it. That predicate is the RFC 1034 §4.3.2 step 3(c) \
+             name-error determination and the one the DNSSEC closest-encloser \
+             proof will read\n  zone: {:?}",
+            ancestor,
+            owner,
+            cfg.records.iter().map(|r| format!("{} {}", r.name, r.record_type)).collect::<Vec<_>>()
+        );
+    }
+
+    /// INVARIANT (AC-2.4): empty non-terminals are nodes, not records.
+    ///
+    /// Scenario: An empty non-terminal is not counted as a record
+    /// features/empty-non-terminals.feature:195
+    ///
+    /// `record_count` is the `dns_zone_records` gauge. Materialising ancestors
+    /// is the one change in this sequence that could plausibly move it without
+    /// any config change at all, and an operator whose alert fires on a gauge
+    /// that moved for no reason stops trusting the gauge.
+    #[test]
+    fn materialising_ancestors_does_not_move_the_record_count(
+        (cfg, _, _) in ancestor_case(),
+    ) {
+        let _watchdog = testutil::arm(WATCHDOG);
+        let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
+
+        let configured: usize = cfg.records.iter().map(|r| r.values.len()).sum();
+        prop_assert_eq!(
+            zone.record_count(),
+            configured,
+            "the zone counts {} records for {} configured values; an empty \
+             non-terminal is a node with no RRsets and contributes nothing to \
+             this gauge\n  zone: {:?}",
+            zone.record_count(),
+            configured,
+            cfg.records.iter().map(|r| format!("{} {}", r.name, r.record_type)).collect::<Vec<_>>()
+        );
     }
 }

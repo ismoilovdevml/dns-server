@@ -36,6 +36,25 @@ Feature: Wildcard record synthesis (RFC 4592)
   # the old model answered NODATA. That exclusion is what S2 and S3 remove, with
   # a ruling, rather than something S1 got to decide.
   #
+  # MODEL NOTE, VEGA-032 S2 — LANDED. Every strict ancestor of every owner name
+  # is now a node with an empty RRset range, so a name that exists only because
+  # something exists beneath it is NODATA and not NXDOMAIN (RFC 4592 §2.2.2, RFC
+  # 8020 §2 — features/empty-non-terminals.feature). Two consequences bear on
+  # the scenarios in THIS file:
+  #
+  #   * a wildcard's PARENT now exists. "*.apps" makes "apps.example.com" an
+  #     empty non-terminal, so it is NODATA. It still holds no records of its
+  #     own, which is the half a_wildcard_never_creates_a_record_at_its_own_
+  #     parent was rewritten to assert;
+  #   * a wildcard can itself BE an empty non-terminal. "x.*.dev" materialises
+  #     "*.dev.example.com" as a node with no RRset, and RFC 4592 §2.1.1 makes
+  #     that a source of synthesis, so names under "dev" are NODATA rather than
+  #     NXDOMAIN. The flag is a property of the NAME, never of which loop
+  #     created the node.
+  #
+  # Which wildcard answers a covered name is UNCHANGED at S2: deepest-wins, not
+  # RFC 4592 §3.3.1's closest encloser. That is VEGA-009 and it is S3's.
+  #
   # EVERY SCENARIO IN THIS FILE IS WRITTEN TO HOLD UNDER BOTH MODELS, and that
   # is the S1 acceptance criterion rather than an accident: S1 changes the
   # structure and no answer. The mechanised form of that claim is
@@ -522,44 +541,51 @@ Feature: Wildcard record synthesis (RFC 4592)
     Then it costs less than 25 times a 1-label lookup in the same zone
 
   # ------------------------------------------------------- NOT THIS ISSUE'S
-  # These stay red. src/zone.rs holds three #[ignore]d tests pinning RFC 4592
-  # §3.3.1 (no closest encloser), RFC 4592 §2.2.2 / RFC 2308 §2.2 (no empty
-  # non-terminals) and an empty non-terminal created by a wildcard. They are
-  # VEGA-009 and VEGA-006, fixed by VEGA-032's zone data model rewrite.
+  # ONE stays red. src/zone.rs used to hold three #[ignore]d tests pinning RFC
+  # 4592 §3.3.1 (no closest encloser), RFC 4592 §2.2.2 / RFC 2308 §2.2 (no empty
+  # non-terminals) and an empty non-terminal created by a wildcard — VEGA-009
+  # and VEGA-006, both fixed by VEGA-032's zone data model rewrite.
   #
-  # VEGA-065 is behaviour-preserving, so if one of them turns green the walk
-  # changed behaviour and the change is wrong. Do not un-ignore them here.
+  # AMENDED AT VEGA-032 S2, in the commit that discharges VEGA-006, which is the
+  # only commit allowed to touch this block. Two of the three are now GREEN and
+  # un-#[ignore]d; the third is VEGA-009's and belongs to S3:
   #
-  # VEGA-083 is NOT behaviour-preserving — it turns NXDOMAIN into NODATA for
-  # covered names — and all three still stay red under it, structurally:
+  #   * an_empty_non_terminal_is_nodata_not_nxdomain  — GREEN at S2 ✓
+  #   * the_parent_of_a_wildcard_is_not_nxdomain      — GREEN at S2 ✓
+  #   * a_wildcard_does_not_apply_below_a_name_that_exists — still red, S3's
   #
-  #   * the empty non-terminal zone holds no wildcards at all, so the probe
-  #     never runs;
-  #   * the wildcard-below-an-existing-name case is answered from the `Found`
-  #     path, which VEGA-083 does not touch;
-  #   * a wildcard can never declare ITS OWN PARENT covered, because RFC 4592
-  #     §3.3.1 makes a wildcard's parent a proper ancestor of the names it
-  #     covers and the probe window is capped at the query's parent depth. The
-  #     mask is empty, so zero probes run.
+  # WHY S2 STOPS THERE. Materialising every strict ancestor makes a name that
+  # exists as an ancestor NODATA, and a wildcard is a node named "*.x", so "x"
+  # exists for the same reason — that is both of VEGA-006's tests. It changes
+  # nothing about WHICH wildcard answers a covered name, which is the whole of
+  # VEGA-009: "*.dev" still applies below "deep.dev", wrongly, and the closest
+  # encloser rule arrives at S3 with its own differential. Ancestor closure
+  # makes that fix look like a two-line change from here; making it here would
+  # leave S3 nothing to prove and would retire VEGA-065's oracle in a commit
+  # with no ruling to retire it.
   #
-  # If one of them turns green under VEGA-083, the change went outside its
-  # fence — most likely by inserting wildcard parents into the zone's name set,
-  # which is VEGA-006's work and not a security commit's. Fix the change.
+  # The history, kept because it is what makes the fence checkable rather than
+  # decorative: VEGA-065 was behaviour-preserving and all three stayed red;
+  # VEGA-083 was NOT (it turns NXDOMAIN into NODATA for covered names) and all
+  # three still stayed red under it, structurally — a wildcard can never declare
+  # ITS OWN PARENT covered, because RFC 4592 §3.3.1 makes a wildcard's parent a
+  # proper ancestor of the names it covers and the probe window is capped at the
+  # query's parent depth. VEGA-032 S0 and S1 extended the same fence and held
+  # it. Only S2 was licensed to move it, and only this far.
   #
-  # VEGA-032 EXTENDS THE SAME FENCE OVER S0 AND S1, and then discharges it.
-  # S0 wires nothing up, and S1 is behaviour-preserving with NO empty
-  # non-terminals and NO closest encloser, so all three stay red through both:
+  # WHAT S2 ALSO CHANGED HERE, written down because it is not obvious: a
+  # wildcard can now exist as an EMPTY NON-TERMINAL. "x.*.dev" makes
+  # "*.dev.example.com" a node with no RRset, which RFC 4592 §2.1.1 makes a
+  # source of synthesis, so names under "dev" move from NXDOMAIN to NODATA by
+  # RFC 1034 §4.3.2 step 3(c). Specced at
+  # features/empty-non-terminals.feature:311.
   #
-  #   * an_empty_non_terminal_is_nodata_not_nxdomain  — green at S2
-  #   * the_parent_of_a_wildcard_is_not_nxdomain      — green at S2
-  #   * a_wildcard_does_not_apply_below_a_name_that_exists — green at S3
-  #
-  # If one turns green at S0 or S1, the commit went outside its fence and the
-  # commit is wrong, not the test.
-  #
-  # The commit that DOES discharge one of them — S2 or S3 — must, in the same
-  # diff, amend:
-  #   * src/zone.rs::the_three_rfc_bugs_this_fix_must_not_touch_are_still_ignored_with_their_reasons
+  # The commit that discharges the remaining one — S3 — must, in the same diff,
+  # amend:
+  #   * src/zone.rs::the_rfc_bug_this_step_must_not_touch_is_still_ignored_and_the_two_it_fixes_are_not
+  #     (renamed from the_three_rfc_bugs_... at S2, because a guard whose name
+  #     says "three are still ignored" while two are green is drift wearing a
+  #     passing test)
   #   * the comment block above those tests in src/zone.rs
   #   * this block
   # Editing that guard is legitimate ONLY in the commit that makes the

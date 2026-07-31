@@ -1565,7 +1565,7 @@ mod tests {
 
     /// Scenario: A wildcard does not answer a type it was not configured for,
     /// but the name still exists
-    /// features/wildcards.feature:106
+    /// features/wildcards.feature:132
     ///
     /// FLIPPED BY VEGA-083, and it was VEGA-010's enshrining test. It asserted
     /// `NxDomain`, which is what the code did, not what RFC 1034 §4.3.2 step
@@ -1986,15 +1986,47 @@ mod tests {
         assert_eq!(soa.serial, 99);
     }
 
+    /// Scenario: A wildcard's parent holds no record of its own
+    /// features/empty-non-terminals.feature:122
+    ///
+    /// REWRITTEN AT VEGA-032 S2, not deleted (ruling §13 AC-2.3). It asserted
+    /// `NxDomain` for `dev.example.com.`, which is the exact opposite of
+    /// `the_parent_of_a_wildcard_is_not_nxdomain` and of RFC 4592 §2.2.2 — the
+    /// wildcard is a node named `*.dev.example.com.`, so its parent exists for
+    /// the same reason any other ancestor does.
+    ///
+    /// It is rewritten rather than deleted because it is a MUTATION KILL: it
+    /// exists to catch `if is_wildcard` -> `if !is_wildcard` in `insert_spec`,
+    /// which files a wildcard's records at its parent name. That kill is kept by
+    /// asserting the two halves of the contract that are actually true — the
+    /// parent exists and holds NO records, and the wildcard still synthesises
+    /// below it. The inverted mutant answers `203.0.113.50` at the parent and
+    /// fails the first half; a mutant that drops wildcards entirely fails the
+    /// second.
     #[test]
     fn a_wildcard_never_creates_a_record_at_its_own_parent() {
         let _watchdog = watchdog();
-        // Kills `if is_wildcard` -> `if !is_wildcard` in insert_spec.
         let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
         assert_eq!(
             z.lookup(&lower("dev.example.com."), RecordType::A),
-            Answer::NxDomain,
-            "*.dev must not put a record at dev.example.com itself"
+            Answer::NoData,
+            "`dev.example.com.` exists as the parent of the wildcard node \
+             `*.dev.example.com.` (RFC 4592 §2.2.2), so it is NODATA — but it \
+             must hold no record of its own. Records here mean `*.dev` was \
+             filed under its parent name instead of at its own"
+        );
+        let Answer::Records(records) = z.lookup(&lower("x.dev.example.com."), RecordType::A) else {
+            panic!(
+                "the wildcard must still synthesise below its parent; a parent \
+                 that exists is not a parent that swallowed the wildcard"
+            );
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].data, a("203.0.113.50"));
+        assert_eq!(
+            records[0].name,
+            parse_name("x.dev.example.com.").unwrap(),
+            "a synthesised record is owned by the queried name (RFC 4592 §3.3.1)"
         );
     }
 
@@ -2258,7 +2290,7 @@ mod tests {
     }
 
     /// Scenario: A maximum-length query name of a type no wildcard holds is NODATA
-    /// features/wildcards.feature:402
+    /// features/wildcards.feature:428
     ///
     /// FLIPPED BY VEGA-083, and owned by VEGA-065. The type-mismatch path at
     /// maximum depth: the walk runs its full window, hits nothing, and must
@@ -2426,7 +2458,7 @@ mod tests {
     }
 
     /// Scenario: A root-origin zone with a wildcard terminates on a miss
-    /// features/wildcards.feature:458
+    /// features/wildcards.feature:484
     ///
     /// FLIPPED BY VEGA-083, and owned by VEGA-065. `origin = "."` is accepted by
     /// `parse_name`, and it drives the walk's floor to 0. The rejected patch's
@@ -3182,71 +3214,90 @@ mod tests {
     /// The text of this module, read at compile time.
     const THIS_MODULE: &str = include_str!("zone.rs");
 
-    /// Scenario: not a behaviour — AC-9 of the VEGA-083 ruling.
+    /// Scenario: A wildcard still applies below a name that exists — S2 does not
+    /// fix VEGA-009
+    /// features/empty-non-terminals.feature:327
     ///
-    /// Three `#[ignore]`d tests below pin RFC 4592 / RFC 2308 non-conformance
-    /// that VEGA-083 must **not** fix: empty non-terminals (VEGA-006), the
-    /// closest-encloser rule (VEGA-009), and the empty non-terminal a wildcard
-    /// implies at its own parent (VEGA-006 again). The ruling traces by hand
-    /// that all three stay red under the mandated diff — the third structurally,
-    /// because RFC 4592 §3.3.1 makes a wildcard's parent a proper ancestor of
-    /// the names it covers and the probe window is capped at the query's parent
-    /// depth, so a wildcard can never declare its own parent covered.
+    /// AMENDED AT VEGA-032 S2, in the commit that discharges two thirds of it —
+    /// which is the only commit in which editing it is legitimate (ruling §13,
+    /// the same rule VEGA-005 Amendment 3a set for the reload classification
+    /// table). It was AC-9 of the VEGA-083 ruling and it asserted that all
+    /// **three** `#[ignore]`d tests below stayed ignored with their reasons
+    /// pinned verbatim.
     ///
-    /// If one of them turns green, the change went outside its fence and the
-    /// change is wrong, not the test. The cheapest way to hide that is to edit
-    /// or drop an `ignore` reason while rewriting the tests around it, so the
-    /// reasons are pinned verbatim here. The expected text is spliced from
-    /// `concat!` fragments on purpose: a literal copy would match itself in
-    /// `THIS_MODULE` and the guard would pass against a deleted attribute.
+    /// S2 materialises every strict ancestor, so two of the three are now green
+    /// and un-`#[ignore]`d: `an_empty_non_terminal_is_nodata_not_nxdomain` and
+    /// `the_parent_of_a_wildcard_is_not_nxdomain`, both VEGA-006's. The third,
+    /// `a_wildcard_does_not_apply_below_a_name_that_exists`, is VEGA-009's and
+    /// belongs to **S3**: ancestor closure makes the closest-encloser fix
+    /// tempting to fold in here, and folding it in would leave S3 with nothing
+    /// to prove and no differential to prove it against.
+    ///
+    /// So the guard now checks **both directions**, and both are load-bearing:
+    ///
+    ///  * VEGA-009's test is still `#[ignore]`d with its reason spelled exactly
+    ///    as it is today — the fence S3 has to climb over;
+    ///  * VEGA-006's two are still here and are **not** `#[ignore]`d — because
+    ///    the cheapest way to make a regression disappear is to re-ignore the
+    ///    test that catches it, and a test that was un-ignored by a ruling must
+    ///    not be re-ignored by a bad afternoon.
+    ///
+    /// The expected text is spliced from `concat!` fragments on purpose: a
+    /// literal copy would match itself in `THIS_MODULE` and the guard would pass
+    /// against a deleted attribute.
     #[test]
-    fn the_three_rfc_bugs_this_fix_must_not_touch_are_still_ignored_with_their_reasons() {
-        let expected: [(&str, &str); 3] = [
-            (
-                "an_empty_non_terminal_is_nodata_not_nxdomain",
-                concat!(
-                    "BUG: empty non-terminals answer NXDOMAIN instead of NODATA ",
-                    "(RFC 2308 s2.2.1)"
-                ),
-            ),
-            (
-                "a_wildcard_does_not_apply_below_a_name_that_exists",
-                concat!(
-                    "BUG: a wildcard is applied below a name that exists ",
-                    "(RFC 4592 s3.3.1)"
-                ),
-            ),
-            (
-                "the_parent_of_a_wildcard_is_not_nxdomain",
-                concat!(
-                    "BUG: an empty non-terminal created by a wildcard is ",
-                    "NXDOMAIN too"
-                ),
-            ),
-        ];
-
+    fn the_rfc_bug_this_step_must_not_touch_is_still_ignored_and_the_two_it_fixes_are_not() {
         let lines: Vec<&str> = THIS_MODULE.lines().collect();
-        for (name, reason) in expected {
+        let find = |name: &str| -> usize {
             let needle = format!("fn {name}(");
-            let at = lines
+            lines
                 .iter()
                 .position(|line| line.contains(&needle))
                 .unwrap_or_else(|| {
                     panic!(
                         "{name} is gone from this module. It pins a known RFC \
-                         defect that VEGA-083 is fenced away from; deleting it \
-                         is how that fence stops being checked"
+                         defect, or the fix for one; deleting it is how the \
+                         fence stops being checked"
                     )
-                });
-            let attribute = format!("#[ignore = \"{reason}\"]");
-            assert!(
-                lines[at.saturating_sub(3)..at]
-                    .iter()
-                    .any(|line| line.trim() == attribute),
-                "{name} is no longer `{attribute}`. Either it turned green — in \
-                 which case the change went outside VEGA-083's fence and the \
-                 change is wrong — or its reason drifted, which is how the next \
-                 reader loses the RFC citation"
+                })
+        };
+        let ignored_near = |at: usize| -> Option<String> {
+            lines[at.saturating_sub(4)..at]
+                .iter()
+                .map(|l| l.trim())
+                .find(|l| l.starts_with("#[ignore"))
+                .map(str::to_owned)
+        };
+
+        // Still red, and S3's. VEGA-009.
+        let still_broken = "a_wildcard_does_not_apply_below_a_name_that_exists";
+        let reason = concat!(
+            "BUG: a wildcard is applied below a name that exists ",
+            "(RFC 4592 s3.3.1)"
+        );
+        let attribute = format!("#[ignore = \"{reason}\"]");
+        assert_eq!(
+            ignored_near(find(still_broken)).as_deref(),
+            Some(attribute.as_str()),
+            "{still_broken} is no longer `{attribute}`. Either it turned green — \
+             in which case S2 went outside its fence, took VEGA-009's work with \
+             it and left S3 unable to prove anything — or its reason drifted, \
+             which is how the next reader loses the RFC citation"
+        );
+
+        // Discharged at S2. VEGA-006. These must carry no `#[ignore]` at all.
+        for fixed in [
+            "an_empty_non_terminal_is_nodata_not_nxdomain",
+            "the_parent_of_a_wildcard_is_not_nxdomain",
+        ] {
+            assert_eq!(
+                ignored_near(find(fixed)),
+                None,
+                "{fixed} is `#[ignore]`d again. It pins VEGA-006, a blocker \
+                 closed by ancestor materialisation, and it was un-ignored by a \
+                 ruling. Re-ignoring a test is not a way to fix the code it \
+                 catches; if it is failing, the zone stopped materialising \
+                 empty non-terminals and RFC 8020 §2 is denying live records"
             );
         }
     }
@@ -3284,32 +3335,54 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Known bugs, written against the RFC. These fail today and are ignored so
-    // the suite stays green until the behaviour is fixed.
+    // Known bugs, written against the RFC. One of these still fails today and is
+    // ignored so the suite stays green until the behaviour is fixed. The other
+    // two were this list's oldest residents and are **discharged at VEGA-032
+    // S2** — they are un-`#[ignore]`d in the commit that materialises every
+    // strict ancestor, which is the only commit allowed to touch them.
     //
-    // VEGA-065 NOTE — DO NOT UN-IGNORE THESE. They pin RFC 4592 / RFC 2308
-    // non-conformance owned by VEGA-006 and VEGA-009 and fixed by VEGA-032 (the
-    // zone data model rewrite), not by bounding the wildcard walk. VEGA-065 is
-    // strictly behaviour-preserving, so if one of them turns green the walk
-    // changed behaviour and the change is wrong. Fix the walk, not the test.
+    // WHAT IS LEFT, AND WHOSE IT IS. `a_wildcard_does_not_apply_below_a_name_
+    // that_exists` pins RFC 4592 §3.3.1: the source of synthesis is `*` under
+    // the CLOSEST ENCLOSER, and Vega instead walks up to the first wildcard it
+    // can find. That is VEGA-009 and it is **S3's**, not S2's. Ancestor closure
+    // makes fixing it look like a two-line change from here; doing it here would
+    // leave S3 with nothing to prove and would retire VEGA-065's differential
+    // oracle in a commit that has no ruling to retire it. If it turns green at
+    // S2, S2 is wrong, not the test.
     //
-    // VEGA-083 NOTE — these stay red under it too, and it is NOT
-    // behaviour-preserving: it turns NXDOMAIN into NODATA for names a wildcard
-    // covers. The empty-non-terminal zone holds no wildcards, so it makes zero
-    // probes; the wildcard-below-an-existing-name case is answered from the
-    // `Found` path, which VEGA-083 does not touch; and a wildcard can never
-    // declare its own parent covered, because RFC 4592 §3.3.1 makes that parent
-    // a proper ancestor of the names it covers and `wildcard_window` caps the
-    // walk at the query's parent depth. That third one is structural, not luck.
-    // The `ignore` reasons are pinned by
-    // `the_three_rfc_bugs_this_fix_must_not_touch_are_still_ignored_with_their_reasons`.
+    // VEGA-065 NOTE, kept for the history it records — that issue was strictly
+    // behaviour-preserving and all three stayed red under it.
+    //
+    // VEGA-083 NOTE, likewise: it is NOT behaviour-preserving (it turns NXDOMAIN
+    // into NODATA for names a wildcard covers) and all three still stayed red,
+    // structurally rather than by luck — a wildcard cannot declare its own
+    // parent covered, because RFC 4592 §3.3.1 makes that parent a proper
+    // ancestor of the names it covers and `wildcard_window` caps the walk at the
+    // query's parent depth.
+    //
+    // VEGA-032 S2 NOTE — what changed, and why it is only these two. Every
+    // strict ancestor of every owner is now a node with an empty RRset range, so
+    // a name that exists only as an ancestor is NODATA (RFC 4592 §2.2.2, RFC
+    // 2308 §2.2) and RFC 8020 §2 can no longer be used to deny the subtree
+    // beneath it. A wildcard is a node named `*.x`, so `x` is its parent and
+    // exists for exactly the same reason — which is the second test. Neither
+    // touches which wildcard answers a covered name, which is why the third
+    // stays red.
+    //
+    // Both directions are pinned by
+    // `the_rfc_bug_this_step_must_not_touch_is_still_ignored_and_the_two_it_fixes_are_not`:
+    // the remaining `ignore` reason verbatim, and the absence of an `ignore` on
+    // the two that are now green.
     //
     // (VEGA-010 used to be on this list. It was the same defect as VEGA-083 seen
     // through another QTYPE, and closed with it.)
     // -----------------------------------------------------------------------
 
+    /// Scenario: A name that exists only as an ancestor is NODATA, not NXDOMAIN
+    /// features/empty-non-terminals.feature:73
+    ///
+    /// VEGA-006's headline, un-`#[ignore]`d at VEGA-032 S2.
     #[test]
-    #[ignore = "BUG: empty non-terminals answer NXDOMAIN instead of NODATA (RFC 2308 s2.2.1)"]
     fn an_empty_non_terminal_is_nodata_not_nxdomain() {
         let _watchdog = watchdog();
         // `a.b.ent.example.com` exists, so `ent.example.com` and
@@ -3317,8 +3390,6 @@ mod tests {
         // NXDOMAIN for them is not cosmetic: under RFC 8020 a resolver that
         // caches NXDOMAIN for `ent.example.com` may synthesise NXDOMAIN for
         // everything beneath it, taking the real record out of service.
-        // `Zone::names` only ever records explicit owner names, never the
-        // ancestors those names imply.
         let z = zone(vec![spec("a.b.ent", "A", &["203.0.113.41"])]);
         assert_eq!(
             z.lookup(&lower("b.ent.example.com."), RecordType::A),
@@ -3350,8 +3421,11 @@ mod tests {
         );
     }
 
+    /// Scenario: The parent of a wildcard exists
+    /// features/empty-non-terminals.feature:112
+    ///
+    /// VEGA-006 through the wildcard shape, un-`#[ignore]`d at VEGA-032 S2.
     #[test]
-    #[ignore = "BUG: an empty non-terminal created by a wildcard is NXDOMAIN too"]
     fn the_parent_of_a_wildcard_is_not_nxdomain() {
         let _watchdog = watchdog();
         // `*.apps.example.com` implies `apps.example.com` exists. Answering
@@ -3362,5 +3436,578 @@ mod tests {
             z.lookup(&lower("apps.example.com."), RecordType::A),
             Answer::NoData
         );
+    }
+
+    // =======================================================================
+    // VEGA-032 S2 — EMPTY NON-TERMINALS (closes VEGA-006)
+    //
+    // Spec: features/empty-non-terminals.feature
+    // Ruling: .claude/backlog/decisions/VEGA-032-zone-data-model.md §3.1, §4.3,
+    //         §6.1 I-3, §10.2 (S2), §13 AC-2.1 … AC-2.6
+    //
+    // Every strict ancestor of every owner name, up to the origin, is a node
+    // with an empty RRset range. An empty non-terminal is not a variant in the
+    // model — it is "a node with no RRsets", which is what RFC 4592 §2.2.2 says
+    // it is and what RFC 4035 §2.3 will need to emit an NSEC carrying only the
+    // NSEC and RRSIG bits.
+    //
+    // Two of these are about answers and one is about structure. The structural
+    // one (`every_node_has_its_parent_in_the_arena`) is the most valuable test
+    // in this group even though it asserts no answer at all: S3's
+    // closest-encloser BINARY SEARCH needs "a node exists at this depth" to be
+    // monotone, and it is monotone only under ancestor closure. A hole in the
+    // chain returns a shallower encloser than the truth, synthesises a wildcard
+    // into a subtree an operator carved out, and reopens VEGA-009 with answers
+    // that look correct.
+    // =======================================================================
+
+    /// Every owner name a zone holds a node for, as the arena holds them.
+    ///
+    /// Reaches into the arena rather than going through [`Zone::exists`],
+    /// because `exists` deliberately answers "would this name be a name error"
+    /// — it is true for wildcard-covered names that are not nodes and false for
+    /// wildcard nodes themselves (RFC 4592 §2.2). Ancestor closure is a claim
+    /// about the NODE SET, so it has to be read off the node set.
+    fn node_names(z: &Zone) -> std::collections::HashSet<LowerName> {
+        z.nodes
+            .iter()
+            .map(|n| LowerName::from(n.name.clone()))
+            .collect()
+    }
+
+    /// Scenario: Every strict ancestor of an owner exists, not just the
+    /// immediate parent
+    /// features/empty-non-terminals.feature:82
+    ///
+    /// A materialisation loop that stops after one level passes
+    /// `an_empty_non_terminal_is_nodata_not_nxdomain` and leaves every
+    /// grandparent NXDOMAIN — the same RFC 8020 §2 denial, one label higher.
+    /// The ruling names "ancestor materialisation loop stopping one level short"
+    /// as a mutant that must be killed; this is what kills it.
+    #[test]
+    fn every_strict_ancestor_of_an_owner_exists_up_to_the_apex() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("a.b.c.d", "A", &["203.0.113.41"])]);
+        for ancestor in [
+            "b.c.d.example.com.",
+            "c.d.example.com.",
+            "d.example.com.",
+            "example.com.",
+        ] {
+            assert_eq!(
+                z.lookup(&lower(ancestor), RecordType::A),
+                Answer::NoData,
+                "{ancestor} exists because a.b.c.d.example.com. does \
+                 (RFC 4592 §2.2.2); NXDOMAIN here lets an RFC 8020 §2 resolver \
+                 deny everything below it, including the configured record"
+            );
+        }
+    }
+
+    /// Scenario: The record beneath an empty non-terminal still answers
+    /// features/empty-non-terminals.feature:91
+    ///
+    /// The half that makes the fix worth having, and the anti-vacuity control
+    /// for every negative assertion in this group: a build that materialised
+    /// ancestors but shadowed or dropped the leaf would satisfy all of them.
+    #[test]
+    fn the_record_beneath_an_empty_non_terminal_still_answers() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("a.b.ent", "A", &["203.0.113.41"])]);
+        let Answer::Records(records) = z.lookup(&lower("a.b.ent.example.com."), RecordType::A)
+        else {
+            panic!("the configured record must still answer at its own name");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].data, a("203.0.113.41"));
+        assert_eq!(records[0].name, parse_name("a.b.ent.example.com.").unwrap());
+        assert_eq!(records[0].ttl, 300);
+    }
+
+    /// Scenario: The service-record shapes that created this bug are all NODATA
+    /// features/empty-non-terminals.feature:100
+    ///
+    /// VEGA-006's own evidence. SRV, TLSA and DKIM each put a record two or
+    /// three labels below a name nobody writes, so every zone that uses them
+    /// holds empty non-terminals; the issue's acceptance criterion names these
+    /// three shapes specifically.
+    #[test]
+    fn the_service_record_shapes_that_created_this_bug_are_all_nodata() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("_sip._tcp", "SRV", &["10 10 5060 sip.example.com."]),
+            spec(
+                "_443._tcp.www",
+                "TLSA",
+                &["3 1 1 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"],
+            ),
+            spec("sel._domainkey", "TXT", &["v=DKIM1; k=rsa; p=MIIB"]),
+        ]);
+
+        for ent in [
+            "_tcp.example.com.",
+            "_tcp.www.example.com.",
+            "www.example.com.",
+            "_domainkey.example.com.",
+        ] {
+            assert_eq!(
+                z.lookup(&lower(ent), RecordType::A),
+                Answer::NoData,
+                "{ent} is an empty non-terminal of a service record set"
+            );
+        }
+
+        // Anti-vacuity: each configured record still answers at its own name, or
+        // the NODATA answers above are a zone that lost its records.
+        for (name, rtype) in [
+            ("_sip._tcp.example.com.", RecordType::SRV),
+            ("_443._tcp.www.example.com.", RecordType::TLSA),
+            ("sel._domainkey.example.com.", RecordType::TXT),
+        ] {
+            let Answer::Records(records) = z.lookup(&lower(name), rtype) else {
+                panic!("{name} {rtype} must still answer");
+            };
+            assert_eq!(records.len(), 1, "{name} {rtype}");
+        }
+    }
+
+    /// Scenario: An owner one label below the apex creates no empty
+    /// non-terminal
+    /// features/empty-non-terminals.feature:163
+    ///
+    /// The discriminating negative for the whole feature. Without it, "answer
+    /// NODATA for every name in the zone" passes every positive scenario here
+    /// and makes the server authoritatively deny nothing — which is the failure
+    /// mode VEGA-083 spent an issue bounding.
+    #[test]
+    fn an_owner_one_label_below_the_apex_creates_no_empty_non_terminal() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("www", "A", &["203.0.113.10"])]);
+        assert_eq!(
+            z.lookup(&lower("nope.example.com."), RecordType::A),
+            Answer::NxDomain,
+            "nothing exists at or below nope.example.com., so it is a real name \
+             error (RFC 1034 §4.3.2 step 3(c))"
+        );
+        assert_eq!(
+            z.lookup(&lower("x.www.example.com."), RecordType::A),
+            Answer::NxDomain,
+            "an owner name is not made into a wildcard by having descendants \
+             materialised above it"
+        );
+    }
+
+    /// Scenario: The ancestor walk stops at the origin and never materialises a
+    /// name above it
+    /// features/empty-non-terminals.feature:174
+    ///
+    /// The off-by-one in the other direction. A walk that runs past the origin
+    /// puts `com.` and the root in the node set; a server that holds a node for
+    /// `com.` is one dispatch change away from answering for it. Out-of-zone
+    /// names are refused before the zone is consulted, so the claim is asserted
+    /// against the node set itself, where it is observable.
+    #[test]
+    fn the_ancestor_walk_stops_at_the_origin() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("a.b", "A", &["203.0.113.41"])]);
+        let names = node_names(&z);
+        for above in ["com.", "."] {
+            assert!(
+                !names.contains(&lower(above)),
+                "{above} is above the origin and must never be a node: \
+                 materialising it makes the zone claim a name it is not \
+                 authoritative for. Nodes: {names:?}"
+            );
+        }
+        assert!(
+            names.contains(&lower("b.example.com.")),
+            "the walk must reach the ancestor it exists for"
+        );
+        assert!(names.contains(&lower("example.com.")), "the apex is a node");
+    }
+
+    /// Scenario: An empty non-terminal is NODATA for every type, including ANY
+    /// features/empty-non-terminals.feature:185
+    ///
+    /// Existence is a property of the NAME and never of the QTYPE (RFC 1034
+    /// §4.3.2 step 3(c)). A fix that materialised ancestors per type — the
+    /// obvious shape if the ancestor loop is written inside `insert_spec`'s
+    /// RRset handling — would answer NXDOMAIN for AAAA at a name that exists,
+    /// which is the same RFC 8020 §2 denial arriving through a dual-stack
+    /// client rather than through an attacker.
+    #[test]
+    fn an_empty_non_terminal_is_nodata_for_every_type_including_any() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("a.b.ent", "A", &["203.0.113.41"])]);
+        for rtype in [
+            RecordType::A,
+            RecordType::AAAA,
+            RecordType::TXT,
+            RecordType::MX,
+            RecordType::SRV,
+            RecordType::CNAME,
+            RecordType::SOA,
+            RecordType::NS,
+            RecordType::ANY,
+        ] {
+            assert_eq!(
+                z.lookup(&lower("b.ent.example.com."), rtype),
+                Answer::NoData,
+                "b.ent.example.com. exists, so {rtype} there is NODATA and never \
+                 a name error"
+            );
+        }
+        assert!(
+            z.exists(&lower("b.ent.example.com.")),
+            "Zone::exists is the RFC 1034 §4.3.2 step 3(c) name-error \
+             determination and an empty non-terminal is not a name error"
+        );
+    }
+
+    /// Scenario: An empty non-terminal is not counted as a record
+    /// features/empty-non-terminals.feature:195
+    ///
+    /// AC-2.4. `record_count` is the `dns_zone_records` gauge and an operator's
+    /// only view of whether a reload truncated the zone. Empty non-terminals are
+    /// nodes, not records; counting them moves the gauge on upgrade with no
+    /// config change and makes any alert on it worthless.
+    #[test]
+    fn an_empty_non_terminal_is_not_counted_as_a_record() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("a.b.c.d", "A", &["203.0.113.41"])]);
+        assert_eq!(
+            z.record_count(),
+            1,
+            "one configured value is one record, however many nodes it implies"
+        );
+        assert_eq!(
+            z.nodes.len(),
+            5,
+            "a.b.c.d + three empty non-terminals + the apex; if this is 1 the \
+             ancestors were never materialised and if it is more they were \
+             materialised twice"
+        );
+    }
+
+    /// Scenario: Every node in the arena has its parent in the arena
+    /// features/empty-non-terminals.feature:205
+    ///
+    /// Invariant I-3, asserted structurally rather than through an answer.
+    /// **This is the load-bearing test of S2 and the reason S3 can be a binary
+    /// search at all**: the predicate "a node exists at this depth" is monotone
+    /// only because the node set is closed under ancestry. A hole in the chain
+    /// makes S3's search return a shallower closest encloser than the truth, so
+    /// a wildcard synthesises into a subtree an operator carved out — VEGA-009
+    /// reopened, silently, with correct-looking answers.
+    ///
+    /// Asserted in a release build too, not only behind `debug_assert`, because
+    /// a release build is where it will run.
+    #[test]
+    fn every_node_has_its_parent_in_the_arena() {
+        let _watchdog = watchdog();
+        for z in [
+            zone(vec![
+                spec("a.b.c.deep", "A", &["203.0.113.1"]),
+                spec("*.dev", "A", &["203.0.113.2"]),
+                spec("*.*.dev", "A", &["203.0.113.3"]),
+                spec("x.*.dev", "A", &["203.0.113.5"]),
+                spec("dev", "A", &["203.0.113.4"]),
+                spec("_sip._tcp", "SRV", &["10 10 5060 sip.example.com."]),
+            ]),
+            zone(Vec::new()),
+            zone_with_origin(".", vec![spec("a.b.c.", "A", &["203.0.113.1"])]),
+        ] {
+            let names = node_names(&z);
+            let apex = z.lower_origin.clone();
+            for name in &names {
+                if *name == apex {
+                    continue;
+                }
+                let parent = LowerName::from(Name::from(name.clone()).base_name());
+                assert!(
+                    names.contains(&parent),
+                    "{name} is a node but its parent {parent} is not. The node \
+                     set must be closed under ancestry (RFC 4592 §2.2.2, ruling \
+                     I-3): S3's closest-encloser binary search reads \"a node \
+                     exists at this depth\" as a monotone predicate, and a hole \
+                     here makes it return a shallower encloser than the truth"
+                );
+            }
+
+            // The order half: canonical order is what makes the forward pass
+            // that computes `cut` (S4) correct, and ancestor closure is what
+            // makes "the parent" a node to find in the first place.
+            for (i, node) in z.nodes.iter().enumerate() {
+                let name = LowerName::from(node.name.clone());
+                for (j, other) in z.nodes.iter().enumerate() {
+                    let ancestor = LowerName::from(other.name.clone());
+                    if i == j || !ancestor.zone_of(&name) {
+                        continue;
+                    }
+                    assert!(
+                        j < i,
+                        "{ancestor} is an ancestor of {name} but sits after it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Scenario: An ancestor that is also a declared owner keeps its records
+    /// features/empty-non-terminals.feature:218
+    ///
+    /// The collision case. `b.example.com.` is both a configured owner and the
+    /// strict ancestor of `a.b.example.com.`, and ancestor materialisation is a
+    /// second write site for a node the config already wrote. An insertion that
+    /// overwrites rather than merges deletes a configured record in the build,
+    /// where nothing else in this tree would notice.
+    #[test]
+    fn an_ancestor_that_is_also_a_declared_owner_keeps_its_records() {
+        let _watchdog = watchdog();
+        // Both orders, because whichever of the two write sites runs first must
+        // not win: a scratch map that is populated by config order alone would
+        // pass one of these and fail the other.
+        for records in [
+            vec![
+                spec("b", "A", &["203.0.113.20"]),
+                spec("a.b", "A", &["203.0.113.41"]),
+            ],
+            vec![
+                spec("a.b", "A", &["203.0.113.41"]),
+                spec("b", "A", &["203.0.113.20"]),
+            ],
+        ] {
+            let z = zone(records);
+            let Answer::Records(records) = z.lookup(&lower("b.example.com."), RecordType::A) else {
+                panic!("the declared record at b.example.com. must survive being an ancestor");
+            };
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].data, a("203.0.113.20"));
+            assert_eq!(z.record_count(), 2);
+        }
+    }
+
+    /// Scenario: An ancestor that is also a declared wildcard keeps its records
+    /// and stays a wildcard
+    /// features/empty-non-terminals.feature:229
+    ///
+    /// The same collision one step nastier: `*.dev.example.com.` is a declared
+    /// wildcard **and** the strict ancestor of `x.*.dev.example.com.`, which RFC
+    /// 4592 §2.1.3 explicitly permits ("a wildcard domain name can have
+    /// subdomains"). The build already carries a `debug_assert` that one name
+    /// never arrives as both a wildcard and an ordinary node; ancestor
+    /// materialisation is a second write site for exactly that field, so it must
+    /// derive the flag from the NAME rather than from which loop inserted it.
+    #[test]
+    fn an_ancestor_that_is_also_a_declared_wildcard_keeps_its_records_and_stays_a_wildcard() {
+        let _watchdog = watchdog();
+        for records in [
+            vec![
+                spec("*.dev", "A", &["203.0.113.50"]),
+                spec("x.*.dev", "A", &["203.0.113.60"]),
+            ],
+            vec![
+                spec("x.*.dev", "A", &["203.0.113.60"]),
+                spec("*.dev", "A", &["203.0.113.50"]),
+            ],
+        ] {
+            let z = zone(records);
+
+            let Answer::Records(synthesised) =
+                z.lookup(&lower("y.dev.example.com."), RecordType::A)
+            else {
+                panic!("the declared wildcard must still synthesise below its parent");
+            };
+            assert_eq!(synthesised[0].data, a("203.0.113.50"));
+
+            let Answer::Records(literal) = z.lookup(&lower("x.*.dev.example.com."), RecordType::A)
+            else {
+                panic!("the literal name below the wildcard must answer its own record");
+            };
+            assert_eq!(literal[0].data, a("203.0.113.60"));
+            assert_eq!(z.record_count(), 2);
+        }
+    }
+
+    /// Scenario: A zone holding no records materialises no empty non-terminals
+    /// features/empty-non-terminals.feature:248
+    ///
+    /// The empty case for the new loop: it runs over an empty owner set and must
+    /// produce an empty result rather than the root, the origin twice, or an
+    /// empty name.
+    #[test]
+    fn a_zone_holding_no_records_materialises_no_empty_non_terminals() {
+        let _watchdog = watchdog();
+        let z = zone(Vec::new());
+        assert_eq!(z.nodes.len(), 1, "the apex, and nothing else");
+        assert_eq!(
+            z.lookup(&lower("x.example.com."), RecordType::A),
+            Answer::NxDomain
+        );
+        assert_eq!(
+            z.lookup(&lower("example.com."), RecordType::A),
+            Answer::NoData,
+            "the apex exists on its own account even with no records"
+        );
+    }
+
+    /// Scenario: An apex-only owner adds nothing to the node set
+    /// features/empty-non-terminals.feature:258
+    ///
+    /// `@` qualifies to the origin, whose only strict ancestors are outside the
+    /// zone. The walk must yield nothing here rather than one entry for the
+    /// origin itself, which would be the apex inserted twice.
+    #[test]
+    fn an_apex_only_owner_adds_nothing_to_the_node_set() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("@", "A", &["203.0.113.10"])]);
+        assert_eq!(z.nodes.len(), 1);
+        let Answer::Records(records) = z.lookup(&lower("example.com."), RecordType::A) else {
+            panic!("the apex record must answer");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].data, a("203.0.113.10"));
+    }
+
+    /// Scenario: A wildcard whose own owner name exceeds 255 octets
+    /// materialises no ancestors
+    /// features/empty-non-terminals.feature:281
+    ///
+    /// RFC 1035 §2.3.4 caps a name at 255 octets, so a wildcard whose parent
+    /// sits within two octets of the ceiling has no representable owner name and
+    /// no node — S1 warns and serves the zone unchanged, because such a wildcard
+    /// covers no representable name either.
+    ///
+    /// It follows that its parent is **not** an empty non-terminal: ancestor
+    /// closure is closure over the NODE set, and no node exists here to imply
+    /// one. Pinned because "materialise every strict ancestor of every owner" is
+    /// also a defensible reading of the ruling, and under it a name would exist
+    /// because of a record the zone refused to hold.
+    #[test]
+    fn a_wildcard_whose_owner_name_exceeds_the_octet_limit_materialises_no_ancestors() {
+        let _watchdog = watchdog();
+        // 121 single-octet labels + `example.com.` is 255 octets exactly, so
+        // prepending `*.` is 257 and the wildcard has no owner name.
+        let parent: String = std::iter::repeat_n("a", 121).collect::<Vec<_>>().join(".");
+        let z = zone(vec![spec(&format!("*.{parent}"), "A", &["203.0.113.70"])]);
+
+        let parent_name = lower(&format!("{parent}.example.com."));
+        // The condition under test, asserted rather than assumed: the parent is
+        // a name hickory will build and `*.<parent>` is not.
+        assert!(
+            Name::from(parent_name.clone()).prepend_label("*").is_err(),
+            "the fixture must sit close enough to RFC 1035 §2.3.4's 255 octets \
+             that the wildcard has no owner name, or it tests nothing"
+        );
+        assert_eq!(
+            z.lookup(&parent_name, RecordType::A),
+            Answer::NxDomain,
+            "no node exists for the wildcard, so nothing implies its parent \
+             exists; a name that exists because of a record the zone refused to \
+             hold is worse than the NXDOMAIN"
+        );
+        assert_eq!(
+            z.record_count(),
+            1,
+            "the record is still counted — that is S1's behaviour and S2 changes \
+             answers, not the gauge"
+        );
+        assert_eq!(z.nodes.len(), 1, "the apex, and nothing else");
+    }
+
+    /// Scenario: A wildcard that is itself an empty non-terminal covers its
+    /// names with NODATA
+    /// features/empty-non-terminals.feature:311
+    ///
+    /// The subtlest behaviour S2 introduces, written down rather than
+    /// discovered. `x.*.dev` makes `*.dev.example.com.` exist as an empty
+    /// non-terminal — a node whose leftmost label is an asterisk. RFC 4592
+    /// §2.1.1 says that **is** a wildcard, so it becomes a source of synthesis
+    /// carrying no RRset, and RFC 1034 §4.3.2 step 3(c) then forbids the name
+    /// error for the names it covers: `y.dev.example.com.` is NODATA where today
+    /// it is NXDOMAIN.
+    ///
+    /// The flag is a property of the NAME, not of which loop created the node.
+    /// Deriving it from the config instead leaves a node that the exact-name
+    /// probe matches and the wildcard probe does not — a wildcard nobody can
+    /// reach, and a literal query for `*.dev.example.com.` answered from a
+    /// branch the pre-S1 model never used.
+    #[test]
+    fn a_wildcard_that_is_an_empty_non_terminal_covers_its_names_with_nodata() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("x.*.dev", "A", &["203.0.113.60"])]);
+
+        assert_eq!(
+            z.lookup(&lower("y.dev.example.com."), RecordType::A),
+            Answer::NoData,
+            "`*.dev.example.com.` exists as an empty non-terminal, so it is a \
+             source of synthesis that carries no RRset: RFC 1034 §4.3.2 step \
+             3(c) forbids the name error"
+        );
+        assert!(
+            z.exists(&lower("y.dev.example.com.")),
+            "coverage and existence are one determination (VEGA-083)"
+        );
+
+        let Answer::Records(records) = z.lookup(&lower("x.*.dev.example.com."), RecordType::A)
+        else {
+            panic!("the configured record must still answer at its own literal name");
+        };
+        assert_eq!(records[0].data, a("203.0.113.60"));
+
+        // And the empty non-terminal itself, queried literally: it exists, so it
+        // is NODATA rather than a name error (RFC 4592 §2.3 — an asterisk in a
+        // QNAME gets no special processing).
+        assert_eq!(
+            z.lookup(&lower("*.dev.example.com."), RecordType::A),
+            Answer::NoData
+        );
+    }
+
+    /// Scenario: An empty non-terminal chain at the protocol's label ceiling is
+    /// answered
+    /// features/empty-non-terminals.feature:341
+    ///
+    /// 127 labels is the deepest name the wire can carry — RFC 1035 §3.1 encodes
+    /// a single-octet label in two octets and terminates with one, so
+    /// `127 * 2 + 1 = 255` — and it is reachable only under `origin = "."`. One
+    /// owner at that depth materialises 126 ancestors, which drives every
+    /// label-indexed structure in the model to its largest reachable value: bit
+    /// 127 of the `u128` depth bitmap and entry 127 of the `[u64; 128]` suffix
+    /// hash. With `panic = "abort"` one index past the end is a full outage from
+    /// one packet, so the whole chain is swept, under the process watchdog.
+    #[test]
+    fn an_empty_non_terminal_chain_at_the_label_ceiling_is_answered() {
+        const CEILING: usize = 127;
+
+        let _watchdog = watchdog();
+
+        let owner: String = std::iter::repeat_n("a", CEILING)
+            .collect::<Vec<_>>()
+            .join(".");
+        let z = zone_with_origin(".", vec![spec(&format!("{owner}."), "A", &["203.0.113.1"])]);
+        let full = Name::from(lower(&format!("{owner}.")));
+        assert_eq!(
+            full.iter().len(),
+            CEILING,
+            "the fixture must sit exactly at the decoder's ceiling"
+        );
+
+        let Answer::Records(records) = z.lookup(&LowerName::from(full.clone()), RecordType::A)
+        else {
+            panic!("the owner at the ceiling must answer");
+        };
+        assert_eq!(records.len(), 1);
+
+        for depth in 0..CEILING {
+            let ancestor = LowerName::from(full.trim_to(depth));
+            assert_eq!(
+                z.lookup(&ancestor, RecordType::A),
+                Answer::NoData,
+                "the ancestor at depth {depth} of a 127-label owner exists \
+                 (RFC 4592 §2.2.2) and must be answered rather than indexed out \
+                 of bounds"
+            );
+        }
     }
 }
