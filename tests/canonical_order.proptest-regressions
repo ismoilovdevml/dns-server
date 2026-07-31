@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a55c83c16b742aaf4cfefd57849f53e1925343cf98c4ced52f56d5f44bd99b49 # shrinks to left = LowerName(Name("a.a.")), right = LowerName(Name("a\000."))

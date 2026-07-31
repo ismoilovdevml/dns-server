@@ -35,6 +35,16 @@ use std::cmp::Ordering;
 use hickory_proto::rr::{LowerName, Name};
 use proptest::prelude::*;
 
+/// The real key, pulled in by path rather than through a `pub` export.
+///
+/// `canonical_sort_key` is `pub(crate)` by the ruling's §10.1 — a `pub` API with
+/// no caller outside the crate is the thing §12 fences off — so this test
+/// compiles the module's own source, exactly as every test in this tree already
+/// does with `src/testutil.rs`. Compiling the source is strictly stronger than
+/// calling an export: there is no second copy to drift.
+#[path = "../src/canonical.rs"]
+mod canonical;
+
 /// Highest label count any DNS name can carry.
 ///
 /// RFC 1035 §2.3.4 caps a name at 255 octets and §3.1 spends a length octet
@@ -61,7 +71,20 @@ const MAX_LABELS: usize = 127;
 ///
 /// # S0 replaces this body with a call to the real key. Nothing else.
 fn key_under_test(name: &LowerName) -> Vec<u8> {
-    escaped_key(name)
+    let key = canonical::canonical_sort_key(name);
+    // The transcription below is the ruling's §7.2 encoding, written down before
+    // any code existed. Diffing the real key against it here — octet for octet,
+    // not merely "sorts the same way" — is the use the transcription was kept
+    // for, and it makes every assertion in this file a check on the encoding as
+    // well as on the order.
+    assert_eq!(
+        key,
+        escaped_key(name),
+        "the real canonical key does not encode {name} the way VEGA-032 §7.2 \
+         mandates. Two encodings can agree on every order this file happens to \
+         check and still differ on one nobody generated"
+    );
+    key
 }
 
 /// The mandated key, kept separately from [`key_under_test`] so that after S0

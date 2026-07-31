@@ -29,6 +29,16 @@
 //! * [`ui`] — colour, tables and formatting for terminal output.
 
 pub mod admin;
+/// The RFC 4034 §6.1 canonical name order, as a `memcmp`-able byte key.
+///
+/// Private: the ruling's §10.1 keeps the zone model's primitives `pub(crate)`,
+/// because a `pub` API with no caller outside this crate is the thing its §12
+/// fences off. `tests/canonical_order.rs` compiles the file by `#[path]`.
+// S0 lands this ahead of its caller: the arena that sorts by it is S1, and one
+// three-thousand-line diff is its own failure mode (§10.2). `dead_code` is
+// therefore right today and wrong from S1, when this allow comes off.
+#[allow(dead_code)]
+mod canonical;
 pub mod cli;
 pub mod commands;
 pub mod config;

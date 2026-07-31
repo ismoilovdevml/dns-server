@@ -54,6 +54,161 @@ fn label_count(name: &LowerName) -> usize {
     name.iter().len()
 }
 
+// ---------------------------------------------------------------------------
+// VEGA-032 S0 — the primitives the node arena is built and probed with.
+//
+// Landed ahead of their caller, per the ruling's §10.2 sequencing: the arena
+// that consumes them is S1. Nothing in `Zone` reads them yet, which is what the
+// `#[allow(dead_code)]` below records and what S1 removes.
+// ---------------------------------------------------------------------------
+
+/// Index into the node arena.
+///
+/// A `u32` caps a zone at `u32::MAX - 1` nodes; the build fails with a named
+/// error rather than wrapping, because a wrapped index answers the wrong
+/// records and says nothing about it.
+#[allow(dead_code)] // Wired into `Node` at S1.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct NodeIdx(u32);
+
+#[allow(dead_code)] // Wired into `Node` at S1.
+impl NodeIdx {
+    /// The apex is always node 0: canonical order puts the shortest name in the
+    /// zone first, and every other node in a zone is a descendant of the apex.
+    pub(crate) const APEX: Self = Self(0);
+
+    /// "No delegation at or above this node". A sentinel rather than an
+    /// `Option<NodeIdx>` so the field stays four bytes instead of eight.
+    pub(crate) const NONE: Self = Self(u32::MAX);
+
+    /// The arena position, for slice access. Never `[]`: a range built at build
+    /// time "must" be valid is exactly the assumption the next refactor
+    /// falsifies, and with `panic = "abort"` one bad index is a full outage.
+    pub(crate) fn get(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Multiplier of the per-octet fold. FNV-1a's 64-bit prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Multiplier of the per-*label* finalisation. The golden-ratio constant, whose
+/// high bits depend on every input bit, which is what turns the running fold
+/// into a usable hash at each label boundary.
+const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Fold one label into a running suffix hash.
+///
+/// The per-octet step is FNV-1a; the per-label step is a multiply and an
+/// xor-shift. The finalisation is what marks the **boundary** between labels:
+/// without it `ab.c` and `a.bc` present the same octets in the same order to
+/// the fold and collide by construction, and it is also what makes every
+/// intermediate state a finished hash in its own right — which is the whole
+/// trick that lets one reverse pass produce a hash for every suffix instead of
+/// 127 separate finalisations.
+///
+/// `SipHash` is rejected here for that reason alone: 127 `finish()` calls is
+/// microseconds, and the whole deep-name budget is 9.1 µs.
+///
+/// Case is not folded. Both sides of every comparison are `LowerName`, which
+/// hickory documents as "guaranteed to be in lower case form" and constructs
+/// through `Name::to_lowercase`; the name arithmetic that survives a mixed-case
+/// input is the label comparison, not the hash.
+#[inline]
+fn mix_label(state: u64, label: &[u8]) -> u64 {
+    let mut hash = state;
+    for &octet in label {
+        hash = (hash ^ u64::from(octet)).wrapping_mul(FNV_PRIME);
+    }
+    let hash = hash.wrapping_mul(GOLDEN);
+    hash ^ (hash >> 31)
+}
+
+/// Hash of a whole name under `seed`, folded right to left.
+///
+/// The root hashes to the seed itself, which is what makes
+/// [`SuffixHashes::at(0)`](SuffixHashes::at) meaningful and what lets a
+/// root-origin zone use the same arithmetic as every other.
+#[allow(dead_code)] // The index that keys on it is S1's.
+fn name_hash(seed: u64, name: &LowerName) -> u64 {
+    let mut hash = seed;
+    for label in name.iter().rev() {
+        hash = mix_label(hash, label);
+    }
+    hash
+}
+
+/// The hash of **every suffix** of one query name, indexed by label count.
+///
+/// `h[d]` is the hash of the `d` rightmost labels, so `h[0]` is the root and
+/// `h[label_count]` is the name itself. One reverse pass over the name fills
+/// all of them, because [`mix_label`] finalises at every label boundary.
+///
+/// This is what removes the last allocation from the negative path. Probing a
+/// depth used to mean `Name::trim_to` → `Name::from_labels`, which allocates two
+/// intermediate `Vec`s and revalidates every label, for a name the probe throws
+/// away — measured at one allocation per negative query in a wildcard zone and
+/// five for a 123-label miss. VEGA-065 recorded that as its declared residual
+/// cost; this is where it is paid off.
+///
+/// 1,032 bytes of stack, no heap, no `Vec`, nothing dropped. The array is sized
+/// from [`MAX_LABELS`], which is not a tuning knob: a longer name cannot exist
+/// on the wire and hickory rejects one before it reaches us, pinned by
+/// `tests/canonical_order.rs::a_name_one_label_past_the_ceiling_is_rejected_before_it_reaches_the_zone`.
+#[allow(dead_code)] // The probe that reads it is S1's.
+struct SuffixHashes {
+    /// `h[d]` hashes the `d` rightmost labels. Filled up to `min(labels,
+    /// MAX_LABELS)`; entries past that are never read, because [`Self::at`]
+    /// refuses them.
+    h: [u64; MAX_LABELS + 1],
+    /// The name's **raw** label count, asterisks included — the index space
+    /// `label_count` and `trim_to` share, and the one `num_labels` is banned
+    /// for not being.
+    labels: usize,
+}
+
+#[allow(dead_code)] // The probe that reads it is S1's.
+impl SuffixHashes {
+    /// One reverse pass over `name`.
+    ///
+    /// The loop is bounded by `MAX_LABELS` and not by the name, because the
+    /// name is chosen by whoever sent the packet. A name longer than the wire
+    /// permits cannot reach here, and if one ever did the pass would stop at the
+    /// ceiling and [`Self::at`] would refuse every depth past it — a miss, never
+    /// an out-of-range write.
+    fn new(seed: u64, name: &LowerName) -> Self {
+        let mut h = [seed; MAX_LABELS + 1];
+        let mut filled = 0usize;
+        for label in name.iter().rev().take(MAX_LABELS) {
+            let next = mix_label(h[filled], label);
+            filled += 1;
+            h[filled] = next;
+        }
+        Self {
+            h,
+            labels: label_count(name),
+        }
+    }
+
+    /// The name's raw label count.
+    fn labels(&self) -> usize {
+        self.labels
+    }
+
+    /// The hash of the `depth` rightmost labels, or `None` when there is no
+    /// such suffix.
+    ///
+    /// `None` past `labels` so that a caller cannot mistake the hash of a
+    /// *shorter* name for the hash of the one it asked about; `None` past
+    /// `MAX_LABELS` because those entries were never filled.
+    fn at(&self, depth: usize) -> Option<u64> {
+        if depth > self.labels || depth > MAX_LABELS {
+            return None;
+        }
+        self.h.get(depth).copied()
+    }
+}
+
 /// Result of a zone lookup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Answer {
@@ -2014,6 +2169,134 @@ mod tests {
         // find runs its full window.
         assert_eq!(z.lookup(&deep_name(123), RecordType::A), Answer::NxDomain);
         assert_eq!(z.record_count(), 0);
+    }
+
+    // ----------------------------------------------- S0: the suffix hash
+    //
+    // AC-0.4 of the ruling, and the two scenarios it is written from. Neither is
+    // reachable from outside the crate: §10.1 keeps the primitives `pub(crate)`
+    // on purpose, because a `pub` API with no caller is its own defect, and
+    // there is no answer to attach the claim to. So they are unit tests, here,
+    // in the commit that adds the primitive.
+
+    /// Scenario: The suffix hash at every depth equals hashing that suffix
+    /// directly
+    /// features/zone-data-model.feature:187
+    ///
+    /// The entire correctness claim of the one-pass hash. `h[d]` is produced by
+    /// folding labels right to left and stopping; the oracle materialises the
+    /// `d` rightmost labels with `trim_to` — the very allocation S0 exists to
+    /// remove from the hot path, which is exactly why it is safe to use as the
+    /// reference here — and hashes that name from scratch. If the two ever
+    /// disagree, every probe below the deepest label looks in the wrong bucket
+    /// and a configured wildcard answers NXDOMAIN with nothing in the log.
+    ///
+    /// The last assertion is the one that pins the per-label finalisation, and
+    /// the pair is not obvious. The fold consumes labels from the **rightmost**,
+    /// so `b.ac.` presents `a, c, b` and so does `cb.a.` — the same octets, in
+    /// the same order, with the boundary in a different place. Two names that
+    /// merely *look* transposed (`ab.c.` against `a.bc.`) present `c, a, b` and
+    /// `b, c, a` and are separated by the octet order alone, so a test written
+    /// on those passes with the finalisation deleted. Measured: it did.
+    #[test]
+    fn the_suffix_hash_at_every_depth_equals_hashing_that_suffix_directly() {
+        const SEED: u64 = 0x0123_4567_89ab_cdef;
+
+        for text in [
+            ".",
+            "example.com.",
+            "a.b.c.d.e.example.com.",
+            "b.ac.example.com.",
+            "cb.a.example.com.",
+            "*.dev.example.com.",
+            "*.*.dev.example.com.",
+        ] {
+            let name = lower(text);
+            let hashes = SuffixHashes::new(SEED, &name);
+            assert_eq!(
+                hashes.labels(),
+                label_count(&name),
+                "{text}: the pass must record the raw label count"
+            );
+
+            for depth in 0..=label_count(&name) {
+                let suffix = LowerName::from(name.trim_to(depth));
+                assert_eq!(
+                    hashes.at(depth),
+                    Some(name_hash(SEED, &suffix)),
+                    "{text}: h[{depth}] is not the hash of {suffix}, so every \
+                     probe at that depth looks in the wrong bucket"
+                );
+            }
+
+            assert_eq!(
+                hashes.at(label_count(&name) + 1),
+                None,
+                "{text}: a depth past the name's own label count has no suffix \
+                 to hash and must not report one"
+            );
+        }
+
+        // The boundary case. `b.ac.` and `cb.a.` are the same five octets in
+        // the same order under a right-to-left fold; only the finalisation at
+        // each label boundary tells them apart. Without it these two names key
+        // the same bucket, and a zone holding both answers one of them from the
+        // other's records.
+        assert_ne!(
+            name_hash(SEED, &lower("b.ac.")),
+            name_hash(SEED, &lower("cb.a.")),
+            "two names differing only in where a label boundary falls hash the \
+             same; the fold is not marking boundaries"
+        );
+    }
+
+    /// Scenario: A 127-label name produces 128 suffix hashes and allocates
+    /// nothing
+    /// features/zone-data-model.feature:197
+    ///
+    /// `h[0]` is the root, so the deepest name the wire can carry fills the
+    /// array to its last entry and not one past it. That last entry is indexed
+    /// by a label count taken from a name an attacker chose, and with
+    /// `panic = "abort"` one index past it is a full outage from one packet.
+    ///
+    /// The allocation half is asserted structurally here — the whole state is a
+    /// `[u64; MAX_LABELS + 1]` and a `usize`, with nowhere to keep a heap
+    /// pointer — and mechanically in `tests/zone_memory.rs`, whose negative-path
+    /// budget is **zero** allocations over a thousand lookups and which drives
+    /// this pass on every one of them. A `#[global_allocator]` cannot be
+    /// installed here: it counts the whole process, and this binary runs 380
+    /// other tests in parallel.
+    #[test]
+    fn a_name_at_the_label_ceiling_fills_the_suffix_array_and_keeps_it_on_the_stack() {
+        const SEED: u64 = 0x0f0f_0f0f_0f0f_0f0f;
+
+        let name = lower(&("a.".repeat(MAX_LABELS)));
+        assert_eq!(
+            label_count(&name),
+            MAX_LABELS,
+            "the fixture must sit exactly at the ceiling, not near it"
+        );
+
+        let hashes = SuffixHashes::new(SEED, &name);
+        let defined = (0..=MAX_LABELS + 1)
+            .filter(|d| hashes.at(*d).is_some())
+            .count();
+        assert_eq!(
+            defined,
+            MAX_LABELS + 1,
+            "a {MAX_LABELS}-label name must produce exactly {} suffix hashes — \
+             one per depth including the root",
+            MAX_LABELS + 1
+        );
+
+        assert_eq!(
+            std::mem::size_of::<SuffixHashes>(),
+            std::mem::size_of::<[u64; MAX_LABELS + 1]>() + std::mem::size_of::<usize>(),
+            "SuffixHashes grew past its stack array and a label count. Anything \
+             else in there is a heap pointer, and the negative path — the only \
+             query shape an attacker can drive without knowing the zone — is \
+             budgeted at zero allocations"
+        );
     }
 
     // ------------------------------------------------- source-level guards

@@ -183,7 +183,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
   # 127, not 123. 123 is the ceiling for names under "example.com." only, and it
   # is wrong wherever the tests use it as a protocol limit.
 
-  @happy @wip src/zone.rs — S0 commit
+  @happy @enforced src/zone.rs:2202
   Scenario: The suffix hash at every depth equals hashing that suffix directly
     # The whole correctness claim of the one-pass hash, and it is not observable
     # from outside the crate: the primitive is pub(crate) by the ruling's §10.1,
@@ -193,11 +193,19 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When the suffix hashes are computed in one reverse pass
     Then h[d] equals the hash of that name's d rightmost labels, for every d
 
-  @boundary @wip src/zone.rs — S0 commit
+  @boundary @enforced src/zone.rs:2270
   Scenario: A 127-label name produces 128 suffix hashes and allocates nothing
     # h[0] is the root, so a 127-label name fills 128 entries — the exact width
     # of the stack array. One index past it is an out-of-bounds read on a path
     # an attacker reaches with a single 271-byte packet.
+    #
+    # The count is asserted in src/zone.rs; the "no heap allocation" half is
+    # asserted structurally there (the whole state is a [u64; 128] and a usize,
+    # with nowhere to keep a pointer) and mechanically by tests/zone_memory.rs,
+    # whose negative-path budget is ZERO allocations over a thousand lookups and
+    # which drives this pass on every one of them. A #[global_allocator] cannot
+    # live in the lib test binary: it counts the whole process, and that binary
+    # runs several hundred tests in parallel.
     Given a name with exactly 127 labels
     When the suffix hashes are computed
     Then there are 128 entries and the pass performs no heap allocation
