@@ -144,42 +144,53 @@ Feature: Authoritative zone lookup
     Then the build fails with an error mentioning "is not inside zone"
 
   # --------------------------------------------------------------- ANY QUERY
+  # RFC 8482 §4.1 and §4.2 change what goes in the ANSWER SECTION and license no
+  # change to the rcode or to the existence determination. Everything in this
+  # section is therefore about response *content*; what an ANY query's rcode must
+  # be lives in the WILDCARD-COVERED NAMES section below, where it is the same
+  # rcode every other QTYPE gets.
 
-  @happy @enforced src/zone.rs:503
-  Scenario: An ANY query returns every type present at the name
+  @happy @enforced src/handler.rs:1220
+  Scenario: An ANY query returns one synthetic HINFO, not the whole node
+    # RFC 8482 §4.2. Returning the node made ANY simultaneously the largest
+    # response and the most expensive lookup, with the attacker choosing both
+    # from a 29-byte packet (VEGA-002).
     Given the zone contains record set "multi" of type "A" with values "203.0.113.60"
     And the zone contains record set "multi" of type "TXT" with values "\"hello\""
     When a client queries "multi.example.com." for type ANY
-    Then the answer section contains 2 records
+    Then the response rcode is NOERROR
+    And the answer section contains 1 record
+    And the answer record type is HINFO
+    And the HINFO CPU field is "RFC8482"
+    And the answer section does not contain a record of type A
+    And the answer section does not contain a record of type TXT
 
-  @happy @gap
-  Scenario: An ANY query at the apex includes the zone SOA
-    # src/handler.rs:195-209 special-cases apex ANY to prepend the zone-level SOA
-    # and de-duplicate any SOA already in the record map. No test covers it.
+  @happy @enforced src/handler.rs:975
+  Scenario: An ANY query at the apex returns the HINFO and not the zone SOA
+    # Nothing in RFC 8482 §4.1 or §4.2 licenses adding the SOA to the ANSWER
+    # section; RFC 1034 §4.3.2 puts the SOA in AUTHORITY, and only on a negative
+    # answer. Prepending it at the apex is the amplification VEGA-002 closed.
     Given the zone contains record set "@" of type "A" with values "203.0.113.10"
     When a client queries "example.com." for type ANY
-    Then the answer section contains an SOA record
-    And the answer section contains exactly one SOA record
+    Then the response rcode is NOERROR
+    And the answer section contains 1 record
+    And the answer record type is HINFO
+    And the answer section does not contain an SOA record
 
-  @empty @gap
-  Scenario: An ANY query at an existing name with no records is NODATA
-    # Reachable only when a name is in `names` but has no exact entries; the apex
-    # of an empty zone is exactly that case.
+  @empty @enforced src/handler.rs:1262
+  Scenario: An ANY query at an existing name that holds no records still returns the HINFO
+    # RFC 8482 §4.2 conditions synthesis on the absence of a CNAME at the QNAME
+    # and on nothing else, so the response shape does not depend on what the
+    # node holds. Bounded and uniform is the point: taking §4.1's "subset"
+    # reading — the empty set for an empty node, i.e. a real NODATA — would make
+    # the shape of the answer depend on node contents.
     Given the zone contains no records
     When a client queries "example.com." for type ANY
     Then the response rcode is NOERROR
-    And the answer section is empty
+    And the answer section contains 1 record
+    And the answer record type is HINFO
 
-  @boundary @gap
-  Scenario: An ANY query does not synthesise a wildcard answer
-    # Zone::resolve returns before reaching the wildcard block when the type is
-    # ANY, so ANY under a wildcard is NXDOMAIN. This is a real, load-bearing
-    # asymmetry with the A-type behaviour and nothing pins it.
-    Given the zone contains record set "*.dev" of type "A" with values "203.0.113.50"
-    When a client queries "x.dev.example.com." for type ANY
-    Then the response rcode is NXDOMAIN
-
-  @boundary @gap
+  @boundary @enforced src/handler.rs:779
   Scenario: An ANY query does not chase a CNAME
     # The ANY branch returns the CNAME record itself and never follows it.
     Given the zone contains record set "alias" of type "CNAME" with values "origin.example.com."
@@ -187,6 +198,100 @@ Feature: Authoritative zone lookup
     When a client queries "alias.example.com." for type ANY
     Then the answer section contains 1 record
     And the answer record type is CNAME
+
+  @boundary @enforced src/handler.rs:1306
+  Scenario: An ANY query at a wildcard-covered CNAME returns the synthesised CNAME
+    # RFC 4592 §3.4.3 synthesises a CNAME at a covered name like any other type;
+    # RFC 8482 §4.2 forbids the HINFO when a CNAME is present at the QNAME.
+    # Before VEGA-083 the existence gate rejected the name before the CNAME
+    # probe ran, so this answered NXDOMAIN and never reached the CNAME it owed —
+    # even though the probe itself was already wildcard-aware.
+    Given the zone contains record set "*.dev" of type "CNAME" with values "origin.example.com."
+    When a client queries "x.dev.example.com." for type ANY
+    Then the response rcode is NOERROR
+    And the answer section contains 1 record
+    And the answer record type is CNAME
+    And the answer record owner is "x.dev.example.com."
+
+  # ---------------------------------------- WILDCARD-COVERED NAMES (VEGA-083)
+  # RFC 1034 §4.3.2 step 3(c): the authoritative name error is set only when the
+  # `*` node does not exist. RFC 4592 §3.3.1: `*.dev.example.com` is the source
+  # of synthesis for every name under `dev.example.com`, and it exists. So no
+  # query for a covered name may be NXDOMAIN, whatever the QTYPE — the answer is
+  # RFC 2308 §2.2 NODATA: NOERROR, empty answer section, SOA in authority.
+  #
+  # RFC 8020 §2 is why the wrong rcode is a subtree-wide denial rather than a
+  # cosmetic error: a resolver holding a cached NXDOMAIN for a covered name may
+  # answer NXDOMAIN for everything beneath it, for RFC 2308 §5's SOA MINIMUM.
+  # And AAAA — not ANY — is what triggers it, because every dual-stack client
+  # sends one alongside every A. No attacker is required.
+
+  @happy @enforced src/zone.rs:1633
+  Scenario: A wildcard answers the type it carries
+    # The positive control. A fix that made every covered name NODATA would
+    # satisfy every other scenario here and take the wildcard out of service.
+    Given the zone contains record set "*.dev" of type "A" with values "203.0.113.50"
+    When a client queries "x.dev.example.com." for type A
+    Then the response rcode is NOERROR
+    And the answer section contains 1 record
+    And the answer record owner is "x.dev.example.com."
+
+  @boundary @enforced tests/integration.rs:1040
+  Scenario Outline: A wildcard-covered name exists for every type, not only the one the wildcard carries
+    # AAAA is listed first deliberately: it is the case that fires on ordinary
+    # traffic, and it must be the first thing that goes red if the fix regresses.
+    Given the zone contains record set "*.dev" of type "A" with values "203.0.113.50"
+    When a client queries "x.dev.example.com." for type <qtype>
+    Then the response rcode is NOERROR
+    And the answer section is empty
+    And the authority section contains the zone SOA
+
+    Examples:
+      | qtype |
+      | AAAA  |
+      | TXT   |
+      | MX    |
+      | SRV   |
+
+  @boundary @enforced src/handler.rs:1278
+  Scenario: An ANY query at a wildcard-covered name is NOERROR with the RFC 8482 HINFO
+    # RFC 8482 changes the answer section, not the existence determination
+    # (§4.1, §4.2). The rcode here must equal the rcode for AAAA above, and it
+    # must be arrived at by the same computation.
+    Given the zone contains record set "*.dev" of type "A" with values "203.0.113.50"
+    When a client queries "x.dev.example.com." for type ANY
+    Then the response rcode is NOERROR
+    And the answer section contains 1 record
+    And the answer record type is HINFO
+
+  @boundary @enforced src/zone.rs:1701
+  Scenario: A name with no source of synthesis is still NXDOMAIN
+    # The negative control. Without it the fix could be "never say NXDOMAIN",
+    # which passes every other scenario in this section.
+    Given the zone contains record set "*.dev" of type "A" with values "203.0.113.50"
+    When a client queries "x.prod.example.com." for type A
+    Then the response rcode is NXDOMAIN
+
+  @boundary @enforced src/zone.rs:1736
+  Scenario: Coverage is decided by the wildcard's own parent, not by its depth
+    # `*.dev` sits at depth 3. So does `other.example.com`. A coverage predicate
+    # read off the depth bitmap alone would make `q.other.example.com` — and
+    # almost every other name in the zone — exist. The failure is silent: the
+    # server stops saying NXDOMAIN about names it is authoritatively denying.
+    Given the zone contains record set "*.dev" of type "A" with values "203.0.113.50"
+    When a client queries "q.other.example.com." for type A
+    Then the response rcode is NXDOMAIN
+
+  @hostile @enforced tests/properties.rs:932
+  Scenario: For a name with no CNAME, the rcode is a function of the name alone
+    # RFC 1034 §4.3.2 step 3(c) as an executable law, and the strongest single
+    # conformance statement in the suite: the name-error branch is not
+    # conditioned on QTYPE anywhere. Scoped to CNAME-free names because RFC 1034
+    # §3.6.2 chasing legitimately lets the target's status reach the rcode.
+    Given any zone the generator produces, with or without wildcards
+    And any in-zone name with no CNAME at it and none synthesised for it
+    When the name is queried for A, AAAA, TXT, MX, SRV, NS, SOA and ANY
+    Then every one of those queries produces the same rcode
 
   # ---------------------------------------------------------------- MALFORMED
 
@@ -265,3 +370,23 @@ Feature: Authoritative zone lookup
     Given the zone contains record set "www" of type "A" with values "203.0.113.20"
     When a client queries "WwW.ExAmPlE.cOm." for type A
     Then the answer section contains 1 record
+
+  @hostile @wip tests/perf_budget.rs:266
+  Scenario: An ANY lookup costs the same on a 100,000-record zone as on a small one
+    # CLAUDE.md's budget: no O(n) scan over the record map per query, for any
+    # query type. The zone layer's ANY arm was one — 219.6 ns / 31.5 µs / 1.83 ms
+    # at 1k / 10k / 100k records, 18,239x an A lookup and 201x the 9.1 µs
+    # per-query CPU budget. Nothing on the packet path reached it, because RFC
+    # 8482 minimal-ANY intercepts first, so it was a landmine in a `pub fn`
+    # rather than a live DoS — one routing change, an AXFR path or a SLIP
+    # implementation away from being one.
+    #
+    # VEGA-083 deletes the arm rather than re-keying it: RFC 1035 §3.2.3 makes
+    # ANY a QTYPE that can never key the record map, so the zone layer answers
+    # existence and the response policy stays with the responder.
+    #
+    # @wip: `#[ignore]`d and failing until that lands; it must be un-ignored in
+    # the same commit.
+    Given a 100,000-record zone
+    When an existing name is looked up for type ANY
+    Then it costs less than 25 times the same name looked up for type A

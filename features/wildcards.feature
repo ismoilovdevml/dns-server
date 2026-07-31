@@ -85,20 +85,30 @@ Feature: Wildcard record synthesis (RFC 4592)
 
   # ------------------------------------------------------------ WRONG TYPE
 
-  @boundary @enforced src/zone.rs:559
-  Scenario: A wildcard does not answer a type it was not configured for
+  @boundary @enforced src/zone.rs:721
+  Scenario: A wildcard does not answer a type it was not configured for, but the name still exists
+    # RFC 1034 §4.3.2 step 3(c): the authoritative name error is set ONLY when
+    # the `*` node does not exist. It exists here and carries no TXT, so control
+    # goes to step 6 — exit with an empty answer section — which is RFC 2308
+    # §2.2 NODATA, not a name error. Answering NXDOMAIN instead lets an RFC 8020
+    # §2 resolver deny the whole subtree for RFC 2308 §5's SOA MINIMUM
+    # (VEGA-083, VEGA-010).
     Given the zone contains record set "*.dev" of type "A" with values "203.0.113.50"
     When a client queries "x.dev.example.com." for type TXT
-    Then the lookup result is NxDomain
+    Then the lookup result is NoData
 
-  @boundary @gap
-  Scenario: A wildcard of the wrong type produces NXDOMAIN with the SOA over the wire
-    # The unit test asserts the Answer enum only. The response the client sees —
-    # rcode NXDOMAIN plus a cacheable SOA — is never asserted.
+  @boundary @enforced tests/integration.rs:1040
+  Scenario: A wildcard of the wrong type produces NOERROR with the SOA over the wire
+    # The unit test asserts the Answer enum only, and the response the client
+    # sees is what does the damage: this used to be rcode NXDOMAIN plus a
+    # cacheable SOA. The SOA assertion stays — RFC 2308 §3 requires it on a
+    # NODATA answer just as on a name error — and only the expectation inverts.
     Given the zone contains record set "*.dev" of type "A" with values "203.0.113.50"
     When a client queries "x.dev.example.com." for type TXT
-    Then the response rcode is NXDOMAIN
+    Then the response rcode is NOERROR
+    And the answer section is empty
     And the authority record type is SOA
+    And the response is authoritative
 
   @boundary @gap
   Scenario: Wildcards of two types at the same node each answer their own type
@@ -236,9 +246,14 @@ Feature: Wildcard record synthesis (RFC 4592)
   #
   # Ruling: .claude/backlog/decisions/VEGA-065-bounded-wildcard-walk.md
   # Out of scope here, by that ruling: closest-encloser blocking (VEGA-009),
-  # empty non-terminals (VEGA-006), wildcard type-mismatch NODATA (VEGA-010),
-  # ANY behaviour (VEGA-002). Today's non-conformant answers on those paths are
-  # pinned as-is, deliberately.
+  # empty non-terminals (VEGA-006), ANY behaviour (VEGA-002). Today's
+  # non-conformant answers on those paths are pinned as-is, deliberately.
+  #
+  # Wildcard type-mismatch NODATA (VEGA-010) WAS on that list and has since been
+  # fixed, by VEGA-083, which found it was the same defect as a wildcard-covered
+  # name answering NXDOMAIN for ANY. Two scenarios below therefore now expect
+  # NODATA where they used to expect NXDOMAIN. The VEGA-065 property they exist
+  # for — the walk's cost, and its termination — is unchanged.
 
   # ------------------------------------------- HAPPY: asterisks in query names
 
@@ -353,24 +368,31 @@ Feature: Wildcard record synthesis (RFC 4592)
   @boundary @vega-065 @enforced src/zone.rs:1086
   Scenario: A maximum-length query name is answered
     # 123 labels is the most a name under "example.com." can carry inside RFC
-    # 1035 §2.3.4's 255 octets (121*2 + 8 + 4 + 1 = 255), and therefore the most
-    # that can ever reach the zone. The depth index is a 128-bit word sized from
-    # that limit; bit 127 must be representable and the shift that sets it must
-    # not overflow.
+    # 1035 §2.3.4's 255 octets (121*2 + 8 + 4 + 1 = 255). It is NOT the ceiling
+    # for the decoder: a bare 127-single-octet-label name is exactly 255 octets
+    # and hickory decodes it, which is where the depth index's 128-bit width and
+    # its bit 127 come from (2n + 1 <= 255). Both bounds are exercised — this
+    # scenario at 123 under a named origin, and src/zone.rs's
+    # `the_true_deepest_name_the_wire_can_carry_is_127_labels_and_is_answered`
+    # at the real ceiling, where the shift that sets the top bit must not
+    # overflow.
     Given the zone contains record set "*" of type "A" with values "203.0.113.1"
     When a client queries a 123-label name inside "example.com." for type A
     Then the answer section contains 1 record
     And the answer record owner is the queried name
 
-  @boundary @vega-065 @enforced src/zone.rs:1101
-  Scenario: A maximum-length query name of a type no wildcard holds is NXDOMAIN
+  @boundary @vega-065 @enforced src/zone.rs:1411
+  Scenario: A maximum-length query name of a type no wildcard holds is NODATA
     # The type-mismatch path at maximum depth: the walk runs its whole window,
     # hits nothing and must return rather than run off the end of the index.
-    # (NXDOMAIN here rather than NODATA is VEGA-010's defect. Pinned as-is so
-    # bounding the walk cannot quietly change it.)
+    # The apex `*` covers this name, so RFC 1034 §4.3.2 step 3(c) makes the
+    # answer NODATA (VEGA-083 corrected this from NXDOMAIN, which was VEGA-010's
+    # defect pinned as-is while VEGA-065 bounded the walk). The boundary this
+    # scenario exists for — the shift at the deepest reachable depth — is
+    # unchanged by that.
     Given the zone contains record set "*" of type "A" with values "203.0.113.1"
     When a client queries a 123-label name inside "example.com." for type TXT
-    Then the lookup result is NxDomain
+    Then the lookup result is NoData
 
   @boundary @vega-065 @enforced src/zone.rs:1125
   Scenario: A name above the zone origin is NXDOMAIN even with a wildcard present
@@ -415,20 +437,26 @@ Feature: Wildcard record synthesis (RFC 4592)
 
   # --------------------------------------------------------------- HOSTILE
 
-  @hostile @vega-065 @enforced src/zone.rs:1137
+  @hostile @vega-065 @enforced src/zone.rs:1577
   Scenario: A root-origin zone with a wildcard terminates on a miss
     # `origin = "."` makes the floor zero, which is where a loop shaped as
     # "count down while depth >= floor" fails to terminate: it needs an extra
     # guard at zero that is easy to drop and impossible to notice. A
     # non-terminating walk under `panic = "abort"` is one packet, one wedged
-    # worker. Enforced under a timeout so a spin fails the test instead of
-    # hanging the suite.
+    # worker. Enforced under a process watchdog so a spin fails the test instead
+    # of hanging the suite.
+    #
+    # The answer is NODATA, not NXDOMAIN: with origin `.` the `*` sits at depth
+    # 0, which is inside the probe window, so `nope.example.com.` genuinely has
+    # a source of synthesis and RFC 1034 §4.3.2 step 3(c) forbids the name error
+    # (VEGA-083). Termination — the property this scenario exists for — is
+    # unaffected either way.
     Given a zone whose origin is the root "." instead of the Background zone
     And the zone contains record set "*" of type "A" with values "203.0.113.1"
     When a client queries "nope.example.com." for type TXT
-    Then the lookup returns NxDomain within 10 seconds
+    Then the lookup returns NoData within the watchdog's deadline
 
-  @hostile @vega-065 @enforced tests/properties.rs:707
+  @hostile @vega-065 @enforced tests/properties.rs:785
   Scenario: The bounded walk agrees with the naive walk on every zone and every name
     # The behaviour-preservation claim, as a property rather than a list of
     # examples. Zones carry up to four wildcards at random depths, including
@@ -446,7 +474,7 @@ Feature: Wildcard record synthesis (RFC 4592)
     Then the answer matches a naive base_name() walk over the same zone
     And the records match too, owner name, TTL and rdata
 
-  @hostile @vega-065 @enforced tests/properties.rs:741
+  @hostile @vega-065 @enforced tests/properties.rs:839
   Scenario: Stacking labels above a covered name does not uncover it
     # The specific thing a bound derived from the query name gets wrong: it
     # silently stops probing once the query is shallow enough. If a name is
@@ -457,15 +485,14 @@ Feature: Wildcard record synthesis (RFC 4592)
     When up to 40 further labels are prefixed to it
     Then it is still covered
 
-  @hostile @vega-065 @wip tests/perf_budget.rs:137
+  @hostile @vega-065 @enforced tests/perf_budget.rs:164
   Scenario: A maximum-length attacker-chosen name costs no more than a one-label name
     # The acceptance criterion. A 123-label NXDOMAIN, measured against a
     # 1-label NXDOMAIN in the same process on the same zone, must be inside 25x.
     # Measured on the unbounded walk: 208 ns shallow, 237.569 us deep, 1142.2x.
     #
-    # @wip: this fails on the current tree, by design — it is what VEGA-065 has
-    # to make true. It is #[ignore]d so `cargo test` stays honest, and must be
-    # un-ignored in the same commit that bounds the walk.
+    # Live since the commit that landed the depth bitmap: 239.631 µs to 1.657 µs
+    # at 123 labels, a 145x cut, ratio 18.8x against a 25x budget.
     Given a 100,000-record zone containing one wildcard
     When a 123-label name inside the zone is looked up for type A
     Then it costs less than 25 times a 1-label lookup in the same zone
@@ -473,8 +500,24 @@ Feature: Wildcard record synthesis (RFC 4592)
   # ------------------------------------------------------- NOT THIS ISSUE'S
   # These stay red. src/zone.rs holds three #[ignore]d tests pinning RFC 4592
   # §3.3.1 (no closest encloser), RFC 4592 §2.2.2 / RFC 2308 §2.2 (no empty
-  # non-terminals) and the wildcard type-mismatch NXDOMAIN. They are VEGA-009,
-  # VEGA-006 and VEGA-010, fixed by VEGA-032's zone data model rewrite.
+  # non-terminals) and an empty non-terminal created by a wildcard. They are
+  # VEGA-009 and VEGA-006, fixed by VEGA-032's zone data model rewrite.
   #
   # VEGA-065 is behaviour-preserving, so if one of them turns green the walk
   # changed behaviour and the change is wrong. Do not un-ignore them here.
+  #
+  # VEGA-083 is NOT behaviour-preserving — it turns NXDOMAIN into NODATA for
+  # covered names — and all three still stay red under it, structurally:
+  #
+  #   * the empty non-terminal zone holds no wildcards at all, so the probe
+  #     never runs;
+  #   * the wildcard-below-an-existing-name case is answered from the `Found`
+  #     path, which VEGA-083 does not touch;
+  #   * a wildcard can never declare ITS OWN PARENT covered, because RFC 4592
+  #     §3.3.1 makes a wildcard's parent a proper ancestor of the names it
+  #     covers and the probe window is capped at the query's parent depth. The
+  #     mask is empty, so zero probes run.
+  #
+  # If one of them turns green under VEGA-083, the change went outside its
+  # fence — most likely by inserting wildcard parents into the zone's name set,
+  # which is VEGA-006's work and not a security commit's. Fix the change.

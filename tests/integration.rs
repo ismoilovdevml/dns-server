@@ -973,6 +973,169 @@ async fn multiple_values_are_all_returned() {
     assert_eq!(response.answers.len(), 3);
 }
 
+// ---------------------------------------------------------------------------
+// VEGA-083 — a wildcard-covered name exists for every QTYPE, on the wire.
+//
+// Spec: features/zone-lookup.feature, section "WILDCARD-COVERED NAMES";
+//       features/wildcards.feature, section "WRONG TYPE".
+// Ruling: .claude/backlog/decisions/VEGA-083-any-at-a-wildcard-covered-name.md
+//
+// These are on the wire deliberately. Both the reviewer's reproduction and the
+// adversary's were UDP against a live handler, and what does the damage is the
+// packet a resolver caches — an authoritative NXDOMAIN carrying our SOA, held
+// for the SOA MINIMUM (RFC 2308 §5) and licensing subtree-wide denial (RFC 8020
+// §2). An enum comparison cannot see the aa bit, the authority section, or the
+// fact that the answer is cacheable at all.
+//
+// One zone for all four, `*.dev A 203.0.113.50`, so the asymmetry between the
+// type the wildcard carries and every other type is what fails.
+// ---------------------------------------------------------------------------
+
+/// The zone both halves of VEGA-083 are observed against.
+fn wildcard_records() -> Vec<RecordSpec> {
+    vec![spec("*.dev", "A", &["203.0.113.50"])]
+}
+
+/// Scenario: A wildcard answers the type it carries
+/// features/zone-lookup.feature:230
+///
+/// The positive control, and the reason the rest of this section cannot be
+/// satisfied by never answering NXDOMAIN.
+#[tokio::test]
+async fn a_wildcard_still_answers_the_type_it_carries_over_the_wire() {
+    let server = TestServer::start(wildcard_records(), None).await;
+
+    let response = ask_udp(&server, &format!("x.dev.{ZONE}"), RecordType::A).await;
+
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(response.metadata.authoritative, "AA must be set");
+    assert_eq!(response.answers.len(), 1);
+    assert_eq!(first_a(&response), "203.0.113.50");
+    assert_eq!(
+        response.answers[0].name.to_string(),
+        format!("x.dev.{ZONE}."),
+        "a synthesised answer must be owned by the queried name"
+    );
+}
+
+/// Scenario Outline: A wildcard-covered name exists for every type, not only the
+/// one the wildcard carries
+/// features/zone-lookup.feature:240
+/// Scenario: A wildcard of the wrong type produces NOERROR with the SOA over the
+/// wire
+/// features/wildcards.feature:101
+///
+/// THE REGRESSION TEST FOR THIS ISSUE. AAAA is checked first because it is the
+/// half that fires without an attacker: every dual-stack client sends one
+/// alongside every A, so before this fix the ordinary resolution of a covered
+/// name emitted an authoritative NXDOMAIN as a matter of course, and the
+/// wildcard's own live A record went out of service at any resolver that
+/// happened to ask AAAA first.
+///
+/// The SOA assertion is kept from the scenario this replaces, not dropped with
+/// the NXDOMAIN: RFC 2308 §3 requires the SOA on a NODATA answer exactly as on a
+/// name error, and an uncacheable NODATA would be a second bug rather than a
+/// fix.
+#[tokio::test]
+async fn a_wildcard_covered_name_is_noerror_over_the_wire_for_every_type_the_wildcard_lacks() {
+    let server = TestServer::start(wildcard_records(), None).await;
+
+    // The wildcard is live in this zone: without this the assertions below are
+    // satisfied by a zone that synthesises nothing at all.
+    let carried = ask_udp(&server, &format!("x.dev.{ZONE}"), RecordType::A).await;
+    assert_eq!(
+        carried.metadata.response_code,
+        ResponseCode::NoError,
+        "fixture check: `*.dev A` must answer A at the covered name"
+    );
+
+    for qtype in [
+        RecordType::AAAA,
+        RecordType::TXT,
+        RecordType::MX,
+        RecordType::SRV,
+    ] {
+        let response = ask_udp(&server, &format!("x.dev.{ZONE}"), qtype).await;
+
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::NoError,
+            "{qtype} at a wildcard-covered name came back {:?}. RFC 1034 §4.3.2 \
+             step 3(c) sets the name error only when the `*` node does not \
+             exist; as NXDOMAIN this is cached for the SOA MINIMUM (RFC 2308 §5) \
+             and RFC 8020 §2 lets the resolver deny the whole subtree, including \
+             the A record the wildcard does carry",
+            response.metadata.response_code
+        );
+        assert!(
+            response.answers.is_empty(),
+            "{qtype} must be NODATA, not an answer of the wrong type: {:?}",
+            response.answers
+        );
+        assert!(
+            response.metadata.authoritative,
+            "{qtype}: a NODATA answer from the zone's own authority must set AA"
+        );
+        assert_eq!(
+            response
+                .authorities
+                .first()
+                .map(hickory_proto::rr::Record::record_type),
+            Some(RecordType::SOA),
+            "{qtype}: RFC 2308 §3 requires the SOA in the authority section of a \
+             NODATA answer, or the resolver cannot cache it and re-asks forever"
+        );
+    }
+}
+
+/// Scenario: An ANY query at a wildcard-covered name is NOERROR with the RFC
+/// 8482 HINFO
+/// features/zone-lookup.feature:257
+///
+/// The rcode here must equal the rcode for AAAA above. RFC 8482 §4.1/§4.2 change
+/// what goes in the answer section and license no change to the existence
+/// determination, so ANY and AAAA must be decided by the same computation.
+#[tokio::test]
+async fn an_any_query_at_a_wildcard_covered_name_is_noerror_with_one_hinfo_over_the_wire() {
+    let server = TestServer::start(wildcard_records(), None).await;
+
+    let response = ask_udp(&server, &format!("x.dev.{ZONE}"), RecordType::ANY).await;
+
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(response.answers.len(), 1, "{:?}", response.answers);
+    assert_eq!(response.answers[0].record_type(), RecordType::HINFO);
+}
+
+/// Scenario: A name with no source of synthesis is still NXDOMAIN
+/// features/zone-lookup.feature:268
+///
+/// The negative control, on the wire and against the same zone. A fix that
+/// widened the existence gate too far would pass every other test in this
+/// section and quietly make the server authoritative for every label an attacker
+/// can invent.
+#[tokio::test]
+async fn a_name_with_no_source_of_synthesis_is_still_nxdomain_over_the_wire() {
+    let server = TestServer::start(wildcard_records(), None).await;
+
+    for qtype in [RecordType::A, RecordType::AAAA, RecordType::ANY] {
+        let response = ask_udp(&server, &format!("x.prod.{ZONE}"), qtype).await;
+
+        assert_eq!(
+            response.metadata.response_code,
+            ResponseCode::NXDomain,
+            "nothing covers x.prod.{ZONE}, so {qtype} there is a real name error"
+        );
+        assert_eq!(
+            response
+                .authorities
+                .first()
+                .map(hickory_proto::rr::Record::record_type),
+            Some(RecordType::SOA),
+            "{qtype}: a name error must stay cacheable"
+        );
+    }
+}
+
 #[tokio::test]
 async fn concurrent_queries_are_all_answered() {
     let server = Arc::new(TestServer::start(vec![spec("www", "A", &["203.0.113.10"])], None).await);

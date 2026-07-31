@@ -550,7 +550,10 @@ mod tests {
     /// Single-character prefix labels keep the wire form inside RFC 1035
     /// §2.3.4's 255-octet limit: at 123 labels the encoding is
     /// `121 * (1 + 1) + (1 + 7) + (1 + 3) + 1 = 255` octets exactly, which is
-    /// the longest name that can ever reach `Zone::resolve`.
+    /// the longest name that can reach `Zone::resolve` *under this origin*. The
+    /// ceiling for the decoder is 127 labels, reached only by a name with no
+    /// `example.com.` suffix to pay for; see
+    /// `the_true_deepest_name_the_wire_can_carry_is_127_labels_and_is_answered`.
     fn deep_name(labels: usize) -> LowerName {
         let prefix = labels - 2;
         let mut s = String::with_capacity(prefix * 2 + 13);
@@ -702,28 +705,60 @@ mod tests {
         );
     }
 
+    /// Scenario: A wildcard does not answer a type it was not configured for,
+    /// but the name still exists
+    /// features/wildcards.feature:89
+    ///
+    /// FLIPPED BY VEGA-083, and it was VEGA-010's enshrining test. It asserted
+    /// `NxDomain`, which is what the code did, not what RFC 1034 §4.3.2 step
+    /// 3(c) says: the authoritative name error is set **only** when the `*` node
+    /// does not exist. `*.dev.example.com.` exists and holds no TXT, so control
+    /// goes to step 6 — exit with an empty answer section — which is RFC 2308
+    /// §2.2 NODATA. As NXDOMAIN the answer is cached for the SOA MINIMUM (RFC
+    /// 2308 §5) and RFC 8020 §2 then licenses the resolver to deny the entire
+    /// subtree, taking the wildcard's live A record out of service.
     #[test]
     fn wildcard_does_not_answer_a_different_type() {
         let _watchdog = watchdog();
         let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
         assert_eq!(
             z.lookup(&lower("x.dev.example.com."), RecordType::TXT),
-            Answer::NxDomain
+            Answer::NoData
         );
     }
 
+    /// Scenario: An ANY query returns one synthetic HINFO, not the whole node
+    /// features/zone-lookup.feature:154
+    ///
+    /// FLIPPED BY VEGA-083. This was `any_query_returns_every_type_at_the_name`,
+    /// asserting that the zone layer enumerates the node for QTYPE=ANY. That arm
+    /// is deleted: RFC 1035 §3.2.3 makes ANY a QTYPE and never an RRTYPE, so it
+    /// can never key the record map, and RFC 8482 makes *what to answer* for it
+    /// a responder policy that lives in `DnsHandler`. The zone layer reports
+    /// existence and nothing else, which is also how the `O(zone)` scan behind
+    /// it — 1.83 ms on a 100k-record zone — stops being one routing change away
+    /// from the packet path.
+    ///
+    /// AXFR (VEGA-032) will need ordered node iteration. It will not get it from
+    /// here; a caller that reads `NoData` as "the node is empty" is wrong.
     #[test]
-    fn any_query_returns_every_type_at_the_name() {
+    fn an_any_lookup_reports_existence_and_never_enumerates_the_node() {
         let _watchdog = watchdog();
         let z = zone(vec![
             spec("multi", "A", &["203.0.113.60"]),
             spec("multi", "TXT", &["\"hello\""]),
         ]);
-        let Answer::Records(records) = z.lookup(&lower("multi.example.com."), RecordType::ANY)
-        else {
-            panic!("expected records");
-        };
-        assert_eq!(records.len(), 2);
+        assert_eq!(
+            z.lookup(&lower("multi.example.com."), RecordType::ANY),
+            Answer::NoData,
+            "the zone layer must report that the name exists, not enumerate it"
+        );
+        assert_eq!(
+            z.lookup(&lower("nope.example.com."), RecordType::ANY),
+            Answer::NxDomain,
+            "and it must still distinguish a name that does not exist, or the \
+             existence report is worthless"
+        );
     }
 
     #[test]
@@ -1361,15 +1396,22 @@ mod tests {
         assert_eq!(LowerName::from(records[0].name.clone()), name);
     }
 
+    /// Scenario: A maximum-length query name of a type no wildcard holds is NODATA
+    /// features/wildcards.feature:385
+    ///
+    /// FLIPPED BY VEGA-083, and owned by VEGA-065. The type-mismatch path at
+    /// maximum depth: the walk runs its full window, hits nothing, and must
+    /// return rather than run off the end of the bitmap. That boundary — the
+    /// shift at the deepest depth the window can reach — is exactly what this
+    /// test is for and is **unchanged**; only the verdict moves, from NXDOMAIN
+    /// to NODATA, because the apex `*` is a source of synthesis for this name
+    /// (RFC 1034 §4.3.2 step 3(c)). The old comment already said as much: it
+    /// called the NXDOMAIN "VEGA-010's defect, pinned as-is".
     #[test]
-    fn a_maximum_length_query_name_of_the_wrong_type_is_nxdomain() {
+    fn a_maximum_length_query_name_of_the_wrong_type_is_nodata() {
         let _watchdog = watchdog();
-        // The type-mismatch path at maximum depth: the walk runs its full
-        // window, hits nothing, and must return rather than run off the end of
-        // the bitmap. (NXDOMAIN rather than NODATA is VEGA-010's defect, not
-        // this one's; pinned here so the walk change cannot alter it.)
         let z = zone(vec![spec("*", "A", &["203.0.113.1"])]);
-        assert_eq!(z.lookup(&deep_name(123), RecordType::TXT), Answer::NxDomain);
+        assert_eq!(z.lookup(&deep_name(123), RecordType::TXT), Answer::NoData);
     }
 
     #[test]
@@ -1515,19 +1557,29 @@ mod tests {
         assert_eq!(z.lookup(&lower("."), RecordType::A), Answer::NxDomain);
     }
 
+    /// Scenario: A root-origin zone with a wildcard terminates on a miss
+    /// features/wildcards.feature:441
+    ///
+    /// FLIPPED BY VEGA-083, and owned by VEGA-065. `origin = "."` is accepted by
+    /// `parse_name`, and it drives the walk's floor to 0. The rejected patch's
+    /// `while labels >= floor { … labels -= 1 }` shape only survives that
+    /// because of an extra `if labels == 0 { break }`; a bitmap loop that clears
+    /// the bit it just probed terminates structurally. Bounded by the process
+    /// watchdog, not by a channel, so a non-terminating walk fails this test
+    /// rather than leaking a thread — **that is the property under test and it
+    /// is unchanged.**
+    ///
+    /// The verdict moves from NXDOMAIN to NODATA because with `origin = "."` the
+    /// `*` sits at depth 0, which the window includes, so `nope.example.com.`
+    /// genuinely has a source of synthesis and RFC 1034 §4.3.2 step 3(c) forbids
+    /// the name error. A walk that spun would never reach either answer.
     #[test]
     fn a_root_origin_zone_terminates_on_a_wildcard_miss() {
-        // `origin = "."` is accepted by parse_name, and it drives the walk's
-        // floor to 0. The rejected patch's `while labels >= floor { … labels -=
-        // 1 }` shape only survives that because of an extra `if labels == 0 {
-        // break }`; a bitmap loop that clears the bit it just probed terminates
-        // structurally. Bounded by the process watchdog, not by a channel, so a
-        // non-terminating walk fails this test rather than leaking a thread.
         let _watchdog = watchdog();
         let z = zone_with_origin(".", vec![spec("*", "A", &["203.0.113.1"])]);
         assert_eq!(
             z.lookup(&lower("nope.example.com."), RecordType::TXT),
-            Answer::NxDomain
+            Answer::NoData
         );
     }
 
@@ -1547,15 +1599,308 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // VEGA-083 — a wildcard-covered name exists for every QTYPE.
+    //
+    // Spec: features/zone-lookup.feature, section "WILDCARD-COVERED NAMES";
+    //       features/wildcards.feature, section "WRONG TYPE".
+    // Ruling: .claude/backlog/decisions/VEGA-083-any-at-a-wildcard-covered-name.md
+    //
+    // RFC 1034 §4.3.2 step 3(c) sets the authoritative name error *only* when
+    // the `*` node does not exist. When it exists and no RR matches QTYPE,
+    // control goes to step 6: exit, empty answer section, NOERROR. That branch
+    // is not conditioned on QTYPE anywhere, which is why the determination for
+    // ANY must be the same computation as the one for AAAA (RFC 8482 §4.1/§4.2
+    // change the answer section and license no RCODE change), and why RFC 4035
+    // §3.1.3.4 and RFC 5155 §7.2.5 define a whole class of authenticated-denial
+    // proof for "wildcard no data" — machinery that would not exist if the
+    // answer were a name error.
+    //
+    // The operational half: AAAA, not ANY, is what fires. Every dual-stack
+    // client sends one alongside every A, so the ordinary resolution of a
+    // covered name emitted an authoritative NXDOMAIN carrying the SOA, cached
+    // for the SOA MINIMUM (RFC 2308 §5), and RFC 8020 §2 then licensed the
+    // resolver to deny the whole subtree. No attacker required.
+    // -----------------------------------------------------------------------
+
+    /// Scenario: A wildcard answers the type it carries
+    /// features/zone-lookup.feature:230
+    ///
+    /// The positive control, and it is not decorative: every other test in this
+    /// section asserts that something is *not* NXDOMAIN, and a fix that simply
+    /// stopped synthesising would satisfy all of them while taking the
+    /// wildcard's records out of service.
+    #[test]
+    fn a_wildcard_still_answers_the_type_it_carries() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
+        let Answer::Records(records) = z.lookup(&lower("x.dev.example.com."), RecordType::A) else {
+            panic!("`*.dev A` must still synthesise an A record for a covered name");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].data, a("203.0.113.50"));
+        assert_eq!(records[0].name, parse_name("x.dev.example.com.").unwrap());
+    }
+
+    /// Scenario: A wildcard-covered name exists for every type, not only the one
+    /// the wildcard carries
+    /// features/zone-lookup.feature:240
+    ///
+    /// AAAA is first on purpose: it is the type ordinary traffic asks for, so it
+    /// is the one that must go red first if this regresses. TXT, MX and SRV are
+    /// there because the defect was in the *walk*, not in any per-type branch,
+    /// and a single-type test cannot tell those apart.
+    #[test]
+    fn a_wildcard_covered_name_is_nodata_for_every_type_the_wildcard_does_not_carry() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
+        for qtype in [
+            RecordType::AAAA,
+            RecordType::TXT,
+            RecordType::MX,
+            RecordType::SRV,
+        ] {
+            assert_eq!(
+                z.lookup(&lower("x.dev.example.com."), qtype),
+                Answer::NoData,
+                "{qtype} at a name covered by `*.dev` must be RFC 2308 §2.2 \
+                 NODATA; as NXDOMAIN it is cached for the SOA MINIMUM and, under \
+                 RFC 8020 §2, denies the whole subtree including the wildcard's \
+                 own A record"
+            );
+        }
+    }
+
+    /// Scenario: An ANY query at a wildcard-covered name is NOERROR with the RFC
+    /// 8482 HINFO
+    /// features/zone-lookup.feature:257
+    ///
+    /// The zone-layer half of that scenario: the handler decides what goes in
+    /// the answer section, but it can only do so for a name the zone says
+    /// exists. This is the third of the three sites that used `names` as the
+    /// existence oracle — the `pub`-reachable `Zone::lookup(_, ANY)` arm — and
+    /// it is the one no packet reached, which is exactly why it went unnoticed.
+    #[test]
+    fn an_any_lookup_at_a_wildcard_covered_name_is_nodata_not_nxdomain() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
+        assert_eq!(
+            z.lookup(&lower("x.dev.example.com."), RecordType::ANY),
+            Answer::NoData,
+            "RFC 8482 changes the answer section, not the existence \
+             determination, so ANY here must agree with AAAA"
+        );
+    }
+
+    /// Scenario: A name with no source of synthesis is still NXDOMAIN
+    /// features/zone-lookup.feature:268
+    ///
+    /// The negative control. Without it, "never answer NXDOMAIN" passes every
+    /// other test in this section — and a server that never denies a name is
+    /// authoritative for every label an attacker can invent.
+    #[test]
+    fn a_name_with_no_source_of_synthesis_is_still_nxdomain() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
+        for qtype in [RecordType::A, RecordType::AAAA, RecordType::ANY] {
+            assert_eq!(
+                z.lookup(&lower("x.prod.example.com."), qtype),
+                Answer::NxDomain,
+                "nothing covers `x.prod.example.com.`, so {qtype} there is a real \
+                 name error (RFC 1034 §4.3.2 step 3(c))"
+            );
+        }
+    }
+
+    /// Scenario: Coverage is decided by the wildcard's own parent, not by its
+    /// depth
+    /// features/zone-lookup.feature:276
+    ///
+    /// THE DISCRIMINATING TEST OF THIS ISSUE. The obvious wrong shortcut is to
+    /// read coverage off `wildcard_depths` alone — the bitmap is already loaded,
+    /// already masked by the window, and the loop already knows which depths it
+    /// probed. But the bitmap says "a wildcard exists *somewhere* at depth d",
+    /// not "at *this* parent". Deriving coverage from it makes every name whose
+    /// parent happens to sit at a populated depth exist, which in a zone with an
+    /// apex wildcard is very nearly every name there is.
+    ///
+    /// The failure is silent and it is the dangerous direction for a different
+    /// reason than the bug: the server stops denying names it is authoritative
+    /// for, so typos and probes resolve to empty answers and nothing in the log
+    /// says so.
+    ///
+    /// It fails in BOTH directions, which is what makes it worth its length:
+    /// the first half fails against the depths-alone shortcut, the second half
+    /// fails against today's code and against any "fix" that simply stops
+    /// covering anything.
+    #[test]
+    fn coverage_is_decided_by_the_wildcard_parent_not_by_its_depth() {
+        let _watchdog = watchdog();
+        // `dev.example.com.` and `one.two.example.com.` are wildcard parents at
+        // depths 3 and 4. `other.example.com.` and `x.y.example.com.` are not
+        // wildcard parents, and sit at exactly those same depths.
+        let z = zone(vec![
+            spec("*.dev", "A", &["203.0.113.50"]),
+            spec("*.one.two", "A", &["203.0.113.51"]),
+        ]);
+
+        for (name, depth) in [("q.other.example.com.", 3), ("q.x.y.example.com.", 4)] {
+            for qtype in [RecordType::A, RecordType::AAAA, RecordType::ANY] {
+                assert_eq!(
+                    z.lookup(&lower(name), qtype),
+                    Answer::NxDomain,
+                    "{name}'s parent is at depth {depth}, where this zone does \
+                     hold a wildcard — but not at *that* name. Coverage read off \
+                     the depth bitmap alone makes it exist, and with it almost \
+                     every name in the zone"
+                );
+            }
+        }
+
+        // The other direction, so this cannot be satisfied by covering nothing.
+        for (name, depth) in [("q.dev.example.com.", 3), ("q.one.two.example.com.", 4)] {
+            assert_eq!(
+                z.lookup(&lower(name), RecordType::AAAA),
+                Answer::NoData,
+                "{name} IS under the wildcard parent at depth {depth} and must \
+                 exist for every type"
+            );
+        }
+    }
+
+    // ------------------------------------------------- source-level guards
+    //
+    // Two contracts of this issue are properties of the *source*, not of any
+    // answer, and both are invisible to every behavioural test in the tree. They
+    // are checked against `include_str!` of this module, so they cost nothing at
+    // runtime and fail at the moment the source stops holding them.
+
+    /// The text of this module, read at compile time.
+    const THIS_MODULE: &str = include_str!("zone.rs");
+
+    /// Scenario: not a behaviour — AC-9 of the VEGA-083 ruling.
+    ///
+    /// Three `#[ignore]`d tests below pin RFC 4592 / RFC 2308 non-conformance
+    /// that VEGA-083 must **not** fix: empty non-terminals (VEGA-006), the
+    /// closest-encloser rule (VEGA-009), and the empty non-terminal a wildcard
+    /// implies at its own parent (VEGA-006 again). The ruling traces by hand
+    /// that all three stay red under the mandated diff — the third structurally,
+    /// because RFC 4592 §3.3.1 makes a wildcard's parent a proper ancestor of
+    /// the names it covers and the probe window is capped at the query's parent
+    /// depth, so a wildcard can never declare its own parent covered.
+    ///
+    /// If one of them turns green, the change went outside its fence and the
+    /// change is wrong, not the test. The cheapest way to hide that is to edit
+    /// or drop an `ignore` reason while rewriting the tests around it, so the
+    /// reasons are pinned verbatim here. The expected text is spliced from
+    /// `concat!` fragments on purpose: a literal copy would match itself in
+    /// `THIS_MODULE` and the guard would pass against a deleted attribute.
+    #[test]
+    fn the_three_rfc_bugs_this_fix_must_not_touch_are_still_ignored_with_their_reasons() {
+        let expected: [(&str, &str); 3] = [
+            (
+                "an_empty_non_terminal_is_nodata_not_nxdomain",
+                concat!(
+                    "BUG: empty non-terminals answer NXDOMAIN instead of NODATA ",
+                    "(RFC 2308 s2.2.1)"
+                ),
+            ),
+            (
+                "a_wildcard_does_not_apply_below_a_name_that_exists",
+                concat!(
+                    "BUG: a wildcard is applied below a name that exists ",
+                    "(RFC 4592 s3.3.1)"
+                ),
+            ),
+            (
+                "the_parent_of_a_wildcard_is_not_nxdomain",
+                concat!(
+                    "BUG: an empty non-terminal created by a wildcard is ",
+                    "NXDOMAIN too"
+                ),
+            ),
+        ];
+
+        let lines: Vec<&str> = THIS_MODULE.lines().collect();
+        for (name, reason) in expected {
+            let needle = format!("fn {name}(");
+            let at = lines
+                .iter()
+                .position(|line| line.contains(&needle))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} is gone from this module. It pins a known RFC \
+                         defect that VEGA-083 is fenced away from; deleting it \
+                         is how that fence stops being checked"
+                    )
+                });
+            let attribute = format!("#[ignore = \"{reason}\"]");
+            assert!(
+                lines[at.saturating_sub(3)..at]
+                    .iter()
+                    .any(|line| line.trim() == attribute),
+                "{name} is no longer `{attribute}`. Either it turned green — in \
+                 which case the change went outside VEGA-083's fence and the \
+                 change is wrong — or its reason drifted, which is how the next \
+                 reader loses the RFC citation"
+            );
+        }
+    }
+
+    /// Scenario: not a behaviour — AC-10 of the VEGA-083 ruling.
+    ///
+    /// `LowerName::num_labels()` is documented as counting labels *discounting*
+    /// a leading `*`, while `Name::trim_to` indexes raw labels. Mixing the two
+    /// shifts every wildcard probe one label off for any name whose leftmost
+    /// label is an asterisk, which is four silent wrong answers on the
+    /// authoritative path (VEGA-065). The ban is stated in the doc comment on
+    /// `label_count`; this is what makes it a check rather than a hope.
+    ///
+    /// The needle is spliced so that the assertion cannot match itself.
+    #[test]
+    fn the_banned_label_counting_function_is_not_used_in_this_module() {
+        let needle = concat!("num_", "labels");
+        let offenders: Vec<(usize, &str)> = THIS_MODULE
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(needle))
+            .filter(|(_, line)| {
+                // Comments explaining the ban are the point; code is not.
+                let trimmed = line.trim_start();
+                !(trimmed.starts_with("//") || trimmed.starts_with('*'))
+            })
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "`{needle}` is banned in this module — it counts a leading asterisk \
+             differently from `trim_to`, which is the index space the wildcard \
+             depth bitmap uses. Use `label_count`. Found at {offenders:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Known bugs, written against the RFC. These fail today and are ignored so
     // the suite stays green until the behaviour is fixed.
     //
     // VEGA-065 NOTE — DO NOT UN-IGNORE THESE. They pin RFC 4592 / RFC 2308
-    // non-conformance owned by VEGA-006, VEGA-009 and VEGA-010 and fixed by
-    // VEGA-032 (the zone data model rewrite), not by bounding the wildcard
-    // walk. VEGA-065 is strictly behaviour-preserving, so if one of them turns
-    // green the walk changed behaviour and the change is wrong. Fix the walk,
-    // not the test.
+    // non-conformance owned by VEGA-006 and VEGA-009 and fixed by VEGA-032 (the
+    // zone data model rewrite), not by bounding the wildcard walk. VEGA-065 is
+    // strictly behaviour-preserving, so if one of them turns green the walk
+    // changed behaviour and the change is wrong. Fix the walk, not the test.
+    //
+    // VEGA-083 NOTE — these stay red under it too, and it is NOT
+    // behaviour-preserving: it turns NXDOMAIN into NODATA for names a wildcard
+    // covers. The empty-non-terminal zone holds no wildcards, so it makes zero
+    // probes; the wildcard-below-an-existing-name case is answered from the
+    // `Found` path, which VEGA-083 does not touch; and a wildcard can never
+    // declare its own parent covered, because RFC 4592 §3.3.1 makes that parent
+    // a proper ancestor of the names it covers and `wildcard_window` caps the
+    // walk at the query's parent depth. That third one is structural, not luck.
+    // The `ignore` reasons are pinned by
+    // `the_three_rfc_bugs_this_fix_must_not_touch_are_still_ignored_with_their_reasons`.
+    //
+    // (VEGA-010 used to be on this list. It was the same defect as VEGA-083 seen
+    // through another QTYPE, and closed with it.)
     // -----------------------------------------------------------------------
 
     #[test]

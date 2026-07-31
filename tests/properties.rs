@@ -137,6 +137,40 @@ fn is_wildcard(name: &str) -> bool {
     name == "*" || name.starts_with("*.")
 }
 
+/// Raw label count, asterisks included — the index space `Name::trim_to` uses,
+/// and deliberately not `num_labels()`. See
+/// `hickorys_num_labels_discounts_a_leading_asterisk_but_trim_to_does_not`.
+fn label_count(name: &LowerName) -> usize {
+    name.iter().len()
+}
+
+/// Does a *source of synthesis* (RFC 4592 §3.3.1) exist for `name` in `cfg`?
+///
+/// Derived from the configuration, never from the `Zone` under test: this is the
+/// oracle that decides which of the differential's disagreements are the one
+/// permitted transition, so an implementation is not allowed a vote in it.
+///
+/// A source of synthesis for `name` is `*.<encloser>` for some proper ancestor
+/// `<encloser>` of `name`. Vega stores such an entry under the encloser itself,
+/// so the test is: the wildcard's parent is an ancestor of `name`, and a
+/// *proper* one — RFC 4592 §3.3.1 makes a wildcard's parent a proper ancestor of
+/// every name it covers, which is why `*.apps` never covers `apps` itself.
+fn has_a_source_of_synthesis(cfg: &ZoneConfig, name: &LowerName) -> bool {
+    cfg.records
+        .iter()
+        .filter(|spec| is_wildcard(&spec.name))
+        .any(|spec| {
+            let encloser = spec
+                .name
+                .trim()
+                .strip_prefix('*')
+                .unwrap_or("")
+                .trim_start_matches('.');
+            let parent = lower(&qualify(encloser));
+            parent.zone_of(name) && label_count(&parent) < label_count(name)
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Properties
 // ---------------------------------------------------------------------------
@@ -718,11 +752,35 @@ proptest! {
     /// must return the same `Answer` — same variant, same owner names, same
     /// TTLs, same rdata — as a naive `base_name()` walk over the same zone.
     ///
+    /// Scenario: The bounded walk agrees with the naive walk on every zone and
+    /// every name
+    /// features/wildcards.feature:460
+    ///
     /// This is the property that would have rejected the proposed patch: it
     /// derived probe depths from `LowerName::num_labels()`, which discounts a
     /// leading asterisk, while probing with `Name::trim_to`, which does not, so
     /// it answered NXDOMAIN for four shapes the naive walk answers. The
     /// generators put asterisks in both the zone and the query on purpose.
+    ///
+    /// VEGA-083 (AC-8) — MONOTONICITY, PROVED RATHER THAN ASSERTED. That issue
+    /// is the first change to this walk that is *not* behaviour-preserving: a
+    /// name with a source of synthesis but no RRset of the queried type moves
+    /// from NXDOMAIN to NODATA (RFC 1034 §4.3.2 step 3(c), RFC 2308 §2.2). The
+    /// naive reference is still the pre-VEGA-065 walk and must never be updated;
+    /// instead the oracle permits **exactly one** transition and nothing else:
+    ///
+    ///   * `NxDomain` -> `NoData`, and only where a source of synthesis exists
+    ///     for the queried name, decided from the config by
+    ///     `has_a_source_of_synthesis` rather than by the code under test;
+    ///   * every other difference fails, including any change to a `Found`
+    ///     answer's owner name, TTL or rdata, and including a `NoData` that
+    ///     appears where nothing covers the name — which is the depths-alone
+    ///     shortcut (AC-5) caught mechanically, over generated zones, rather
+    ///     than by the handful of names an example test can name.
+    ///
+    /// The transition is also *required* where it applies, so this direction of
+    /// the property is the fix itself and not merely permission for it. That is
+    /// what lets a reviewer trust the diff without re-deriving §6.2 by hand.
     #[test]
     fn the_wildcard_walk_agrees_with_a_naive_base_name_walk(
         cfg in walk_zone_config(),
@@ -736,17 +794,36 @@ proptest! {
 
         let actual = zone.lookup(&queried, qtype);
         let expected = naive.lookup(&queried, qtype);
+        let zone_shape = cfg.records.iter()
+            .map(|r| format!("{} {}", r.name, r.record_type))
+            .collect::<Vec<_>>();
 
-        prop_assert_eq!(
-            canonical(&actual),
-            canonical(&expected),
-            "{} {} disagreed with the naive walk\n  zone: {:?}\n  got:      {:?}\n  expected: {:?}",
-            name,
-            qtype,
-            cfg.records.iter().map(|r| format!("{} {}", r.name, r.record_type)).collect::<Vec<_>>(),
-            actual,
-            expected
-        );
+        if matches!(expected, Answer::NxDomain) && has_a_source_of_synthesis(&cfg, &queried) {
+            // The one permitted transition, and here it is mandatory.
+            prop_assert_eq!(
+                canonical(&actual),
+                canonical(&Answer::NoData),
+                "{} {} has a source of synthesis, so RFC 1034 §4.3.2 step 3(c) \
+                 forbids the name error: the answer must be NODATA\n  zone: {:?}\n  got: {:?}",
+                name,
+                qtype,
+                zone_shape,
+                actual
+            );
+        } else {
+            prop_assert_eq!(
+                canonical(&actual),
+                canonical(&expected),
+                "{} {} disagreed with the naive walk, and not by the one \
+                 transition VEGA-083 permits (NXDOMAIN -> NODATA for a name a \
+                 wildcard covers)\n  zone: {:?}\n  got:      {:?}\n  expected: {:?}",
+                name,
+                qtype,
+                zone_shape,
+                actual,
+                expected
+            );
+        }
     }
 
     /// INVARIANT (VEGA-065): the walk's cost is a property of the zone, not of
@@ -806,6 +883,81 @@ proptest! {
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VEGA-083 — the name-error determination, as an executable law.
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// INVARIANT (RFC 1034 §4.3.2 step 3(c)): for a name with no CNAME at it and
+    /// none synthesised for it, whether the answer is a name error is a function
+    /// of **the name alone** and never of the QTYPE.
+    ///
+    /// Scenario: For a name with no CNAME, the rcode is a function of the name alone
+    /// features/zone-lookup.feature:286
+    ///
+    /// This is the strongest single conformance statement in the suite, and it
+    /// is the one VEGA-032 must not break when it throws the data model away.
+    /// Step 3(c) is unusually explicit about which branch sets the error:
+    ///
+    /// > If the "*" label does not exist, check whether the name we are looking
+    /// > for is the original QNAME … set an authoritative name error in the
+    /// > response and exit. … If the "*" label does exist, match RRs at that
+    /// > node against QTYPE. If any match, copy them into the answer section …
+    /// > Go to step 6.
+    ///
+    /// The error is set only when the node does not exist. Nothing in that
+    /// branch mentions QTYPE, and step 6 is an exit with an empty answer section
+    /// and no error. So a server in which QTYPE reaches the rcode — as Vega's
+    /// did for AAAA and again, through entirely different code, for ANY — is
+    /// wrong by construction rather than by accident, and the two halves cannot
+    /// be fixed independently.
+    ///
+    /// SCOPE. CNAME-free only, by RFC 1034 §3.6.2: chasing an alias legitimately
+    /// lets the *target's* status reach the rcode, so a name with a CNAME at it
+    /// can answer differently for different types without any of it being a
+    /// defect. The scope is taken through `Zone::lookup(_, CNAME)`, which is
+    /// wildcard-aware, so it excludes a CNAME synthesised at a covered name as
+    /// well as one written there.
+    ///
+    /// ANY is in the list on purpose. RFC 8482 §4.1/§4.2 change what goes in the
+    /// answer section and license no rcode change, so an implementation in which
+    /// the existence determination for ANY is *different code* from the one for
+    /// AAAA cannot satisfy this property except by coincidence.
+    #[test]
+    fn the_rcode_of_a_cname_free_name_does_not_depend_on_the_qtype(
+        cfg in zone_config(),
+        name in query_name(),
+    ) {
+        let _watchdog = testutil::arm(WATCHDOG);
+        let Ok(zone) = Zone::from_config(&cfg) else { return Ok(()); };
+        let queried = lower(&name);
+
+        prop_assume!(!matches!(zone.lookup(&queried, RecordType::CNAME), Answer::Records(_)));
+
+        let types = [
+            RecordType::A, RecordType::AAAA, RecordType::TXT, RecordType::MX,
+            RecordType::SRV, RecordType::NS, RecordType::SOA, RecordType::ANY,
+        ];
+        let (denied, existed): (Vec<RecordType>, Vec<RecordType>) = types
+            .into_iter()
+            .partition(|t| matches!(zone.lookup(&queried, *t), Answer::NxDomain));
+
+        prop_assert!(
+            denied.is_empty() || existed.is_empty(),
+            "{} is a name error for {:?} and exists for {:?}. RFC 1034 §4.3.2 \
+             step 3(c) conditions the name error on the `*` node's existence and \
+             on nothing else, so one query cannot deny a name that another \
+             answers\n  zone: {:?}",
+            name,
+            denied,
+            existed,
+            cfg.records.iter().map(|r| format!("{} {}", r.name, r.record_type)).collect::<Vec<_>>()
+        );
     }
 }
 
@@ -954,11 +1106,16 @@ proptest! {
     ///     `Resolution::NxDomain` when no wildcard of that type matches.
     ///
     /// `features/zone-lookup.feature:174` ("An ANY query does not synthesise a
-    /// wildcard answer") currently writes this down as intended behaviour, with
-    /// the code as its justification. It is a bug, not a contract, and the
-    /// scenario should be inverted when VEGA-083 is fixed.
+    /// wildcard answer") wrote this down as intended behaviour, with the code as
+    /// its justification. It was a bug, not a contract; the scenario has been
+    /// inverted and split (features/zone-lookup.feature:230-286) and this test is
+    /// no longer `#[ignore]`d — it is the filed regression test for VEGA-083 and
+    /// it must be green when the fix lands.
+    ///
+    /// Scenario: A wildcard-covered name exists for every type, not only the one
+    /// the wildcard carries
+    /// features/zone-lookup.feature:240
     #[test]
-    #[ignore = "BUG VEGA-083: a wildcard-covered name answers NXDOMAIN for any type the wildcard does not carry (RFC 4592 s2.2, RFC 2308 s2.2.1)"]
     fn a_wildcard_covered_name_exists_for_every_type(
         cfg in zone_config(),
         name in query_name(),
@@ -986,6 +1143,22 @@ proptest! {
         });
         prop_assume!(covered);
 
+        // AC-2, HALF-APPLIED ON PURPOSE — rust-dev finishes this line.
+        //
+        // The ruling deletes `Zone::has_name` and replaces it with
+        // `Zone::exists` (§5.5): a `pub` predicate meaning "is there a node
+        // here" sitting next to one meaning "must this be answered NOERROR" is
+        // the footgun that produced this bug, so the narrow one does not survive
+        // as public API. This assertion becomes, with its message unchanged:
+        //
+        //     zone.exists(&queried),
+        //
+        // It is left as `has_name` only because `Zone::exists` does not exist
+        // yet: naming it here would fail to compile the whole test binary, and a
+        // binary that does not build cannot show rust-dev a single one of the
+        // other tests failing for the right reason — nor can `cargo clippy
+        // --all-targets` run. Change it in the fix commit; the compiler will
+        // point at this line the moment `has_name` is removed.
         prop_assert!(
             zone.has_name(&queried),
             "{name} is synthesised from a wildcard, so it exists (RFC 4592 §2.2); \

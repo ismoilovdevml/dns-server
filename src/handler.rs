@@ -768,7 +768,8 @@ mod tests {
         }
     }
 
-    /// Scenario: An ANY query at a CNAME owner returns the CNAME
+    /// Scenario: An ANY query does not chase a CNAME
+    /// features/zone-lookup.feature:194
     /// features/cname.feature — RFC 8482 §4.2
     ///
     /// Synthesis is only permitted when there is no CNAME at the owner name.
@@ -962,12 +963,14 @@ mod tests {
         assert_eq!(r.answers[0].record_type(), RecordType::SOA);
     }
 
-    /// Scenario: An ANY query is answered with a single synthetic HINFO
-    /// features/zone-lookup.feature:174
+    /// Scenario: An ANY query at the apex returns the HINFO and not the zone SOA
+    /// features/zone-lookup.feature:169
     ///
     /// RFC 8482 §4.1. This used to return the whole node — every RRset at the
     /// name plus the SOA — which made ANY the largest answer we could produce
-    /// from the smallest query anyone could send.
+    /// from the smallest query anyone could send. Nothing in RFC 8482 licenses
+    /// adding the SOA to the *answer* section; RFC 1034 §4.3.2 puts it in
+    /// *authority*, and only on a negative answer.
     #[test]
     fn an_apex_any_query_is_answered_with_one_synthetic_hinfo() {
         let h = handler(
@@ -992,11 +995,13 @@ mod tests {
         assert!(!types.contains(&RecordType::SOA), "{types:?}");
     }
 
-    /// Scenario: An ANY query for a name that does not exist is NXDOMAIN
-    /// features/zone-lookup.feature:174
+    /// Scenario: A name with no source of synthesis is still NXDOMAIN
+    /// features/zone-lookup.feature:268
     ///
     /// Kills a mutant that answers every ANY query with the HINFO regardless of
     /// whether the name exists, which would make the zone claim every name in it.
+    /// Also the negative control for VEGA-083: the existence gate got *wider*
+    /// there, and this is the half that must not move.
     #[test]
     fn an_any_query_for_a_missing_name_is_nxdomain() {
         let h = handler(vec![spec("www", "A", &["203.0.113.10"])], false);
@@ -1111,11 +1116,24 @@ mod tests {
         // Guards the `Answer::Records(records) if records.is_empty()` arm: a
         // NOERROR with an empty answer section must always be cacheable, which
         // means it must always carry the zone SOA.
-        let h = handler(vec![spec("www", "A", &["203.0.113.20"])], true);
+        //
+        // The wildcard-covered rows are VEGA-083's: RFC 2308 §3 requires the SOA
+        // on a NODATA answer exactly as it does on a name error, so turning
+        // those answers from NXDOMAIN into NODATA must not drop it. An
+        // uncacheable NODATA is a different bug, not a fix.
+        let h = handler(
+            vec![
+                spec("www", "A", &["203.0.113.20"]),
+                spec("*.dev", "A", &["203.0.113.50"]),
+            ],
+            true,
+        );
         for (name, qtype) in [
             ("www.example.com.", RecordType::AAAA),
             ("www.example.com.", RecordType::MX),
             ("example.com.", RecordType::TXT),
+            ("x.dev.example.com.", RecordType::AAAA),
+            ("x.dev.example.com.", RecordType::SRV),
             ("myip.example.com.", RecordType::AAAA),
             ("version.example.com.", RecordType::A),
             ("hello.example.com.", RecordType::MX),
@@ -1172,6 +1190,218 @@ mod tests {
                 resolved.answers.len()
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // VEGA-083 — the rcode at a wildcard-covered name.
+    //
+    // Spec: features/zone-lookup.feature, sections "ANY QUERY" and
+    //       "WILDCARD-COVERED NAMES".
+    // Ruling: .claude/backlog/decisions/VEGA-083-any-at-a-wildcard-covered-name.md
+    //
+    // The handler owns the rcode, so this is where the law lands: RFC 1034
+    // §4.3.2 step 3(c) sets the name error only when the `*` node does not
+    // exist, and that branch is not conditioned on QTYPE anywhere. RFC 8482
+    // §4.1/§4.2 change the *answer section* for ANY and license no rcode change,
+    // so the existence determination for ANY must be the same computation as the
+    // one for AAAA — which, before this issue, it was not: ANY was gated on a
+    // raw node-set lookup that knew nothing about synthesis.
+    // -----------------------------------------------------------------------
+
+    /// Scenario: An ANY query returns one synthetic HINFO, not the whole node
+    /// features/zone-lookup.feature:154
+    ///
+    /// The apex case is covered above; this is the ordinary-name case, and it
+    /// carries the two negative assertions that make either of them mean
+    /// anything. Without "no A" and "no TXT" the scenario passes against an
+    /// implementation that returns the HINFO *and* the node, which is the
+    /// amplification VEGA-002 closed rather than the fix.
+    #[test]
+    fn an_any_query_returns_one_synthetic_hinfo_and_not_the_node() {
+        let h = handler(
+            vec![
+                spec("multi", "A", &["203.0.113.60"]),
+                spec("multi", "TXT", &["\"hello\""]),
+            ],
+            false,
+        );
+        let r = h.resolve(&lower("multi.example.com."), RecordType::ANY, client());
+        assert_eq!(r.code, ResponseCode::NoError);
+        assert_eq!(r.answers.len(), 1, "{:?}", r.answers);
+        assert_eq!(r.answers[0].record_type(), RecordType::HINFO);
+        let RData::HINFO(hinfo) = &r.answers[0].data else {
+            panic!("expected HINFO, got {:?}", r.answers[0].data);
+        };
+        assert_eq!(
+            &*hinfo.cpu, b"RFC8482",
+            "RFC 8482 §6 asks for a recognisable CPU field so operators can tell \
+             a minimal-ANY answer from a real HINFO"
+        );
+        let types: Vec<_> = r.answers.iter().map(Record::record_type).collect();
+        assert!(
+            !types.contains(&RecordType::A),
+            "the node's A came back beside the HINFO: {types:?}"
+        );
+        assert!(
+            !types.contains(&RecordType::TXT),
+            "the node's TXT came back beside the HINFO: {types:?}"
+        );
+    }
+
+    /// Scenario: An ANY query at an existing name that holds no records still
+    /// returns the HINFO
+    /// features/zone-lookup.feature:181
+    ///
+    /// Ruled substantively by the architect, because both readings of RFC 8482
+    /// are conformant: §4.2 conditions synthesis on the absence of a CNAME at
+    /// the QNAME and on nothing else, so the shape of an ANY response does not
+    /// depend on what the node holds. Taking §4.1's "subset" reading — the empty
+    /// set for an empty node, i.e. a real NODATA — would make it depend on
+    /// exactly that, and uniform-and-bounded is the whole value of §4.2 here.
+    #[test]
+    fn an_any_query_at_a_name_that_holds_no_records_still_returns_the_hinfo() {
+        let h = handler(vec![], false);
+        let r = h.resolve(&lower("example.com."), RecordType::ANY, client());
+        assert_eq!(r.code, ResponseCode::NoError);
+        assert_eq!(r.answers.len(), 1, "{:?}", r.answers);
+        assert_eq!(r.answers[0].record_type(), RecordType::HINFO);
+    }
+
+    /// Scenario: An ANY query at a wildcard-covered name is NOERROR with the RFC
+    /// 8482 HINFO
+    /// features/zone-lookup.feature:257
+    ///
+    /// The half the issue was filed as. It is the least important half — ANY is
+    /// rare and increasingly refused outright — but it is the one where the two
+    /// existence determinations were visibly different code.
+    #[test]
+    fn an_any_query_at_a_wildcard_covered_name_is_noerror_with_the_hinfo() {
+        let h = handler(vec![spec("*.dev", "A", &["203.0.113.50"])], false);
+        let r = h.resolve(&lower("x.dev.example.com."), RecordType::ANY, client());
+        assert_eq!(
+            r.code,
+            ResponseCode::NoError,
+            "a name with a source of synthesis exists (RFC 4592 §3.3.1), and RFC \
+             8482 licenses no rcode change"
+        );
+        assert_eq!(r.answers.len(), 1, "{:?}", r.answers);
+        assert_eq!(r.answers[0].record_type(), RecordType::HINFO);
+    }
+
+    /// Scenario: An ANY query at a wildcard-covered CNAME returns the
+    /// synthesised CNAME
+    /// features/zone-lookup.feature:203
+    ///
+    /// An unfiled defect the architect found at the same site, and the reason
+    /// the fix has an *order* and not just a predicate: the existence gate ran
+    /// before the CNAME probe, and the CNAME probe goes through `Zone::lookup`
+    /// and is therefore already wildcard-aware. So the branch was internally
+    /// inconsistent — it could synthesise the CNAME but refused to admit the
+    /// name existed — and a wildcard CNAME answered NXDOMAIN while holding the
+    /// answer it owed. RFC 4592 §3.4.3 and RFC 8482 §4.2 violated at once.
+    ///
+    /// Ordering the branch `exists` → CNAME → HINFO closes it. A fix that gets
+    /// the predicate right but leaves the order alone still fails this.
+    #[test]
+    fn an_any_query_at_a_wildcard_covered_cname_returns_the_synthesised_cname() {
+        let h = handler(
+            vec![
+                spec("*.dev", "CNAME", &["origin.example.com."]),
+                spec("origin", "A", &["203.0.113.20"]),
+            ],
+            false,
+        );
+        let r = h.resolve(&lower("x.dev.example.com."), RecordType::ANY, client());
+        assert_eq!(r.code, ResponseCode::NoError);
+        assert_eq!(r.answers.len(), 1, "{:?}", r.answers);
+        assert_eq!(
+            r.answers[0].record_type(),
+            RecordType::CNAME,
+            "RFC 8482 §4.2 forbids synthesising a HINFO over a CNAME, and the \
+             CNAME is synthesised at a covered name like any other type"
+        );
+        assert_eq!(
+            r.answers[0].name,
+            Name::from(lower("x.dev.example.com.")),
+            "a synthesised answer owned by `*.dev.example.com.` is discarded by \
+             every resolver that receives it"
+        );
+    }
+
+    /// Scenario: For a name with no CNAME, the rcode is a function of the name
+    /// alone
+    /// features/zone-lookup.feature:286
+    ///
+    /// AC-1 as an example, at the layer that owns the rcode. The property-test
+    /// form over generated zones is
+    /// `tests/properties.rs::the_rcode_of_a_cname_free_name_does_not_depend_on_the_qtype`;
+    /// this one names the exact packets that were observed on the wire.
+    ///
+    /// Asserted as "every QTYPE agrees with A" rather than "every QTYPE is
+    /// NOERROR", because the claim is the *invariance*, not the value: a server
+    /// that answered NXDOMAIN to all six would be wrong in a different way, and
+    /// the positive control above is what pins the value.
+    #[test]
+    fn the_rcode_at_a_wildcard_covered_name_does_not_depend_on_the_qtype() {
+        let h = handler(vec![spec("*.dev", "A", &["203.0.113.50"])], false);
+        let name = lower("x.dev.example.com.");
+
+        let carried = h.resolve(&name, RecordType::A, client());
+        assert_eq!(
+            carried.code,
+            ResponseCode::NoError,
+            "the wildcard must still answer the type it carries"
+        );
+
+        // AAAA first: it is what a dual-stack client sends alongside every A, so
+        // it is the one that poisons a resolver's cache during ordinary traffic.
+        for qtype in [
+            RecordType::AAAA,
+            RecordType::TXT,
+            RecordType::MX,
+            RecordType::SRV,
+            RecordType::ANY,
+        ] {
+            let r = h.resolve(&name, qtype, client());
+            assert_eq!(
+                r.code, carried.code,
+                "{qtype} at x.dev.example.com. answered {:?} where A answers \
+                 {:?}. RFC 1034 §4.3.2 step 3(c) conditions the name error on \
+                 the `*` node's existence and on nothing else, so the rcode may \
+                 not depend on the QTYPE",
+                r.code, carried.code
+            );
+        }
+    }
+
+    /// Scenario: Coverage is decided by the wildcard's own parent, not by its
+    /// depth
+    /// features/zone-lookup.feature:276
+    ///
+    /// The same discrimination as
+    /// `zone::tests::coverage_is_decided_by_the_wildcard_parent_not_by_its_depth`,
+    /// carried through to the rcode: the depths-alone shortcut does not just
+    /// mislabel an enum, it makes the server answer NOERROR for names it is
+    /// authoritatively denying today.
+    #[test]
+    fn a_name_whose_parent_merely_shares_a_depth_with_a_wildcard_is_still_nxdomain() {
+        let h = handler(vec![spec("*.dev", "A", &["203.0.113.50"])], false);
+        for qtype in [RecordType::A, RecordType::AAAA, RecordType::ANY] {
+            let r = h.resolve(&lower("q.other.example.com."), qtype, client());
+            assert_eq!(
+                r.code,
+                ResponseCode::NXDomain,
+                "`other.example.com.` sits at the same depth as the wildcard's \
+                 parent but is not it, so {qtype} there is a real name error"
+            );
+        }
+        // Anti-vacuity: the covered sibling must exist, or this passes against a
+        // server that never covers anything.
+        assert_eq!(
+            h.resolve(&lower("q.dev.example.com."), RecordType::AAAA, client())
+                .code,
+            ResponseCode::NoError
+        );
     }
 
     /// A single-question UDP request for `name`/`qtype`, as `dispatch` sees it.

@@ -205,6 +205,9 @@ fn a_deep_name_does_not_cost_more_than_a_shallow_one() {
 /// BUDGET (CLAUDE.md, "Performance budget"): **no `O(n)` scan over the record
 /// map per query, for any query type.**
 ///
+/// Scenario: An ANY lookup costs the same on a 100,000-record zone as on a small one
+/// features/zone-lookup.feature:375
+///
 /// `Zone::resolve`'s ANY branch is
 /// `for ((owner, _), records) in &self.exact { if owner == name { … } }` — a
 /// linear walk of every record set in the zone, with a `LowerName` comparison
@@ -240,20 +243,39 @@ fn a_deep_name_does_not_cost_more_than_a_shallow_one() {
 /// The fix is the record-map re-key (VEGA-002): with owner-major keying, "every
 /// RRset at this name" is a map hit rather than a scan. Until then the budget
 /// belongs here, failing, so it is not rediscovered a third time.
+///
+/// # VEGA-083 (AC-7): the arm is deleted rather than re-keyed
+///
+/// The scan carried the existence defect under that issue's ruling at a third
+/// `pub`-reachable site — `else if self.names.contains(name)` decided NODATA vs
+/// NXDOMAIN from the node set, so a wildcard-covered name got a name error here
+/// too. Fixing it in place means either a slower scan or VEGA-032's re-key, so
+/// it goes: RFC 1035 §3.2.3 makes ANY a QTYPE that can never key the record map,
+/// and RFC 8482 makes the response policy the *responder's* business, so the
+/// zone layer has nothing to say about ANY beyond whether the name exists.
+///
+/// `Zone::lookup(_, ANY)` therefore returns `NoData` for every existing name and
+/// `NxDomain` otherwise — hence the assertions below, which were
+/// `Answer::Records(_)`. Flat cost across zone sizes follows by construction.
+/// **This test must be un-`#[ignore]`d in the commit that lands the fix**; it is
+/// an acceptance criterion, not a bonus. It stays ignored until then because it
+/// is a release-mode budget and, on the unfixed tree, its 600 ANY lookups over a
+/// 100k-record zone are minutes of debug-build scanning.
 #[test]
-#[ignore = "BUG: Zone::lookup(_, ANY) scans every record set in the zone; 1.83 ms at 100k records (CLAUDE.md performance budget, VEGA-002)"]
+#[ignore = "VEGA-083 AC-7: un-ignore in the commit that deletes the O(zone) ANY arm; until then Zone::lookup(_, ANY) scans every record set, 1.83 ms at 100k records (CLAUDE.md performance budget)"]
 fn an_any_lookup_does_not_scan_the_whole_record_map() {
     let _watchdog = testutil::arm(WATCHDOG);
     let z = wildcard_zone();
     let name = lower("h1.example.com.");
 
-    // Both find the same record set at the same name, so the only difference
-    // measured is how the lookup gets there.
+    // The same existing name either way, so the only difference measured is how
+    // the lookup gets there.
     assert!(matches!(z.lookup(&name, RecordType::A), Answer::Records(_)));
-    assert!(matches!(
+    assert_eq!(
         z.lookup(&name, RecordType::ANY),
-        Answer::Records(_)
-    ));
+        Answer::NoData,
+        "the zone layer reports existence for ANY and never enumerates the node"
+    );
 
     let a = best_of(3, 200, || {
         std::hint::black_box(z.lookup(std::hint::black_box(&name), RecordType::A));
