@@ -201,13 +201,15 @@ fn record_list_and_get_filter_correctly() {
     run(dir.path(), &["record", "add", "www", "TXT", "\"hello\""]);
     run(dir.path(), &["record", "add", "api", "A", "203.0.113.20"]);
 
+    // Two more than this test adds: `init` writes the apex NS RRset and its
+    // glue A, because VEGA-032 S5 refuses a zone without an apex NS.
     let all = run(dir.path(), &["record", "list", "--json"]);
-    assert_eq!(json(&all)["count"], 3);
+    assert_eq!(json(&all)["count"], 5);
 
     let by_type = run(dir.path(), &["record", "list", "--type", "a", "--json"]);
     assert_eq!(
         json(&by_type)["count"],
-        2,
+        3,
         "type filter is case-insensitive"
     );
 
@@ -254,7 +256,12 @@ fn record_delete_removes_values_and_whole_sets() {
     assert_eq!(json(&whole_set)["change"], "removed");
 
     let list = run(dir.path(), &["record", "list", "--json"]);
-    assert_eq!(json(&list)["count"], 0);
+    assert_eq!(
+        json(&list)["count"],
+        2,
+        "the apex NS RRset and its glue that `init` wrote survive; only what \
+         this test added was deleted"
+    );
 
     // Deleting something absent is not an error.
     let absent = run(dir.path(), &["record", "delete", "ghost", "A", "--json"]);
@@ -344,8 +351,18 @@ fn check_validates_and_reports_the_zone() {
     let value = json(&output);
     assert_eq!(value["ok"], true);
     assert_eq!(value["zone"]["origin"], "example.com");
-    assert_eq!(value["zone"]["records"], 1);
-    assert_eq!(value["zone"]["soa"], true);
+    // `www A`, plus the apex NS RRset and its glue address that `init` now
+    // writes because VEGA-032 S5 refuses a zone without an apex NS
+    // (RFC 1034 §4.2.1).
+    assert_eq!(value["zone"]["records"], 3);
+    assert!(
+        value["zone"]["soa"]
+            .as_str()
+            .is_some_and(|soa| soa.contains("hostmaster.example.com.")),
+        "the SOA is reported in full now that it is mandatory: {}",
+        value["zone"]["soa"]
+    );
+    assert_eq!(value["findings"].as_array().map(Vec::len), Some(0));
 }
 
 #[test]

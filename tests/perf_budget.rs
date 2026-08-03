@@ -71,6 +71,15 @@ fn spec(name: &str, ty: &str, values: &[&str]) -> RecordSpec {
     }
 }
 
+/// The apex NS RRset every fixture here carries.
+///
+/// RFC 1034 §4.2.1 requires one and VEGA-032 S5 refuses a zone without one. One
+/// record in a hundred thousand; it is in the arena and the index like any
+/// other, and every figure below is measured with it present.
+fn apex_ns() -> RecordSpec {
+    spec("@", "NS", &["ns1.example.com."])
+}
+
 fn lower(name: &str) -> LowerName {
     let mut n: Name = name.parse().expect("fixture name parses");
     n.set_fqdn(true);
@@ -80,6 +89,7 @@ fn lower(name: &str) -> LowerName {
 /// A zone that holds at least one wildcard — the only zones VEGA-065 exposes.
 fn wildcard_zone() -> Zone {
     let mut records = vec![
+        apex_ns(),
         spec("@", "A", &["203.0.113.10", "203.0.113.11"]),
         spec("*.apps", "A", &["203.0.113.30"]),
     ];
@@ -339,7 +349,8 @@ fn an_any_lookup_does_not_scan_the_whole_record_map() {
 fn an_empty_non_terminal_costs_no_more_than_an_exact_hit() {
     let _watchdog = testutil::arm(WATCHDOG);
 
-    let mut records = Vec::with_capacity(ZONE_SIZE);
+    let mut records = vec![apex_ns()];
+    records.reserve(ZONE_SIZE);
     for i in 0..ZONE_SIZE {
         records.push(spec(
             &format!("_sip._tcp.h{i}"),
@@ -447,7 +458,11 @@ fn the_protocol_ceiling_name_does_not_cost_more_than_a_shallow_one() {
     // A root-origin zone: `origin = "."` is accepted, drives the probe window's
     // floor to zero, and is the only origin under which a 127-label name is
     // inside the zone at all.
-    let mut records = vec![spec("*", "A", &["203.0.113.1"])];
+    // The apex NS is spelled for the root here, not with `apex_ns()`: this
+    // fixture's origin is `.`, and a target under `example.com.` would be an
+    // out-of-bailiwick name server, which is legal but is not what the other
+    // fixtures carry.
+    let mut records = vec![spec("@", "NS", &["ns1."]), spec("*", "A", &["203.0.113.1"])];
     records.reserve(ZONE_SIZE);
     for i in 0..ZONE_SIZE {
         records.push(spec(
@@ -465,7 +480,15 @@ fn the_protocol_ceiling_name_does_not_cost_more_than_a_shallow_one() {
         origin: ".".to_owned(),
         default_ttl: 300,
         builtins: false,
-        soa: None,
+        soa: Some(SoaSpec {
+            mname: "ns1.".to_owned(),
+            rname: "hostmaster.".to_owned(),
+            serial: 1,
+            refresh: 3600,
+            retry: 900,
+            expire: 604_800,
+            minimum: 60,
+        }),
         records,
     })
     .expect("root-origin zone builds");
@@ -521,7 +544,8 @@ const HOSTILE_WILDCARD_DEPTHS: usize = 120;
 /// pays for every probe — is never reached. That is the difference between
 /// measuring the attack and measuring a cache hit.
 fn multi_depth_wildcard_zone(depths: usize) -> Zone {
-    let mut records = Vec::with_capacity(depths + 1);
+    let mut records = Vec::with_capacity(depths + 2);
+    records.push(apex_ns());
     records.push(spec("www", "A", &["203.0.113.20"]));
     for d in 1..=depths {
         let parent = std::iter::repeat_n("a", d).collect::<Vec<_>>().join(".");

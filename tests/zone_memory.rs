@@ -123,7 +123,12 @@ fn lower(name: &str) -> LowerName {
 }
 
 fn config(with_wildcard: bool) -> ZoneConfig {
-    let mut records = Vec::with_capacity(ZONE_SIZE + 3);
+    let mut records = Vec::with_capacity(ZONE_SIZE + 4);
+    // Mandatory since VEGA-032 S5 (RFC 1034 §4.2.1). It costs one `Rrset` and
+    // one `RData` at the apex node, which already exists — no new node, and no
+    // referral, because the apex is never a zone cut. That fixed cost is why the
+    // flat-fixture byte count below moved at S5 and the per-record cost did not.
+    records.push(spec("@", "NS", "ns1.example.com."));
     if with_wildcard {
         records.push(spec("*.dev", "A", "203.0.113.50"));
         // An empty non-terminal in the zone the negative paths are measured
@@ -346,14 +351,17 @@ const BYTES_PER_EMPTY_NON_TERMINAL: i64 = 110;
 /// the only thing that differs is the shape of the owner name.
 fn deep_config() -> ZoneConfig {
     let mut cfg = config(false);
-    cfg.records = (0..ZONE_SIZE)
-        .map(|i| {
+    // The mandatory apex NS is kept, and kept identical to the flat fixture's,
+    // so it cancels exactly in the subtraction below and the difference between
+    // the two zones is still only the shape of the owner names.
+    cfg.records = std::iter::once(spec("@", "NS", "ns1.example.com."))
+        .chain((0..ZONE_SIZE).map(|i| {
             spec(
                 &format!("_sip._tcp.h{i}"),
                 "A",
                 &format!("10.{}.{}.{}", (i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff),
             )
-        })
+        }))
         .collect();
     cfg
 }
@@ -412,13 +420,22 @@ fn empty_non_terminal_budget(flat_live: i64, unmet: &mut Vec<String>) {
     }
 }
 
-/// The flat fixture's live heap, measured at `bd4b397`, to the byte.
+/// The flat fixture's live heap, to the byte.
 ///
-/// 30,255,464 B — 28.8 MiB, 302 B per record — and it has not moved between S1
-/// and S2. The fixture is FLAT (`h{i}`), so it materialises zero empty
-/// non-terminals and S2 could not touch it; S3 deletes one `u128` **per zone**,
-/// so it must not move by more than 16 bytes either.
-const FLAT_FIXTURE_BYTES_AT_BD4B397: i64 = 30_255_464;
+/// 30,255,464 B — 28.8 MiB, 302 B per record — from S1 through **S4**. The
+/// fixture is FLAT (`h{i}`), so it materialises zero empty non-terminals and S2
+/// could not touch it; S3 deleted one `u128` per zone; S4's `cut: NodeIdx` per
+/// node landed in padding the S1 `Node` layout was already spending, so the
+/// count did not move by a byte across any of the three.
+///
+/// **Re-baselined once, at S5, by +200 B exactly.** S5 makes an apex NS RRset
+/// mandatory (RFC 1034 §4.2.1), so the fixture now declares one, and the
+/// measured delta is `size_of::<Rrset>()` (16) + `size_of::<RData>()` (184) at
+/// a node that already existed. That is a **fixture** cost, once per zone: the
+/// per-record figure is unchanged at 302 B, the node count is unchanged at
+/// 100,001, and the window below is unchanged at ±64 B, so the gate is exactly
+/// as able to see a per-node field as it was before.
+const FLAT_FIXTURE_BYTES: i64 = 30_255_664;
 
 /// How far the flat fixture may drift and still count as unmoved.
 ///
@@ -462,10 +479,10 @@ const FLAT_FIXTURE_DRIFT_BYTES: i64 = 64;
 /// field, so it is the one that has to say which build it is talking about.
 /// Skipping is announced on stdout rather than done quietly.
 fn flat_fixture_does_not_grow(flat_live: i64, unmet: &mut Vec<String>) {
-    let drift = flat_live - FLAT_FIXTURE_BYTES_AT_BD4B397;
+    let drift = flat_live - FLAT_FIXTURE_BYTES;
     println!(
-        "flat fixture heap: {flat_live} B against {FLAT_FIXTURE_BYTES_AT_BD4B397} B \
-         at bd4b397, drift {drift:+} B"
+        "flat fixture heap: {flat_live} B against {FLAT_FIXTURE_BYTES} B \
+         (S1-S4 baseline + S5's mandatory apex NS), drift {drift:+} B"
     );
     if cfg!(debug_assertions) {
         println!(
@@ -479,8 +496,8 @@ fn flat_fixture_does_not_grow(flat_live: i64, unmet: &mut Vec<String>) {
     if drift.abs() > FLAT_FIXTURE_DRIFT_BYTES {
         unmet.push(format!(
             "\"The flat 100,000-record fixture does not grow\": it is now \
-             {flat_live} B against {FLAT_FIXTURE_BYTES_AT_BD4B397} B at \
-             `bd4b397`, a drift of {drift:+} B against a window of \
+             {flat_live} B against {FLAT_FIXTURE_BYTES} B, a drift of \
+             {drift:+} B against a window of \
              ±{FLAT_FIXTURE_DRIFT_BYTES} B. This fixture materialises no empty \
              non-terminals and holds one wildcard, so the only thing S3 may \
              change here is one `u128` per ZONE. A drift of this size is \

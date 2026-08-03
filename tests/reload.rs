@@ -161,6 +161,7 @@ fn config_file(origin: Option<&str>, zone_extra: &str, server: &str, ip: &str) -
          [zone.soa]\n\
          mname = \"ns1.example.test.\"\n\
          rname = \"hostmaster.example.test.\"\n\n\
+         [[zone.records]]\nname = \"@\"\ntype = \"NS\"\nvalues = [\"ns1.example.test.\"]\n\n\
          [[zone.records]]\nname = \"www\"\ntype = \"A\"\nvalues = [\"{ip}\"]\n"
     )
 }
@@ -216,6 +217,41 @@ impl Spawn {
     fn without_config(mut self) -> Self {
         self.with_config = false;
         self
+    }
+
+    /// Start the server expecting it **not** to come up, and return its log.
+    ///
+    /// Bounded by the child's own exit rather than by a poll loop: a build
+    /// failure is reported before anything binds, so the process is gone in
+    /// milliseconds and a server that wrongly started would be caught by
+    /// `wait_with_output` never returning inside the harness timeout.
+    fn start_expecting_failure(self) -> String {
+        let dir = TempDir::new().expect("temp dir");
+        let gate = hold_spawn_gate();
+        let mut command = Command::new(bin());
+        command
+            .arg("serve")
+            .arg("--udp")
+            .arg(format!("127.0.0.1:{}", free_udp_port()))
+            .args(&self.args)
+            .current_dir(dir.path())
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for name in RESET_ENV {
+            command.env_remove(name);
+        }
+        let child = command
+            .spawn()
+            .expect("the server binary should be runnable");
+        drop(gate);
+        let out = child.wait_with_output().expect("the child exits");
+        assert!(
+            !out.status.success(),
+            "the server started with no zone to serve"
+        );
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)
     }
 
     async fn start(self) -> Vega {
@@ -1625,10 +1661,22 @@ async fn every_reload_error_body_carries_a_code_from_the_documented_set() {
     assert_eq!(forbidden_status, 403, "{forbidden}");
     assert_code(&forbidden, "forbidden");
 
-    let unconfigured = Spawn::new(String::new()).without_config().start().await;
-    let (unconfigured_status, body) = unconfigured.reload().await;
-    assert_eq!(unconfigured_status, 501, "{body}");
-    assert_code(&body, "not_configured");
+    // The `not_configured` 501 used to be reached here, by starting a server
+    // with no `--config` at all. VEGA-032 S5 makes that shape unstartable: a
+    // zone needs an SOA and an apex NS, and neither has a command-line flag, so
+    // a process with no config file has no zone to serve. The code and its 501
+    // are kept and are covered by
+    // `src/admin.rs::reload_without_a_hook_names_the_not_configured_code`;
+    // what is asserted here instead is the startup refusal itself, because that
+    // is the wire-visible half an operator meets.
+    let refused = Spawn::new(String::new())
+        .without_config()
+        .start_expecting_failure();
+    assert!(
+        refused.contains("has no SOA record") || refused.contains("has no NS record set"),
+        "a process with no config has no zone to serve, and must say which \
+         mandatory record is missing rather than starting empty:\n{refused}"
+    );
 }
 
 // ==========================================================================

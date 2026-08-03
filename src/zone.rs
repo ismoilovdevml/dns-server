@@ -37,11 +37,17 @@
 //! with a referral: the NS RRset in the authority section, in-zone glue in the
 //! additional section, AA clear.
 //!
-//! # What this module does NOT do yet
+//! Some configs are refused outright, because there is no correct way to serve
+//! them: a zone with no SOA or no apex NS RRset (RFC 1035 §5.2, RFC 1034
+//! §4.2.1), an RRset declared at two TTLs (RFC 2181 §5), a CNAME sharing its
+//! owner name (RFC 1034 §3.6.2), and an NS RRset at a wildcard (RFC 4592 §4.2).
+//! Every finding is reported in one build, because an operator fixing a config
+//! by restarting until it stops complaining makes one edit per restart. Occluded
+//! data and missing glue are the deliberate exceptions: they are a WARN and a
+//! `vega check` failure, because those configs work today and refusing them
+//! would turn a running deployment into a failed reload.
 //!
-//! This is S4 of the six commits VEGA-032 sequences. SOA and apex NS are still
-//! optional, an RRset can still carry mixed TTLs, and a CNAME can still share
-//! its owner name with another type (all S5).
+//! # What this module does NOT do
 //!
 //! `tests/arena_differential.rs` holds this file to a transcription of the
 //! implementation S1 replaced, fed a node set closed under ancestry, and permits
@@ -418,18 +424,21 @@ impl NodeFlags {
     }
 }
 
-/// One RRset, or one TTL-homogeneous run of one.
+/// One RRset.
 ///
 /// RFC 2181 §5 says every record in an RRset shares a TTL and that they are
-/// atomic, so the TTL belongs here and not once per record — that移 alone is four
+/// atomic, so the TTL belongs here and not once per record — that alone is four
 /// bytes times every record in the zone.
 ///
-/// **A run, not strictly an RRset, until S5.** Two `[[zone.records]]` blocks for
-/// one owner and type with different TTLs are merged today into a single set
-/// with mixed TTLs, which is the RFC 2181 §5 violation VEGA-061 pins and S5
-/// fixes. Until then the arena keeps them as consecutive runs of one type, in
-/// config order, so the answer is byte-identical to what the map model produced.
-/// `tests/properties.rs::an_rrset_never_mixes_ttls` stays red on purpose.
+/// **A true RRset since S5, not a TTL-homogeneous run.** Two `[[zone.records]]`
+/// blocks for one owner and type used to be merged into a single answer with
+/// mixed TTLs, which is the RFC 2181 §5 violation VEGA-061 pinned; the arena
+/// kept them as consecutive runs of one type so that the answer stayed
+/// byte-identical to the map model's. That config is now refused at build time,
+/// so there is at most one run per type and the slice
+/// [`Zone::rrsets_of`] returns is at most one long. The slice shape is kept
+/// rather than narrowed to an `Option`: it costs nothing, and RRSIG (RFC 4034
+/// §3) will want more than one entry per type at DNSSEC time.
 #[derive(Debug)]
 struct Rrset {
     /// RFC 1035 §3.2.2. Never `ANY`: §3.2.3 makes 255 a QTYPE, so it can never
@@ -512,7 +521,15 @@ pub struct Zone {
     /// separate field would be a second source of truth for one name.
     lower_origin: LowerName,
     default_ttl: u32,
-    soa: Option<Record>,
+    /// The zone's SOA. **Not an `Option` since S5**, because a zone with no SOA
+    /// fails to build (RFC 1034 §4.2.1, RFC 1035 §5.2).
+    ///
+    /// The "no SOA" branch is gone rather than handled, and that is the point:
+    /// RFC 2308 §3 requires the SOA in a negative answer for that answer to be
+    /// cacheable at all, so every miss against a zone without one came back
+    /// forever — which is exactly the load profile a random-subdomain flood
+    /// wants.
+    soa: Record,
 
     /// Nodes in RFC 4034 §6.1 canonical order. Node 0 is the apex, and every
     /// ancestor precedes its descendants, because canonical order sorts on the
@@ -620,33 +637,9 @@ impl Zone {
             builder.insert_spec(spec)?;
         }
 
-        let mut zone = builder.finish(soa)?;
-
-        // An SOA declared as a plain record set wins over none at all, so pick it
-        // up if the operator wrote `[[zone.records]] type = "SOA"` instead.
-        if zone.soa.is_none() {
-            zone.soa = zone.apex_soa();
-        }
-
+        let zone = builder.finish(soa)?;
         zone.debug_assert_invariants();
         Ok(zone)
-    }
-
-    /// The SOA sitting at the apex as an ordinary record set, if there is one.
-    ///
-    /// The first record of the set, matching what the map model's
-    /// `rs.first().cloned()` returned.
-    fn apex_soa(&self) -> Option<Record> {
-        let hashes = SuffixHashes::new(self.hash_seed, &self.lower_origin);
-        let idx = self.exact_node(&self.lower_origin, &hashes)?;
-        let node = self.nodes.get(idx.get())?;
-        let first = self.rrsets_of(node, RecordType::SOA).first()?;
-        let value = self.rdata.get(span(first.rdata))?.first()?;
-        Some(Record::from_rdata(
-            node.name.clone(),
-            first.ttl,
-            value.clone(),
-        ))
     }
 
     /// The zone origin.
@@ -654,9 +647,13 @@ impl Zone {
         &self.lower_origin
     }
 
-    /// The SOA record, if the zone declares one.
-    pub fn soa(&self) -> Option<&Record> {
-        self.soa.as_ref()
+    /// The zone's SOA record.
+    ///
+    /// Infallible since VEGA-032 S5: a config with no SOA does not build, so no
+    /// caller carries an `Option` and no negative answer can go out without the
+    /// authority record RFC 2308 §3 needs to make it cacheable.
+    pub fn soa(&self) -> &Record {
+        &self.soa
     }
 
     /// TTL used for records without an explicit one.
@@ -878,11 +875,12 @@ impl Zone {
 
     /// The RRsets of `rtype` at `node`, as a contiguous slice.
     ///
-    /// A slice rather than a single RRset because two config blocks for one
-    /// owner and type with different TTLs are still merged into one answer until
-    /// S5 (see [`Rrset`]). Two `partition_point`s rather than one
-    /// `binary_search`, so the run is found whole and in order however long it
-    /// is. Both are O(log T) and bounded by the node's own RRset count.
+    /// A slice, and since S5 at most one entry long: a config declaring one
+    /// owner and type twice at different TTLs no longer builds (see [`Rrset`]).
+    /// Two `partition_point`s rather than one `binary_search`, so the run is
+    /// found whole and in order however long it is — which is what keeps this
+    /// correct if RRSIG ever puts a second entry of one type here (RFC 4034 §3).
+    /// Both are O(log T) and bounded by the node's own RRset count.
     fn rrsets_of(&self, node: &Node, rtype: RecordType) -> &[Rrset] {
         let Some(all) = self.rrsets.get(span(node.rrsets)) else {
             return &[];
@@ -1703,6 +1701,171 @@ impl<'a> ZoneBuilder<'a> {
         }
     }
 
+    /// The SOA written as an ordinary `[[zone.records]]` block at the apex.
+    ///
+    /// The first value of the set, which is also the only one the invariant
+    /// check permits.
+    fn apex_soa_record(&self) -> Option<Record> {
+        let node = self.nodes.get(self.lower_origin)?;
+        let run = node.rrsets.iter().find(|r| r.rtype == RecordType::SOA)?;
+        let value = run.rdata.first()?;
+        Some(Record::from_rdata(
+            node.name.clone(),
+            run.ttl,
+            value.clone(),
+        ))
+    }
+
+    /// The invariants a zone must satisfy to be served at all — VEGA-032 §6.2,
+    /// I-4 through I-8.
+    ///
+    /// **Every one is a hard error, at startup and at reload alike.** Nothing is
+    /// synthesised and there is no escape flag: an SOA needs an MNAME, an RNAME
+    /// and a serial, and inventing any of them is a guess that shows up as a
+    /// broken NOTIFY, a broken secondary, or a negative-cache lifetime nobody
+    /// chose. An apex NS RRset asserts an identity we cannot know. BIND's
+    /// `named` refuses to load a zone with no SOA and with no apex NS, NSD's
+    /// parser treats both as errors, and Knot makes both mandatory semantic
+    /// checks — for a single-zone server, "the zone is not served" and "the
+    /// process has nothing to do" are the same sentence.
+    ///
+    /// Safe *because* VEGA-005 froze the reload contract: `from_config` returns
+    /// `Result`, the new zone is fully built before `replace_zone` is called, and
+    /// a build failure never reaches the swap. A config edit that deletes the
+    /// apex NS is a 4xx with a named code and a WARN, not an outage, and
+    /// `tests/reload.rs::every_failure_mode_names_its_code_and_leaves_the_zone_alone`
+    /// is what holds that true.
+    ///
+    /// # Every finding, in one run
+    ///
+    /// The violations are collected rather than returned one at a time (AC-5.8).
+    /// An operator fixing a config by restarting until it stops complaining is
+    /// an operator making one edit per restart, and `vega check` exists to be
+    /// run once before the restart, not once per problem.
+    fn check_invariants(&self, soa_in_config: bool) -> Result<()> {
+        let origin = self.origin.to_string();
+        let mut findings: Vec<String> = Vec::new();
+
+        let mut apex_soa_values = 0usize;
+        let mut apex_has_ns = false;
+
+        for (owner, node) in &self.nodes {
+            let at_apex = owner == self.lower_origin;
+
+            // I-7 (VEGA-061). Two `[[zone.records]]` blocks for one owner and
+            // type with different TTLs reach here as two runs of that type —
+            // that is exactly how `insert_spec` splits them. RFC 2181 §5: every
+            // record in an RRset shares one TTL and they are atomic, and §5.2
+            // leaves a resolver that receives otherwise free to choose, so the
+            // same RRset is cached for different lifetimes by different caches.
+            let mut seen: Vec<RecordType> = Vec::new();
+            for run in &node.rrsets {
+                if seen.contains(&run.rtype) {
+                    findings.push(format!(
+                        "{owner} has two {} record sets with different TTLs. RFC 2181 §5 \
+                         makes an RRset atomic and gives it ONE TTL; two caches receiving \
+                         this would keep it for different lifetimes. Merge the \
+                         [[zone.records]] blocks, or give them the same `ttl`",
+                        run.rtype
+                    ));
+                }
+                seen.push(run.rtype);
+
+                if run.rtype == RecordType::SOA {
+                    if at_apex {
+                        apex_soa_values += run.rdata.len();
+                    } else {
+                        // I-4. RFC 1035 §5.2: an SOA marks the top of a zone,
+                        // and there is exactly one top.
+                        findings.push(format!(
+                            "{owner} has an SOA record, but an SOA belongs only at the \
+                             zone apex {origin} (RFC 1035 §5.2 — it is what marks the top \
+                             of a zone). Move it to `name = \"@\"`, or delete it"
+                        ));
+                    }
+                }
+                if run.rtype == RecordType::NS {
+                    if at_apex {
+                        apex_has_ns = true;
+                    } else if node.wildcard {
+                        // I-8. RFC 4592 §4.2 leaves wildcard delegation
+                        // undefined; there is no right answer to implement, so
+                        // the config is rejected rather than guessed at.
+                        findings.push(format!(
+                            "{owner} is a wildcard owning an NS record set. RFC 4592 §4.2 \
+                             leaves wildcard delegation undefined — there is no specified \
+                             answer for a query below it — so this is refused rather than \
+                             guessed at. Delegate each subdomain explicitly"
+                        ));
+                    }
+                }
+            }
+
+            // I-6 (VEGA-064). RFC 1034 §3.6.2 and RFC 2181 §10.1: a CNAME is
+            // alone at its owner name. Otherwise the name resolves differently
+            // depending on what you ask for — the exact-type match wins for the
+            // type that coexists, and every other type chases the alias.
+            let cnames: usize = node
+                .rrsets
+                .iter()
+                .filter(|r| r.rtype == RecordType::CNAME)
+                .map(|r| r.rdata.len())
+                .sum();
+            if cnames > 0 && node.rrsets.len() > 1 {
+                let others: Vec<String> = node
+                    .rrsets
+                    .iter()
+                    .filter(|r| r.rtype != RecordType::CNAME)
+                    .map(|r| r.rtype.to_string())
+                    .collect();
+                findings.push(format!(
+                    "{owner} has a CNAME alongside {}. RFC 1034 §3.6.2 and RFC 2181 §10.1 \
+                     forbid it: the alias would answer every type except {}, so the name \
+                     resolves to two different things depending on what is asked. Keep one",
+                    others.join(", "),
+                    others.join(", ")
+                ));
+            }
+            if cnames > 1 {
+                findings.push(format!(
+                    "{owner} has {cnames} CNAME records. RFC 1034 §3.6.2 permits exactly \
+                     one — a name is an alias for one other name, or it is not an alias"
+                ));
+            }
+        }
+
+        // I-4, the counting half.
+        if soa_in_config && apex_soa_values > 0 {
+            findings.push(format!(
+                "zone {origin} declares an SOA twice: once in [zone.soa] and once as a \
+                 [[zone.records]] block at the apex. RFC 1035 §5.2 allows one, and the two \
+                 can disagree — the serial you bump would be the one that is ignored. \
+                 Delete whichever is not authoritative"
+            ));
+        } else if apex_soa_values > 1 {
+            findings.push(format!(
+                "zone {origin} has {apex_soa_values} SOA records at its apex. RFC 1035 §5.2 \
+                 allows exactly one: it carries the serial every secondary compares and the \
+                 MINIMUM every negative answer is cached for"
+            ));
+        } else if !soa_in_config && apex_soa_values == 0 {
+            findings.push(missing_soa(&origin));
+        }
+
+        // I-5.
+        if !apex_has_ns {
+            findings.push(missing_apex_ns(&origin));
+        }
+
+        if findings.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "zone {origin} cannot be served:\n\n{}",
+            findings.join("\n\n")
+        )
+    }
+
     /// Lay the scratch map out as three exactly-sized arenas plus an index.
     fn finish(mut self, soa: Option<Record>) -> Result<Zone> {
         let origin = self.origin.clone();
@@ -1722,6 +1885,19 @@ impl<'a> ZoneBuilder<'a> {
             });
 
         self.materialise_ancestors();
+
+        // Before anything is laid out, and before the SOA is resolved: a build
+        // that is going to be refused should be refused while the failure can
+        // still name the record set the operator wrote.
+        self.check_invariants(soa.is_some())?;
+
+        // Exactly one SOA exists by the check above — either the `[zone.soa]`
+        // table or an apex `[[zone.records]]` block, never both and never
+        // neither. `ok_or_else` rather than `expect`, because this runs on the
+        // reload path and `panic = "abort"` makes an `expect` here an outage.
+        let soa = soa
+            .or_else(|| self.apex_soa_record())
+            .ok_or_else(|| anyhow::anyhow!(missing_soa(&self.origin.to_string())))?;
 
         let entries: Vec<(LowerName, ScratchNode)> = self.nodes.into_iter().collect();
 
@@ -2058,6 +2234,55 @@ fn apply_cut(
     }
 }
 
+/// The error an operator reads when a zone has no SOA.
+///
+/// The text is part of the design. Whoever meets this is meeting it because
+/// their server did not come back after a restart, at whatever hour that
+/// happened, and the fastest thing we can give them is the exact TOML to paste.
+fn missing_soa(origin: &str) -> String {
+    format!(
+        "zone {origin} has no SOA record. RFC 1035 §5.2 requires one: it marks the top of \
+         the zone, and RFC 2308 §3 makes it the record that lets a resolver cache a \
+         negative answer at all — without it every miss comes back, which is exactly what \
+         a random-subdomain flood is trying to achieve.\n\
+         \n\
+         Nothing is synthesised here, because an SOA needs an MNAME, an RNAME and a serial \
+         and a guess at any of them breaks NOTIFY, every secondary, or every negative \
+         answer's cache lifetime. Add, to your config:\n\
+         \n\
+         \x20   [zone.soa]\n\
+         \x20   mname   = \"ns1.{origin}\"\n\
+         \x20   rname   = \"hostmaster.{origin}\"\n\
+         \x20   serial  = 1\n\
+         \x20   refresh = 3600\n\
+         \x20   retry   = 900\n\
+         \x20   expire  = 604800\n\
+         \x20   minimum = 60"
+    )
+}
+
+/// The error an operator reads when a zone has no apex NS RRset.
+///
+/// Quoted from the ruling (VEGA-032 §6.3) rather than paraphrased, for the same
+/// reason as [`missing_soa`].
+fn missing_apex_ns(origin: &str) -> String {
+    format!(
+        "zone {origin} has no NS record set at its apex. RFC 1034 §4.2.1 requires one: it \
+         names the servers authoritative for the zone, and every delegation checker and \
+         every secondary reads it. Add, to [zone] in your config:\n\
+         \n\
+         \x20   [[zone.records]]\n\
+         \x20   name   = \"@\"\n\
+         \x20   type   = \"NS\"\n\
+         \x20   values = [\"ns1.{origin}\"]\n\
+         \n\
+         \x20   [[zone.records]]\n\
+         \x20   name   = \"ns1\"\n\
+         \x20   type   = \"A\"\n\
+         \x20   values = [\"<this server's public address>\"]"
+    )
+}
+
 /// A label depth as the `u8` [`Zone::origin_depth`] and [`Zone::max_depth`] are
 /// stored in, clamped to [`MAX_LABELS`].
 ///
@@ -2194,24 +2419,71 @@ mod tests {
                 expire: 604_800,
                 minimum: 60,
             }),
-            records,
+            records: with_apex_ns("example.com", records),
         })
         .expect("zone should build")
     }
+
+    /// Give `records` an apex NS RRset unless it already has one.
+    ///
+    /// S5 makes an apex NS RRset mandatory (RFC 1034 §4.2.1), and nearly every
+    /// fixture in this module is about something else entirely. Injecting it
+    /// here keeps each test's `records` list to the shape it is testing —
+    /// the alternative is the same two lines pasted into two hundred fixtures,
+    /// where nobody reads them and the one fixture that needs a *different* NS
+    /// RRset is invisible.
+    ///
+    /// Injected only when absent, so a test that declares its own apex NS —
+    /// or that is *about* the apex NS — gets exactly what it wrote.
+    fn with_apex_ns(origin: &str, mut records: Vec<RecordSpec>) -> Vec<RecordSpec> {
+        let declared = records.iter().any(|r| {
+            let name = r.name.trim();
+            (name == "@" || name.is_empty()) && r.record_type.eq_ignore_ascii_case("NS")
+        });
+        if !declared {
+            let origin = origin.trim_end_matches('.');
+            let target = if origin.is_empty() {
+                "ns1.".to_owned()
+            } else {
+                format!("ns1.{origin}.")
+            };
+            records.insert(0, spec("@", "NS", &[&target]));
+        }
+        records
+    }
+
+    /// The one record [`with_apex_ns`] injects.
+    ///
+    /// Named rather than folded into each expected total, so an assertion about
+    /// a fixture's *own* records still reads as the number of records that
+    /// fixture declares.
+    const INJECTED_APEX_NS: usize = 1;
 
     fn lower(name: &str) -> LowerName {
         LowerName::from(parse_name(name).unwrap())
     }
 
-    /// A zone with an arbitrary origin and no SOA, for the cases where the
-    /// origin itself is the thing under test (notably `origin = "."`).
+    /// A zone with an arbitrary origin, for the cases where the origin itself is
+    /// the thing under test (notably `origin = "."`).
     fn zone_with_origin(origin: &str, records: Vec<RecordSpec>) -> Zone {
         Zone::from_config(&ZoneConfig {
             origin: origin.to_owned(),
             default_ttl: 300,
             builtins: false,
-            soa: None,
-            records,
+            // S5 makes an SOA mandatory, so this can no longer be `None`. The
+            // MNAME and RNAME are absolute and deliberately outside whatever
+            // origin the caller passes, so a root-origin zone gets the same
+            // fixture as any other.
+            soa: Some(SoaSpec {
+                mname: "ns1.example.com.".to_owned(),
+                rname: "hostmaster.example.com.".to_owned(),
+                serial: 7,
+                refresh: 3600,
+                retry: 900,
+                expire: 604_800,
+                minimum: 60,
+            }),
+            records: with_apex_ns(origin, records),
         })
         .expect("zone should build")
     }
@@ -2437,7 +2709,7 @@ mod tests {
     #[test]
     fn soa_is_served_at_the_apex() {
         let z = zone(vec![]);
-        let soa = z.soa().expect("soa configured");
+        let soa = z.soa();
         assert_eq!(soa.record_type(), RecordType::SOA);
         assert_eq!(soa.ttl, 60);
     }
@@ -2491,7 +2763,7 @@ mod tests {
             spec("@", "A", &["203.0.113.1", "203.0.113.2"]),
             spec("www", "A", &["203.0.113.3"]),
         ]);
-        assert_eq!(z.record_count(), 3);
+        assert_eq!(z.record_count(), 3 + INJECTED_APEX_NS);
     }
 
     // -----------------------------------------------------------------------
@@ -2528,8 +2800,16 @@ mod tests {
             origin: "example.com".to_owned(),
             default_ttl: 300,
             builtins: false,
-            soa: None,
-            records: vec![spec("long", "TXT", &[&value])],
+            soa: Some(SoaSpec {
+                mname: "ns1.example.com.".to_owned(),
+                rname: "hostmaster.example.com.".to_owned(),
+                serial: 7,
+                refresh: 3600,
+                retry: 900,
+                expire: 604_800,
+                minimum: 60,
+            }),
+            records: with_apex_ns("example.com", vec![spec("long", "TXT", &[&value])]),
         })
         .expect("a value of exactly rdata::MAX_VALUE_CHARS characters must build");
         assert!(matches!(
@@ -2764,23 +3044,50 @@ mod tests {
             "A",
             &["203.0.113.1", "203.0.113.2", "203.0.113.3", "203.0.113.4"],
         )]);
-        assert_eq!(z.record_count(), 4);
+        assert_eq!(z.record_count(), 4 + INJECTED_APEX_NS);
     }
 
+    /// Scenario: Two SOAs, one in `[zone.soa]` and one as a record set
+    /// AC-5.1 — RFC 1035 §5.2
+    ///
+    /// INVERTED AT VEGA-032 S5. It used to assert that `[zone.soa]` silently
+    /// won. Silently is the problem: the two carry independent serials, and the
+    /// one an operator bumps before a reload is a coin toss. RFC 1035 §5.2
+    /// allows one SOA, so two is a config error, named.
     #[test]
-    fn a_zone_level_soa_wins_over_a_record_set_soa() {
-        // Kills `zone.soa.is_none()` -> `is_some()` in the SOA fallback.
-        let z = zone(vec![spec(
-            "@",
-            "SOA",
-            &["ns9.example.com. hostmaster.example.com. 99 1 1 1 1"],
-        )]);
-        let RData::SOA(soa) = &z.soa().expect("soa").data else {
-            panic!("expected SOA");
-        };
-        assert_eq!(soa.serial, 7, "[zone.soa] must win over a record set");
+    fn two_declarations_of_the_soa_are_a_build_error_not_a_silent_winner() {
+        let error = Zone::from_config(&ZoneConfig {
+            origin: "example.com".to_owned(),
+            default_ttl: 300,
+            builtins: false,
+            soa: Some(SoaSpec {
+                mname: "ns1.example.com.".to_owned(),
+                rname: "hostmaster.example.com.".to_owned(),
+                serial: 7,
+                refresh: 3600,
+                retry: 900,
+                expire: 604_800,
+                minimum: 60,
+            }),
+            records: with_apex_ns(
+                "example.com",
+                vec![spec(
+                    "@",
+                    "SOA",
+                    &["ns9.example.com. hostmaster.example.com. 99 1 1 1 1"],
+                )],
+            ),
+        })
+        .expect_err("two SOAs must not build");
+        let text = format!("{error}");
+        assert!(text.contains("declares an SOA twice"), "{text}");
+        assert!(text.contains("[zone.soa]"), "{text}");
     }
 
+    /// Scenario: An SOA written as a record set is the zone's SOA
+    /// AC-5.1
+    ///
+    /// The other half of the rule above: exactly one, from either source.
     #[test]
     fn a_record_set_soa_is_used_when_no_zone_soa_is_declared() {
         let z = Zone::from_config(&ZoneConfig {
@@ -2788,14 +3095,17 @@ mod tests {
             default_ttl: 300,
             builtins: false,
             soa: None,
-            records: vec![spec(
-                "@",
-                "SOA",
-                &["ns9.example.com. hostmaster.example.com. 99 1 1 1 1"],
-            )],
+            records: with_apex_ns(
+                "example.com",
+                vec![spec(
+                    "@",
+                    "SOA",
+                    &["ns9.example.com. hostmaster.example.com. 99 1 1 1 1"],
+                )],
+            ),
         })
         .expect("zone builds");
-        let RData::SOA(soa) = &z.soa().expect("soa").data else {
+        let RData::SOA(soa) = &z.soa().data else {
             panic!("expected SOA");
         };
         assert_eq!(soa.serial, 99);
@@ -3679,7 +3989,11 @@ mod tests {
         // The deep shape too: an empty zone is where a walk with nothing to
         // find runs its full window.
         assert_eq!(z.lookup(&deep_name(123), RecordType::A), Answer::NxDomain);
-        assert_eq!(z.record_count(), 0);
+        assert_eq!(
+            z.record_count(),
+            INJECTED_APEX_NS,
+            "the apex NS RRset S5 makes mandatory, and nothing else"
+        );
     }
 
     // -------------------------------------------------- S1: the arena
@@ -3883,13 +4197,12 @@ mod tests {
     /// permutes an address set between reloads makes a load-balancing
     /// resolver's behaviour unreproducible and a packet capture undiffable.
     ///
-    /// The third case is the discriminating one. Two blocks for one owner and
-    /// type with **different** TTLs are merged into one answer with mixed TTLs
-    /// today — the RFC 2181 §5 violation VEGA-061 pins and S5 fixes — so the
-    /// arena keeps them as consecutive runs rather than storing a TTL per
-    /// record. Declaring 10, 20, then 10 again is what says the runs are not
-    /// regrouped by TTL on the way in, and it is a case that cannot arise at all
-    /// once S5 refuses the config.
+    /// AMENDED AT VEGA-032 S5. Its third case declared three blocks for one
+    /// owner and type at TTLs 10, 20, 10, to prove the arena did not regroup
+    /// runs by TTL. That config no longer builds — RFC 2181 §5, VEGA-061 — and
+    /// the case was written with the note that S5 would remove it. What it was
+    /// discriminating against is gone with it: there is at most one run per type
+    /// now, so there is nothing left to regroup.
     #[test]
     fn an_rrset_is_answered_in_the_order_the_config_declares_it() {
         let _watchdog = watchdog();
@@ -3904,9 +4217,6 @@ mod tests {
             spec("pool", "A", &["203.0.113.1", "203.0.113.2", "203.0.113.3"]),
             ttl("merged", &["203.0.113.10"], 60),
             ttl("merged", &["203.0.113.11"], 60),
-            ttl("runs", &["203.0.113.20"], 10),
-            ttl("runs", &["203.0.113.21"], 20),
-            ttl("runs", &["203.0.113.22"], 10),
         ]);
 
         for (label, name, want) in [
@@ -3923,15 +4233,6 @@ mod tests {
                 "two blocks at one TTL",
                 "merged.example.com.",
                 vec![("203.0.113.10", 60), ("203.0.113.11", 60)],
-            ),
-            (
-                "three blocks, TTLs 10, 20, 10",
-                "runs.example.com.",
-                vec![
-                    ("203.0.113.20", 10),
-                    ("203.0.113.21", 20),
-                    ("203.0.113.22", 10),
-                ],
             ),
         ] {
             let Answer::Records(records) = z.lookup(&lower(name), RecordType::A) else {
@@ -4645,7 +4946,7 @@ mod tests {
         let z = zone(vec![spec("a.b.c.d", "A", &["203.0.113.41"])]);
         assert_eq!(
             z.record_count(),
-            1,
+            1 + INJECTED_APEX_NS,
             "one configured value is one record, however many nodes it implies"
         );
         assert_eq!(
@@ -4751,7 +5052,7 @@ mod tests {
             };
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].data, a("203.0.113.20"));
-            assert_eq!(z.record_count(), 2);
+            assert_eq!(z.record_count(), 2 + INJECTED_APEX_NS);
         }
     }
 
@@ -4793,7 +5094,7 @@ mod tests {
                 panic!("the literal name below the wildcard must answer its own record");
             };
             assert_eq!(literal[0].data, a("203.0.113.60"));
-            assert_eq!(z.record_count(), 2);
+            assert_eq!(z.record_count(), 2 + INJECTED_APEX_NS);
         }
     }
 
@@ -4876,7 +5177,7 @@ mod tests {
         );
         assert_eq!(
             z.record_count(),
-            1,
+            1 + INJECTED_APEX_NS,
             "the record is still counted — that is S1's behaviour and S2 changes \
              answers, not the gauge"
         );
@@ -5962,5 +6263,226 @@ mod tests {
             "a sibling of the cut is not below it"
         );
         assert!(cut_of("example.com.").is_none(), "the apex is never a cut");
+    }
+
+    // =======================================================================
+    // VEGA-032 S5 — MANDATORY SOA AND APEX NS, AND THE RRSET INVARIANTS
+    // (closes VEGA-061, VEGA-064 and VEGA-025)
+    //
+    // Every one of these is a HARD ERROR, at startup and at reload alike.
+    // Nothing is synthesised and there is no escape flag: an SOA needs an
+    // MNAME, an RNAME and a serial, and a guess at any of them is a broken
+    // NOTIFY, a broken secondary, or a negative-cache lifetime nobody chose.
+    // BIND, NSD and Knot all refuse to load such a zone.
+    //
+    // The reload half is safe because VEGA-005 guarantees a refused build
+    // leaves the running zone byte-identical — re-proved against these new
+    // failure classes by
+    // `src/reload.rs::every_failure_mode_names_its_code_and_leaves_the_zone_alone`,
+    // which now carries the missing-apex-NS and missing-SOA configs in its
+    // table rather than a new test written to agree with it.
+    // =======================================================================
+
+    /// Build a zone from records with **nothing** injected, and return the
+    /// error text.
+    ///
+    /// The apex NS and the SOA are the things under test here, so `zone()`'s
+    /// injection would defeat the point.
+    fn build_error(soa: Option<SoaSpec>, records: Vec<RecordSpec>) -> String {
+        let error = Zone::from_config(&ZoneConfig {
+            origin: "example.com".to_owned(),
+            default_ttl: 300,
+            builtins: false,
+            soa,
+            records,
+        })
+        .expect_err("this config must not build");
+        format!("{error}")
+    }
+
+    fn fixture_soa() -> SoaSpec {
+        SoaSpec {
+            mname: "ns1.example.com.".to_owned(),
+            rname: "hostmaster.example.com.".to_owned(),
+            serial: 7,
+            refresh: 3600,
+            retry: 900,
+            expire: 604_800,
+            minimum: 60,
+        }
+    }
+
+    /// Scenario: A zone with no SOA does not build
+    /// AC-5.1 — RFC 1035 §5.2, RFC 2308 §3
+    ///
+    /// The error text is asserted, not just the failure, because the text is the
+    /// feature. Whoever meets it is meeting it because their server did not come
+    /// back after a restart, and the paste-ready TOML is the whole point.
+    #[test]
+    fn a_zone_with_no_soa_does_not_build_and_says_what_to_add() {
+        let text = build_error(None, vec![spec("@", "NS", &["ns1.example.com."])]);
+        assert!(text.contains("has no SOA record"), "{text}");
+        assert!(text.contains("RFC 1035 §5.2"), "{text}");
+        assert!(
+            text.contains("[zone.soa]") && text.contains("mname"),
+            "the error must quote the TOML to add: {text}"
+        );
+    }
+
+    /// Scenario: A zone with no apex NS RRset does not build
+    /// AC-5.2 — RFC 1034 §4.2.1
+    #[test]
+    fn a_zone_with_no_apex_ns_does_not_build_and_says_what_to_add() {
+        let text = build_error(
+            Some(fixture_soa()),
+            vec![spec("www", "A", &["203.0.113.1"])],
+        );
+        assert!(text.contains("has no NS record set at its apex"), "{text}");
+        assert!(text.contains("RFC 1034 §4.2.1"), "{text}");
+        assert!(
+            text.contains("type   = \"NS\"") && text.contains("ns1.example.com."),
+            "the error must quote the TOML to add: {text}"
+        );
+    }
+
+    /// Scenario: An SOA below the apex does not build
+    /// AC-5.3 — RFC 1035 §5.2
+    #[test]
+    fn an_soa_below_the_apex_does_not_build() {
+        let text = build_error(
+            None,
+            vec![
+                spec("@", "NS", &["ns1.example.com."]),
+                spec(
+                    "sub",
+                    "SOA",
+                    &["ns1.example.com. hostmaster.example.com. 1 1 1 1 1"],
+                ),
+            ],
+        );
+        assert!(text.contains("sub.example.com."), "{text}");
+        assert!(text.contains("only at the zone apex"), "{text}");
+    }
+
+    /// Scenario: One owner and type at two TTLs does not build
+    /// AC-5.4 — RFC 2181 §5 — VEGA-061
+    #[test]
+    fn an_rrset_declared_at_two_ttls_does_not_build() {
+        let ttl = |name: &str, value: &str, ttl: u32| {
+            let mut s = spec(name, "A", &[value]);
+            s.ttl = Some(ttl);
+            s
+        };
+        let text = build_error(
+            Some(fixture_soa()),
+            vec![
+                spec("@", "NS", &["ns1.example.com."]),
+                ttl("pool", "203.0.113.1", 60),
+                ttl("pool", "203.0.113.2", 120),
+            ],
+        );
+        assert!(
+            text.contains("pool.example.com.") && text.contains("two A record sets"),
+            "the error must name the owner and the type: {text}"
+        );
+        assert!(text.contains("RFC 2181 §5"), "{text}");
+    }
+
+    /// Scenario: A CNAME sharing its owner name does not build
+    /// AC-5.5 — RFC 1034 §3.6.2, RFC 2181 §10.1 — VEGA-064
+    #[test]
+    fn a_cname_alongside_another_type_or_a_second_cname_does_not_build() {
+        let coexisting = build_error(
+            Some(fixture_soa()),
+            vec![
+                spec("@", "NS", &["ns1.example.com."]),
+                spec("www", "A", &["203.0.113.1"]),
+                spec("www", "CNAME", &["target.example.com."]),
+            ],
+        );
+        assert!(
+            coexisting.contains("www.example.com.") && coexisting.contains("CNAME alongside"),
+            "{coexisting}"
+        );
+
+        let doubled = build_error(
+            Some(fixture_soa()),
+            vec![
+                spec("@", "NS", &["ns1.example.com."]),
+                spec("www", "CNAME", &["one.example.com.", "two.example.com."]),
+            ],
+        );
+        assert!(
+            doubled.contains("has 2 CNAME records"),
+            "a name is an alias for ONE other name, or it is not an alias: {doubled}"
+        );
+    }
+
+    /// Scenario: A wildcard owning an NS RRset does not build
+    /// AC-5.6 — RFC 4592 §4.2
+    ///
+    /// §4.2 leaves wildcard delegation undefined: there is no specified answer
+    /// for a query below one, so there is nothing to implement and the config is
+    /// refused rather than guessed at.
+    #[test]
+    fn a_wildcard_owning_an_ns_rrset_does_not_build() {
+        let text = build_error(
+            Some(fixture_soa()),
+            vec![
+                spec("@", "NS", &["ns1.example.com."]),
+                spec("*.dev", "NS", &["ns1.dev.example.com."]),
+            ],
+        );
+        assert!(text.contains("*.dev.example.com."), "{text}");
+        assert!(text.contains("RFC 4592 §4.2"), "{text}");
+    }
+
+    /// Scenario: Every invariant a config breaks is reported in one run
+    /// AC-5.8
+    ///
+    /// An operator fixing a config by restarting until it stops complaining is
+    /// an operator making one edit per restart. `vega check` exists to be run
+    /// once, before the restart, and a check that stops at the first problem
+    /// makes that a lie.
+    #[test]
+    fn a_config_that_breaks_several_invariants_reports_all_of_them_at_once() {
+        let text = build_error(
+            None,
+            vec![
+                spec("www", "A", &["203.0.113.1"]),
+                spec("www", "CNAME", &["target.example.com."]),
+                spec("*.dev", "NS", &["ns1.dev.example.com."]),
+            ],
+        );
+        for expected in [
+            "has no SOA record",
+            "has no NS record set at its apex",
+            "CNAME alongside",
+            "RFC 4592 §4.2",
+        ] {
+            assert!(
+                text.contains(expected),
+                "one run must report every finding; {expected:?} is missing \
+                 from:\n{text}"
+            );
+        }
+    }
+
+    /// Scenario: The SOA is infallible for every caller
+    /// AC-5.10
+    ///
+    /// Not a behaviour so much as a shape: `Zone::soa()` returns `&Record`, so
+    /// the branch where a negative answer went out with an empty authority
+    /// section — uncacheable, and therefore re-queried forever (RFC 2308 §3) —
+    /// no longer exists to be taken.
+    #[test]
+    fn the_soa_is_present_on_every_zone_that_builds() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("www", "A", &["203.0.113.1"])]);
+        let RData::SOA(soa) = &z.soa().data else {
+            panic!("every zone that builds has an SOA");
+        };
+        assert_eq!(soa.serial, 7);
+        assert_eq!(z.soa().name, parse_name("example.com.").unwrap());
     }
 }

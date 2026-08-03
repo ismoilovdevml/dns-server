@@ -482,11 +482,27 @@ mod tests {
             .global
     }
 
+    /// The apex NS record set every config `zone_toml` writes carries.
+    ///
+    /// VEGA-032 S5 makes an apex NS RRset mandatory (RFC 1034 §4.2.1), so a
+    /// config with `count` A records serves `count + 1`. Named rather than
+    /// folded into each total, so an assertion about a fixture's own records
+    /// still reads as the number that fixture writes.
+    const MANDATORY_APEX_NS: usize = 1;
+
     /// A config file with `count` A records under `origin`.
     fn zone_toml(origin: &str, count: usize, server: &str) -> String {
         use std::fmt::Write as _;
 
-        let mut toml = format!("[server]\n{server}\n[zone]\norigin = \"{origin}\"\n");
+        // The SOA and the apex NS RRset are both mandatory since VEGA-032 S5
+        // (RFC 1035 §5.2, RFC 1034 §4.2.1), so every config this fixture writes
+        // carries them. None of these tests is about either.
+        let mut toml = format!(
+            "[server]\n{server}\n[zone]\norigin = \"{origin}\"\n\
+             \n[zone.soa]\nmname = \"ns1.example.test.\"\nrname = \"hostmaster.example.test.\"\n\
+             serial = 1\nrefresh = 3600\nretry = 900\nexpire = 604800\nminimum = 60\n\
+             \n[[zone.records]]\nname = \"@\"\ntype = \"NS\"\nvalues = [\"ns1.example.test.\"]\n"
+        );
         for index in 0..count {
             let _ = write!(
                 toml,
@@ -706,10 +722,10 @@ mod tests {
         assert_eq!(error.code, ReloadErrorCode::ConfigInvalid);
         assert_eq!(
             fixture.handler.zone().record_count(),
-            1,
+            1 + MANDATORY_APEX_NS,
             "a refused reload replaced the serving zone"
         );
-        assert_eq!(gauge(&fixture.metrics), 1);
+        assert_eq!(gauge(&fixture.metrics), (1 + MANDATORY_APEX_NS) as u64);
     }
 
     /// Scenario: Adding a trailing dot to the origin is not an origin change
@@ -723,7 +739,11 @@ mod tests {
             let outcome = fixture
                 .reload()
                 .unwrap_or_else(|error| panic!("{spelling} was refused: {error}"));
-            assert_eq!(outcome.records, 2, "{spelling} did not apply its records");
+            assert_eq!(
+                outcome.records,
+                2 + MANDATORY_APEX_NS,
+                "{spelling} did not apply its records"
+            );
             assert!(
                 !outcome.ignored.contains(&KEY_ORIGIN),
                 "{spelling} is the same zone, so it is not shadowed drift"
@@ -967,16 +987,20 @@ mod tests {
     #[test]
     fn a_successful_reload_moves_the_records_gauge_to_the_new_count() {
         let fixture = Fixture::start(&zone_toml("example.test", 3, ""), &[]);
-        assert_eq!(gauge(&fixture.metrics), 3, "the fixture must start at 3");
+        assert_eq!(
+            gauge(&fixture.metrics),
+            (3 + MANDATORY_APEX_NS) as u64,
+            "the fixture must start at 3"
+        );
 
         fixture.write(&zone_toml("example.test", 5, ""));
         let outcome = fixture.reload().expect("the reload succeeds");
 
-        assert_eq!(outcome.records, 5);
-        assert_eq!(fixture.handler.zone().record_count(), 5);
+        assert_eq!(outcome.records, 5 + MANDATORY_APEX_NS);
+        assert_eq!(fixture.handler.zone().record_count(), 5 + MANDATORY_APEX_NS);
         assert_eq!(
             gauge(&fixture.metrics),
-            5,
+            (5 + MANDATORY_APEX_NS) as u64,
             "dns_zone_records still describes the pre-reload zone"
         );
     }
@@ -1013,7 +1037,7 @@ mod tests {
         );
         assert_eq!(
             fixture.handler.zone().record_count(),
-            51,
+            51 + MANDATORY_APEX_NS,
             "the last reload must still be the one installed"
         );
     }
@@ -1024,8 +1048,8 @@ mod tests {
         fixture.write(&zone_toml("example.test", 4, ""));
 
         let outcome = fixture.reload().expect("the reload succeeds");
-        assert_eq!(outcome.records, 4);
-        assert_eq!(fixture.handler.zone().record_count(), 4);
+        assert_eq!(outcome.records, 4 + MANDATORY_APEX_NS);
+        assert_eq!(fixture.handler.zone().record_count(), 4 + MANDATORY_APEX_NS);
         assert!(outcome.ignored.is_empty(), "{:?}", outcome.ignored);
     }
 
@@ -1039,6 +1063,27 @@ mod tests {
         let mut broken = zone_toml("example.test", 0, "");
         broken.push_str("\n[[zone.records]]\nname = \"bad\"\ntype = \"A\"\nvalues = [\"nope\"]\n");
 
+        // AC-5.7. VEGA-032 S5 adds a whole class of build failure — an edit that
+        // deletes the apex NS RRset or the SOA — and a hard error is only
+        // acceptable at reload time because VEGA-005 guarantees a refused build
+        // leaves the running zone untouched. That guarantee is re-proved here,
+        // against the new class, by the test that already owns it rather than by
+        // a new one written to agree with it.
+        let no_apex_ns = zone_toml("example.test", 3, "").replace(
+            "[[zone.records]]\nname = \"@\"\ntype = \"NS\"\nvalues = [\"ns1.example.test.\"]\n",
+            "",
+        );
+        let no_soa =
+            zone_toml("example.test", 3, "").replace("mname = \"ns1.example.test.\"", "MARKER");
+        let no_soa = no_soa
+            .split_once("[zone.soa]")
+            .map(|(head, tail)| {
+                let rest = tail.split_once("\n\n").map_or("", |(_, r)| r);
+                format!("{head}{rest}")
+            })
+            .expect("the fixture writes a [zone.soa] table");
+        assert!(!no_soa.contains("MARKER"), "the SOA table was not removed");
+
         let cases: Vec<(ReloadErrorCode, Option<String>)> = vec![
             (ReloadErrorCode::ConfigReadFailed, None),
             (
@@ -1050,12 +1095,18 @@ mod tests {
                 // No record tables, so the key lands in `[zone]` and not inside a
                 // `[[zone.records]]` entry — this has to be rejected by the merge,
                 // not by the parser.
-                Some(format!(
-                    "{}default_ttl = 0\n",
+                // Spliced INTO `[zone]` rather than appended, because
+                // `zone_toml` now writes the mandatory apex NS RRset as a
+                // `[[zone.records]]` table and anything appended after one
+                // lands inside it.
+                Some(
                     zone_toml("example.test", 0, "")
-                )),
+                        .replace("[zone]\n", "[zone]\ndefault_ttl = 0\n"),
+                ),
             ),
             (ReloadErrorCode::ZoneBuildFailed, Some(broken)),
+            (ReloadErrorCode::ZoneBuildFailed, Some(no_apex_ns)),
+            (ReloadErrorCode::ZoneBuildFailed, Some(no_soa)),
             (
                 ReloadErrorCode::OriginChanged,
                 Some(zone_toml("example.net", 1, "")),
@@ -1073,10 +1124,14 @@ mod tests {
             assert_eq!(error.code, code, "{}", error.detail);
             assert_eq!(
                 fixture.handler.zone().record_count(),
-                3,
+                3 + MANDATORY_APEX_NS,
                 "{code} replaced the serving zone"
             );
-            assert_eq!(gauge(&fixture.metrics), 3, "{code} moved the gauge");
+            assert_eq!(
+                gauge(&fixture.metrics),
+                (3 + MANDATORY_APEX_NS) as u64,
+                "{code} moved the gauge"
+            );
         }
     }
 
@@ -1149,10 +1204,10 @@ mod tests {
         assert_eq!(error.code, ReloadErrorCode::ShuttingDown);
         assert_eq!(
             fixture.handler.zone().record_count(),
-            1,
+            1 + MANDATORY_APEX_NS,
             "a zone was installed into a process that is going away"
         );
-        assert_eq!(gauge(&fixture.metrics), 1);
+        assert_eq!(gauge(&fixture.metrics), (1 + MANDATORY_APEX_NS) as u64);
     }
 
     /// Scenario: Concurrent reload requests are each applied or refused as in progress
@@ -1192,7 +1247,7 @@ mod tests {
         let outcome = fixture
             .reload()
             .expect("a poisoned lock must not brick reload for the process's life");
-        assert_eq!(outcome.records, 2);
+        assert_eq!(outcome.records, 2 + MANDATORY_APEX_NS);
     }
 
     /// Scenario: The record-count gauge never describes a zone that is not installed
@@ -1228,7 +1283,7 @@ mod tests {
         for count in 2..=rounds {
             fixture.write(&zone_toml("example.test", count, ""));
             let outcome = fixture.reload().expect("the reload succeeds");
-            assert_eq!(outcome.records, count);
+            assert_eq!(outcome.records, count + MANDATORY_APEX_NS);
         }
         stop.store(true, Ordering::Relaxed);
         sampler.join().expect("the sampler finishes");

@@ -56,8 +56,11 @@ default_ttl = 300
 # Handy for smoke tests; turn off if you would rather not expose server internals.
 builtins = true
 
-# The SOA is what lets resolvers cache your negative answers. Without it,
-# NXDOMAIN responses carry no authority record and get re-queried constantly.
+# MANDATORY. The SOA is what lets resolvers cache your negative answers
+# (RFC 2308 §3); without it, NXDOMAIN responses carry no authority record and get
+# re-queried constantly. The server refuses to start if it is missing, and
+# nothing is synthesised — a guessed MNAME breaks NOTIFY and a guessed serial
+# breaks every secondary.
 [zone.soa]
 mname = "ns1.example.com."            # primary name server
 rname = "hostmaster.example.com."     # zone contact, in DNS form
@@ -71,6 +74,14 @@ minimum = 60                           # negative-cache TTL
 # `name` is relative to `origin`. Use "@" for the apex, "*" or "*.sub" for
 # wildcards, and a trailing dot for a fully-qualified name.
 # `values` are written exactly as they would appear in a zone file.
+#
+# Four shapes are REFUSED at load, because there is no correct way to serve them:
+#   * two blocks for one owner and type with different `ttl` (RFC 2181 §5)
+#   * a CNAME beside another type, or two CNAMEs, at one owner
+#     (RFC 1034 §3.6.2, RFC 2181 §10.1)
+#   * an NS record set at a wildcard (RFC 4592 §4.2)
+#   * an SOA anywhere but the apex (RFC 1035 §5.2)
+# `vega check` reports all of them in one run.
 
 [[zone.records]]
 name = "@"
@@ -82,6 +93,10 @@ name = "@"
 type = "AAAA"
 values = ["2001:db8::10"]
 
+# MANDATORY. An NS record set at the APEX names the servers authoritative for
+# this zone (RFC 1034 §4.2.1); every delegation checker and every secondary reads
+# it, and the server refuses to start without it. A NON-apex NS is a delegation —
+# see the section further down.
 [[zone.records]]
 name = "@"
 type = "NS"

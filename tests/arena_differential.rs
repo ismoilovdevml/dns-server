@@ -568,6 +568,103 @@ fn declared_node_names(cfg: &ZoneConfig) -> Vec<LowerName> {
     out
 }
 
+/// The apex NS RRset VEGA-032 S5 makes mandatory (RFC 1034 §4.2.1).
+///
+/// Every fixture and every generated config in this file carries it, so that the
+/// build-outcome comparison is about the shapes each test is actually varying
+/// and not about an invariant all of them would trip over identically.
+fn apex_ns_spec() -> RecordSpec {
+    RecordSpec {
+        name: "@".to_owned(),
+        record_type: "NS".to_owned(),
+        ttl: None,
+        values: vec![format!("ns1.{ORIGIN}.")],
+    }
+}
+
+/// Why VEGA-032 S5 refuses this config, decided from the **config** — or `None`
+/// when S5 has nothing to say about it.
+///
+/// The transcription in [`FrozenZone`] is deliberately never edited, so it
+/// builds every config the pre-S5 implementation built. S5 refuses some of them,
+/// and this is the only permitted reason for the two to disagree about whether a
+/// config loads. Written from RFC 2181 §5 and §10.1, RFC 1034 §3.6.2 and §4.2.1,
+/// RFC 1035 §5.2 and RFC 4592 §4.2 — not from `Zone::check_invariants`, because
+/// an oracle that calls the thing it is checking is a tautology.
+///
+/// **This is a fence, not a waiver.** The build-outcome assertion still fails if
+/// the arena refuses a config this returns `None` for, which is what stops S5
+/// from being an excuse for any refusal at all.
+fn refused_by_s5(cfg: &ZoneConfig) -> Option<&'static str> {
+    let mut origin = cfg.origin.parse::<Name>().ok()?;
+    origin.set_fqdn(true);
+    let lower_origin = LowerName::from(origin.clone());
+
+    // (owner, type) -> the effective TTLs declared for it, and how many values.
+    let mut declared: HashMap<(LowerName, RecordType), (Vec<u32>, usize)> = HashMap::new();
+    let mut apex_has_ns = false;
+    let mut apex_soa_values = 0usize;
+
+    for spec in &cfg.records {
+        let Ok(rtype) = spec.record_type.to_uppercase().parse::<RecordType>() else {
+            continue;
+        };
+        let Some(owner) = spec_node_name(&origin, &lower_origin, spec) else {
+            continue;
+        };
+        let at_apex = owner == lower_origin;
+        if rtype == RecordType::NS {
+            if at_apex {
+                apex_has_ns = true;
+            } else if owner.iter().next() == Some(b"*") {
+                return Some("a wildcard owns an NS RRset (RFC 4592 §4.2)");
+            }
+        }
+        if rtype == RecordType::SOA {
+            if at_apex {
+                apex_soa_values += spec.values.len();
+            } else {
+                return Some("an SOA sits below the apex (RFC 1035 §5.2)");
+            }
+        }
+        let entry = declared.entry((owner, rtype)).or_default();
+        entry.0.push(spec.ttl.unwrap_or(cfg.default_ttl));
+        entry.1 += spec.values.len();
+    }
+
+    for ((_, rtype), (ttls, values)) in &declared {
+        if ttls.windows(2).any(|pair| pair[0] != pair[1]) {
+            return Some("one owner and type declared at two TTLs (RFC 2181 §5)");
+        }
+        if *rtype == RecordType::CNAME && *values > 1 {
+            return Some("two CNAMEs at one owner name (RFC 1034 §3.6.2)");
+        }
+    }
+    for (owner, rtype) in declared.keys() {
+        if *rtype == RecordType::CNAME
+            && declared
+                .keys()
+                .any(|(other, ty)| other == owner && *ty != RecordType::CNAME)
+        {
+            return Some("a CNAME alongside another type (RFC 2181 §10.1)");
+        }
+    }
+
+    if cfg.soa.is_some() && apex_soa_values > 0 {
+        return Some("an SOA in [zone.soa] and another as a record set");
+    }
+    if apex_soa_values > 1 {
+        return Some("two SOAs at the apex (RFC 1035 §5.2)");
+    }
+    if cfg.soa.is_none() && apex_soa_values == 0 {
+        return Some("no SOA (RFC 1035 §5.2, RFC 2308 §3)");
+    }
+    if !apex_has_ns {
+        return Some("no NS RRset at the apex (RFC 1034 §4.2.1)");
+    }
+    None
+}
+
 /// The node name one spec declares, or `None` when it declares none.
 ///
 /// Extracted at S3 so [`declared_node_names`] and [`ConfigModel`] cannot drift:
@@ -1308,6 +1405,7 @@ fn zone_config() -> impl Strategy<Value = ZoneConfig> {
             records.extend(wildcards);
             records.extend(broken);
             records.extend(carve.into_iter().flatten());
+            records.push(apex_ns_spec());
             ZoneConfig {
                 origin: ORIGIN.to_owned(),
                 default_ttl: 300,
@@ -1574,16 +1672,24 @@ proptest! {
             .map(|r| format!("{} {}", r.name, r.record_type))
             .collect();
 
+        // S5 is the ONE licensed disagreement, and it is decided from the
+        // config rather than from what the arena did (`refused_by_s5`). The
+        // transcription is never edited, so it still builds the configs RFC 2181
+        // §5, RFC 2181 §10.1, RFC 1034 §4.2.1, RFC 1035 §5.2 and RFC 4592 §4.2
+        // say must not be served; every OTHER divergence is still a failure.
+        let s5 = refused_by_s5(&cfg);
         prop_assert_eq!(
             real.is_ok(),
-            frozen.is_ok(),
+            frozen.is_ok() && s5.is_none(),
             "the two implementations disagree on whether this config builds \
-             (arena: {}, frozen: {}). A rewrite may reword an error; it may not \
-             change which configs load, because that is a reload that starts \
-             failing or a config that starts smuggling records for someone \
-             else's namespace\n  zone: {:?}",
+             (arena: {}, frozen: {}, S5 refusal: {:?}). A rewrite may reword an \
+             error; outside S5's named invariants it may not change which \
+             configs load, because that is a reload that starts failing or a \
+             config that starts smuggling records for someone else's \
+             namespace\n  zone: {:?}",
             real.is_ok(),
             frozen.is_ok(),
+            s5,
             shape
         );
 
@@ -1621,7 +1727,7 @@ proptest! {
             shape
         );
         prop_assert_eq!(
-            render_soa(real.soa()),
+            render_soa(Some(real.soa())),
             render_soa(frozen.soa.as_ref()),
             "the SOA moved. Every negative answer carries it (RFC 2308 §3) and \
              its MINIMUM sets the negative cache lifetime (§5)\n  zone: {:?}",
@@ -1760,6 +1866,7 @@ fn s2_fixture() -> ZoneConfig {
             minimum: 60,
         }),
         records: vec![
+            spec("@", "NS", &format!("ns1.{ORIGIN}.")),
             spec("@", "A", "203.0.113.10"),
             spec("host", "A", "203.0.113.20"),
             spec("host", "TXT", "\"two rrsets at one name\""),
@@ -1891,7 +1998,10 @@ fn every_branch_of_the_lookup_agrees_with_the_transcription_over_an_ancestor_clo
     let origin_depth = label_count(&frozen.lower_origin);
 
     assert_eq!(real.record_count(), frozen.record_count);
-    assert_eq!(render_soa(real.soa()), render_soa(frozen.soa.as_ref()));
+    assert_eq!(
+        render_soa(Some(real.soa())),
+        render_soa(frozen.soa.as_ref())
+    );
 
     let names = fixture_names();
     let types = [
@@ -2222,6 +2332,7 @@ fn s3_fixture() -> ZoneConfig {
             minimum: 60,
         }),
         records: vec![
+            spec("@", "NS", &format!("ns1.{ORIGIN}.")),
             spec("host", "A", "203.0.113.20"),
             // The ladder. Do not flatten it.
             spec("*.dev", "A", "203.0.113.50"),

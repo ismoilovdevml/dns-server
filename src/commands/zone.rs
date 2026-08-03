@@ -185,7 +185,7 @@ pub fn check(config: &Config, config_path: Option<&Path>, as_json: bool) -> Resu
                 "builtins": config.zone.builtins,
                 "record_sets": config.zone.records.len(),
                 "records": zone.record_count(),
-                "soa": zone.soa().is_some(),
+                "soa": zone.soa().to_string(),
             },
             "listeners": {
                 "udp": config.udp.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -208,16 +208,16 @@ pub fn check(config: &Config, config_path: Option<&Path>, as_json: bool) -> Resu
     ui::field("default ttl", format!("{}s", config.zone.default_ttl), 16);
     ui::field("record sets", config.zone.records.len(), 16);
     ui::field("records", ui::accent(zone.record_count()), 16);
+    // Never absent: a zone with no SOA does not build (VEGA-032 S5), so what is
+    // worth showing is the serial — the number a secondary compares and the one
+    // an operator forgets to bump.
     ui::field(
         "soa",
-        if zone.soa().is_some() {
-            format!("{} present", ui::tick())
-        } else {
-            // Without an SOA, resolvers cannot cache our negative answers.
-            format!(
-                "{} missing — negative answers will not be cacheable",
-                ui::bang()
-            )
+        match &zone.soa().data {
+            hickory_proto::rr::RData::SOA(soa) => {
+                format!("{} serial {}", ui::tick(), ui::accent(soa.serial))
+            }
+            other => format!("{} {other}", ui::tick()),
         },
         16,
     );
@@ -411,7 +411,28 @@ values = ["example.com."]
         // The generated file must parse as a real config and build a real zone.
         let editor = ConfigEditor::open(&path).unwrap();
         assert_eq!(editor.origin(), Some("example.org"));
-        assert!(editor.records().is_empty());
+
+        // AC-5.9: `init` emits the SOA and the apex NS RRset that VEGA-032 S5
+        // makes mandatory, and its output loads. A generated config the server
+        // then refuses to start on is the worst possible first five minutes.
+        let records = editor.records();
+        assert!(
+            records
+                .iter()
+                .any(|r| r.name == "@" && r.record_type == "NS"),
+            "init must write an apex NS RRset (RFC 1034 §4.2.1): {records:?}"
+        );
+        let config = crate::config::Config::load(&crate::config::GlobalArgs {
+            config: Some(path.clone()),
+            ..Default::default()
+        })
+        .expect("the generated config resolves");
+        let zone = Zone::from_config(&config.zone).expect("the generated config builds a zone");
+        assert!(
+            zone.diagnostics().is_empty(),
+            "`init` must produce a config `check` passes: {:?}",
+            zone.diagnostics()
+        );
     }
 
     #[test]

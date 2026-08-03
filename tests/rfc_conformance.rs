@@ -39,6 +39,23 @@ fn spec(name: &str, ty: &str, values: &[&str]) -> RecordSpec {
     }
 }
 
+/// Give `records` the apex NS RRset VEGA-032 S5 makes mandatory
+/// (RFC 1034 §4.2.1), unless the caller declared one of its own.
+///
+/// Injected rather than pasted into every fixture: every zone needs one and
+/// almost no test here is about it. A test that declares its own — the
+/// delegation cases — gets exactly what it wrote.
+fn with_apex_ns(mut records: Vec<RecordSpec>) -> Vec<RecordSpec> {
+    let declared = records.iter().any(|r| {
+        let name = r.name.trim();
+        (name == "@" || name.is_empty()) && r.record_type.eq_ignore_ascii_case("NS")
+    });
+    if !declared {
+        records.insert(0, spec("@", "NS", &[&format!("ns1.{ZONE}.")]));
+    }
+    records
+}
+
 fn zone_config(records: Vec<RecordSpec>) -> ZoneConfig {
     ZoneConfig {
         origin: ZONE.to_owned(),
@@ -53,7 +70,7 @@ fn zone_config(records: Vec<RecordSpec>) -> ZoneConfig {
             expire: 604_800,
             minimum: 60,
         }),
-        records,
+        records: with_apex_ns(records),
     }
 }
 

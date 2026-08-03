@@ -74,21 +74,44 @@ fn record_spec() -> impl Strategy<Value = RecordSpec> {
     )
 }
 
+/// The apex NS RRset VEGA-032 S5 makes mandatory (RFC 1034 §4.2.1), and the SOA
+/// it makes mandatory alongside it (RFC 1035 §5.2).
+///
+/// Every config in this file carries both, so that a property about wildcards or
+/// about the closest encloser is not silently a property about a zone that no
+/// longer builds.
+fn apex_ns_spec() -> RecordSpec {
+    RecordSpec {
+        name: "@".to_owned(),
+        record_type: "NS".to_owned(),
+        ttl: None,
+        values: vec![format!("ns1.{ORIGIN}.")],
+    }
+}
+
+/// The mandatory SOA, for the configs that used to pass `soa: None`.
+fn mandatory_soa() -> SoaSpec {
+    SoaSpec {
+        mname: format!("ns1.{ORIGIN}."),
+        rname: format!("hostmaster.{ORIGIN}."),
+        serial: 1,
+        refresh: 3600,
+        retry: 900,
+        expire: 604_800,
+        minimum: 60,
+    }
+}
+
 fn zone_config() -> impl Strategy<Value = ZoneConfig> {
-    prop::collection::vec(record_spec(), 0..12).prop_map(|records| ZoneConfig {
-        origin: ORIGIN.to_owned(),
-        default_ttl: 300,
-        builtins: false,
-        soa: Some(SoaSpec {
-            mname: format!("ns1.{ORIGIN}."),
-            rname: format!("hostmaster.{ORIGIN}."),
-            serial: 1,
-            refresh: 3600,
-            retry: 900,
-            expire: 604_800,
-            minimum: 60,
-        }),
-        records,
+    prop::collection::vec(record_spec(), 0..12).prop_map(|mut records| {
+        records.push(apex_ns_spec());
+        ZoneConfig {
+            origin: ORIGIN.to_owned(),
+            default_ttl: 300,
+            builtins: false,
+            soa: Some(mandatory_soa()),
+            records,
+        }
     })
 }
 
@@ -629,11 +652,12 @@ fn walk_zone_config() -> impl Strategy<Value = ZoneConfig> {
         .prop_map(|(wildcards, exacts)| {
             let mut records = wildcards;
             records.extend(exacts);
+            records.push(apex_ns_spec());
             ZoneConfig {
                 origin: ORIGIN.to_owned(),
                 default_ttl: 300,
                 builtins: false,
-                soa: None,
+                soa: Some(mandatory_soa()),
                 records,
             }
         })
@@ -1024,8 +1048,9 @@ fn the_replacement_oracle_catches_the_case_the_retired_one_found() {
         origin: ORIGIN.to_owned(),
         default_ttl: 300,
         builtins: false,
-        soa: None,
+        soa: Some(mandatory_soa()),
         records: vec![
+            apex_ns_spec(),
             RecordSpec {
                 name: "*".to_owned(),
                 record_type: "TXT".to_owned(),
@@ -1512,8 +1537,13 @@ proptest! {
     /// Minimal case found by proptest:
     ///   [[zone.records]] name="@" type="CNAME" ttl=1   values=["dev.example.test."]
     ///   [[zone.records]] name="@" type="CNAME"         values=["dev.example.test."]
+    ///
+    /// **FIXED AND UN-`#[ignore]`d AT VEGA-032 S5** (VEGA-061). The config that
+    /// produced a mixed-TTL RRset is now refused at build time, naming the owner
+    /// and the type, so the `Ok` arm below is only ever reached by a zone that
+    /// cannot contain one. The property is unchanged: what changed is that it
+    /// can now hold.
     #[test]
-    #[ignore = "BUG: duplicate record sets are merged into one RRset with mixed TTLs (RFC 2181 s5.2)"]
     fn an_rrset_never_mixes_ttls(
         cfg in zone_config(),
         name in query_name(),
@@ -1579,28 +1609,53 @@ proptest! {
     /// INVARIANT (RFC 1034 s3.6.2, RFC 2181 s10.1): a CNAME is the only record
     /// allowed at its owner name, and there may be exactly one of it.
     ///
-    /// BUG: the zone accepts a CNAME alongside other types at the same name,
-    /// and accepts several CNAMEs at one name, with no validation at build time
-    /// and no warning. The resulting answers are ones no resolver expects.
+    /// FIXED AND UN-`#[ignore]`d AT VEGA-032 S5 (VEGA-064). The zone used to
+    /// accept a CNAME alongside other types at one name, and several CNAMEs at
+    /// one name, with no validation and no warning: the exact-type match won for
+    /// the type that coexisted while every other type chased the alias, so the
+    /// name resolved to two different things depending on what was asked.
     #[test]
-    #[ignore = "BUG: a CNAME may coexist with other types, and be duplicated, at one owner name (RFC 1034 s3.6.2)"]
-    fn a_cname_is_alone_at_its_owner_name(cfg in zone_config()) {
-        let mut cname_owners = BTreeSet::new();
-        let mut other_owners = BTreeSet::new();
-        for spec in &cfg.records {
-            let owner = qualify(&spec.name).to_lowercase();
-            if spec.record_type == "CNAME" {
-                cname_owners.insert(owner);
-            } else {
-                other_owners.insert(owner);
-            }
-        }
-        let clash: Vec<_> = cname_owners.intersection(&other_owners).collect();
-        prop_assume!(!clash.is_empty());
+    fn a_cname_is_alone_at_its_owner_name(cfg in zone_config(), pick in 0usize..64) {
+        // The clash is CONSTRUCTED, not filtered for. Generating a config and
+        // hoping a CNAME lands on an owner some other type already holds is how
+        // this property starves: it spent its whole global reject budget the
+        // first time it was run un-ignored, and a property that depends on the
+        // generator being lucky is not a property.
+        let owners: Vec<String> = cfg
+            .records
+            .iter()
+            .filter(|r| r.record_type != "CNAME" && !is_wildcard(&r.name))
+            .map(|r| r.name.clone())
+            .collect();
+        prop_assume!(!owners.is_empty());
+        let owner = owners[pick % owners.len()].clone();
 
+        let mut clashing = cfg.clone();
+        clashing.records.push(RecordSpec {
+            name: owner.clone(),
+            record_type: "CNAME".to_owned(),
+            ttl: None,
+            values: vec![format!("target.{ORIGIN}.")],
+        });
         prop_assert!(
-            Zone::from_config(&cfg).is_err(),
-            "a CNAME sharing {clash:?} with another type must be rejected at build time"
+            Zone::from_config(&clashing).is_err(),
+            "a CNAME sharing {owner:?} with another type must be rejected at \
+             build time (RFC 1034 §3.6.2, RFC 2181 §10.1)"
+        );
+
+        // The other half of §3.6.2: at most one. A name is an alias for one
+        // other name, or it is not an alias.
+        let mut doubled = cfg.clone();
+        doubled.records.retain(|r| r.name != owner);
+        doubled.records.push(RecordSpec {
+            name: owner.clone(),
+            record_type: "CNAME".to_owned(),
+            ttl: None,
+            values: vec![format!("one.{ORIGIN}."), format!("two.{ORIGIN}.")],
+        });
+        prop_assert!(
+            Zone::from_config(&doubled).is_err(),
+            "two CNAMEs at {owner:?} must be rejected at build time"
         );
     }
 
@@ -1849,21 +1904,26 @@ proptest! {
         prop_assert_eq!(&actual, &model, "edits {:?}\n{}", edits, raw);
 
         // And the whole thing must still build a servable zone.
+        let mut records: Vec<RecordSpec> = reopened
+            .records()
+            .into_iter()
+            .map(|r| RecordSpec {
+                name: r.name,
+                record_type: r.record_type,
+                ttl: r.ttl,
+                values: r.values,
+            })
+            .collect();
+        // The editor round trip is about comments and record text, not about
+        // the apex NS RRset VEGA-032 S5 makes mandatory — which the edit
+        // sequence never writes, so it is added here rather than asserted about.
+        records.push(apex_ns_spec());
         let cfg = ZoneConfig {
-            origin: "example.test".to_owned(),
+            origin: ORIGIN.to_owned(),
             default_ttl: 300,
             builtins: false,
-            soa: None,
-            records: reopened
-                .records()
-                .into_iter()
-                .map(|r| RecordSpec {
-                    name: r.name,
-                    record_type: r.record_type,
-                    ttl: r.ttl,
-                    values: r.values,
-                })
-                .collect(),
+            soa: Some(mandatory_soa()),
+            records,
         };
         prop_assert!(Zone::from_config(&cfg).is_ok(), "{}", raw);
     }
@@ -1913,7 +1973,7 @@ fn ancestor_case() -> impl Strategy<Value = (ZoneConfig, usize, usize)> {
         0usize..64,
     )
         .prop_map(|(owners, which, depth)| {
-            let records = owners
+            let records: Vec<RecordSpec> = owners
                 .into_iter()
                 .map(|(name, (record_type, value), ttl)| RecordSpec {
                     name,
@@ -1922,12 +1982,14 @@ fn ancestor_case() -> impl Strategy<Value = (ZoneConfig, usize, usize)> {
                     values: vec![value],
                 })
                 .collect();
+            let mut records = records;
+            records.push(apex_ns_spec());
             (
                 ZoneConfig {
                     origin: ORIGIN.to_owned(),
                     default_ttl: 300,
                     builtins: false,
-                    soa: None,
+                    soa: Some(mandatory_soa()),
                     records,
                 },
                 which,

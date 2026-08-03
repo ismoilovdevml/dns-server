@@ -107,7 +107,24 @@ impl ConfigEditor {
              mname = \"ns1.{origin}.\"\n\
              rname = \"hostmaster.{origin}.\"\n\
              serial = 1\n\
-             minimum = 60\n"
+             minimum = 60\n\
+             \n\
+             # RFC 1034 §4.2.1 requires an NS record set at the apex, and the \
+             server refuses\n\
+             # to start without one: it names the servers authoritative for \
+             this zone, and\n\
+             # every delegation checker and every secondary reads it. Point it \
+             at this host.\n\
+             [[zone.records]]\n\
+             name = \"@\"\n\
+             type = \"NS\"\n\
+             values = [\"ns1.{origin}.\"]\n\
+             \n\
+             [[zone.records]]\n\
+             name = \"ns1\"\n\
+             type = \"A\"\n\
+             values = [\"127.0.0.1\"]        # replace with this server's \
+             public address\n"
         );
         write_atomically(path, &contents)?;
         Ok(true)

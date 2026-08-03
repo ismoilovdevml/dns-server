@@ -110,7 +110,9 @@ vega completions fish > ~/.config/fish/completions/vega.fish
 ## Quickstart
 
 ```bash
-# 1. A config file, with a sensible SOA already filled in.
+# 1. A config file, with the SOA and the apex NS record set already filled in.
+#    Both are mandatory — the server refuses to start without them
+#    (RFC 1035 §5.2, RFC 1034 §4.2.1). Point the `ns1` A record at this host.
 vega init --origin example.com
 
 # 2. Records. Values use zone-file syntax, so MX looks like MX.
@@ -261,11 +263,20 @@ origin = "example.com"
 default_ttl = 300
 builtins = true                    # the diagnostic sub-zones, below
 
+# Mandatory. Without it, negative answers are not cacheable (RFC 2308 §3) and
+# the server refuses to start (RFC 1035 §5.2).
 [zone.soa]
 mname = "ns1.example.com."
 rname = "hostmaster.example.com."
 serial = 2026073001
 minimum = 60                       # negative-cache TTL
+
+# Also mandatory: an NS record set at the apex names the servers authoritative
+# for this zone (RFC 1034 §4.2.1). A NON-apex NS is a delegation — see below.
+[[zone.records]]
+name = "@"
+type = "NS"
+values = ["ns1.example.com."]
 
 [[zone.records]]
 name = "@"                         # "@" = apex, "*.sub" = wildcard
@@ -273,6 +284,13 @@ type = "A"
 ttl = 60                           # optional
 values = ["203.0.113.10", "203.0.113.11"]
 ```
+
+A few configs are refused outright, because there is no correct way to serve
+them: an RRset declared at two different TTLs (RFC 2181 §5), a `CNAME` sharing
+its owner name with another type or with a second `CNAME` (RFC 1034 §3.6.2,
+RFC 2181 §10.1), an `NS` record set at a wildcard (RFC 4592 §4.2), and an `SOA`
+anywhere but the apex (RFC 1035 §5.2). `vega check` reports every one in a single
+run, before the restart.
 
 </details>
 

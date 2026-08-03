@@ -7,6 +7,90 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed — BREAKING: a zone now needs an SOA and an apex NS to load
+
+**If your config has no `[zone.soa]` table and no apex `NS` record set, this
+release will not start.** Read this before upgrading; it is the only change here
+that can stop a running deployment.
+
+Run `vega check --config /etc/vega/vega.toml` before you upgrade. It exits
+non-zero and prints every problem in one pass, so one run is enough.
+
+This is what you will see on the terminal and in the journal:
+
+```text
+ERROR building the zone: zone example.com. cannot be served:
+
+zone example.com. has no NS record set at its apex. RFC 1034 §4.2.1 requires
+one: it names the servers authoritative for the zone, and every delegation
+checker and every secondary reads it. Add, to [zone] in your config:
+
+    [[zone.records]]
+    name   = "@"
+    type   = "NS"
+    values = ["ns1.example.com."]
+
+    [[zone.records]]
+    name   = "ns1"
+    type   = "A"
+    values = ["<this server's public address>"]
+```
+
+and, for the SOA:
+
+```text
+zone example.com. has no SOA record. RFC 1035 §5.2 requires one: it marks the
+top of the zone, and RFC 2308 §3 makes it the record that lets a resolver cache
+a negative answer at all — without it every miss comes back, which is exactly
+what a random-subdomain flood is trying to achieve.
+
+Nothing is synthesised here, because an SOA needs an MNAME, an RNAME and a
+serial and a guess at any of them breaks NOTIFY, every secondary, or every
+negative answer's cache lifetime. Add, to your config:
+
+    [zone.soa]
+    mname   = "ns1.example.com"
+    rname   = "hostmaster.example.com"
+    serial  = 1
+    refresh = 3600
+    retry   = 900
+    expire  = 604800
+    minimum = 60
+```
+
+**Nothing is synthesised and there is no escape flag.** An SOA needs an MNAME, an
+RNAME and a serial; inventing them breaks `NOTIFY`, breaks every secondary, and
+puts a number nobody chose on every negative answer's cache lifetime. An apex
+`NS` RRset asserts an identity we cannot know. BIND's `named`, NSD and Knot all
+refuse to load such a zone, and for a single-zone server "the zone is not served"
+and "the process has nothing to do" are the same sentence.
+
+Four more configs are now refused, each with the offending owner name in the
+error, and **all of them reported in one run** rather than one per restart:
+
+| refused config | why |
+| --- | --- |
+| two `[[zone.records]]` blocks for one owner and type with different `ttl` | RFC 2181 §5 — an RRset is atomic and has one TTL; two caches would keep it for different lifetimes |
+| a `CNAME` alongside any other type at one owner | RFC 1034 §3.6.2, RFC 2181 §10.1 — the name resolved to two different things depending on what was asked |
+| two `CNAME`s at one owner | RFC 1034 §3.6.2 — a name is an alias for one other name, or it is not an alias |
+| an `NS` RRset at a wildcard (`*.dev`) | RFC 4592 §4.2 leaves wildcard delegation undefined; there is no specified answer to implement |
+| an `SOA` below the apex, or an SOA in both `[zone.soa]` and `[[zone.records]]` | RFC 1035 §5.2 — exactly one, at the top. Two can disagree, and the serial you bump would be the one that is ignored |
+
+Two consequences worth knowing:
+
+- **`vega serve` with no config file at all no longer starts.** It used to serve
+  an empty zone under `dnsserver.dev` with the diagnostic sub-zones. There is no
+  command-line flag for an SOA or an NS record, so a process with no config file
+  has no zone to serve. Run `vega init` first — its output now includes both and
+  passes `vega check`.
+- `dns_zone_records` counts the apex NS RRset like any other record, so the gauge
+  steps up by one when you add it.
+
+A refused reload is still not an outage: `POST /reload` answers `400` with
+`code: "zone_build_failed"`, logs a `WARN`, and the running zone keeps answering
+byte-identically — the VEGA-005 guarantee, re-proved against these new failure
+classes.
+
 ### Added
 
 - **Delegation and glue.** A non-apex `NS` record set is now a zone cut. A query

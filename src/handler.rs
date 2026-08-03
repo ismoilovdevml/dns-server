@@ -132,11 +132,17 @@ impl Resolved {
         }
     }
 
-    fn negative(code: ResponseCode, soa: Option<&Record>) -> Self {
+    /// A negative answer, always carrying the zone's SOA.
+    ///
+    /// `&Record` and not `Option<&Record>` since VEGA-032 S5: a zone with no SOA
+    /// does not build, so the branch where a negative answer went out with an
+    /// empty authority section — uncacheable, and therefore re-queried forever
+    /// (RFC 2308 §3) — no longer exists to be taken.
+    fn negative(code: ResponseCode, soa: &Record) -> Self {
         Self {
             code,
             answers: Vec::new(),
-            authority: soa.cloned().into_iter().collect(),
+            authority: vec![soa.clone()],
             additional: Vec::new(),
             authoritative: true,
         }
@@ -319,9 +325,7 @@ impl DnsHandler {
         // A zone-level SOA (from `[zone.soa]`) is not part of the record map, so
         // answer apex SOA queries from it directly.
         if qtype == RecordType::SOA && name == zone.origin() {
-            if let Some(soa) = zone.soa() {
-                return Resolved::found(vec![soa.clone()]);
-            }
+            return Resolved::found(vec![zone.soa().clone()]);
         }
 
         let answer = zone.lookup(name, qtype);
@@ -695,13 +699,7 @@ fn serve_failed(request_meta: &Metadata) -> ResponseInfo {
 }
 
 /// Answer a TXT-only built-in, or NODATA when the client asked for another type.
-fn txt_builtin(
-    qname: Name,
-    qtype: RecordType,
-    ttl: u32,
-    text: String,
-    soa: Option<&Record>,
-) -> Resolved {
+fn txt_builtin(qname: Name, qtype: RecordType, ttl: u32, text: String, soa: &Record) -> Resolved {
     if qtype == RecordType::TXT || qtype == RecordType::ANY {
         Resolved::found(vec![Record::from_rdata(
             qname,
@@ -757,7 +755,20 @@ mod tests {
             .unwrap_or_else(|e| panic!("{record_type} {value:?} should parse: {e}"))
     }
 
+    /// A zone config over `records`, with the apex NS RRset S5 makes mandatory
+    /// injected unless the caller declared its own.
+    ///
+    /// Injected here rather than pasted into every fixture: RFC 1034 §4.2.1
+    /// requires an apex NS of every zone, and none of these tests is about it.
     fn zone_config(records: Vec<RecordSpec>, builtins: bool) -> ZoneConfig {
+        let mut records = records;
+        let declared = records.iter().any(|r| {
+            let name = r.name.trim();
+            (name == "@" || name.is_empty()) && r.record_type.eq_ignore_ascii_case("NS")
+        });
+        if !declared {
+            records.insert(0, spec("@", "NS", &["ns1.example.com."]));
+        }
         ZoneConfig {
             origin: "example.com".to_owned(),
             default_ttl: 300,
@@ -1136,7 +1147,9 @@ mod tests {
             &rdata_of(RecordType::A, "198.51.100.7"),
             "a reload must be visible to the next query"
         );
-        assert_eq!(h.zone().record_count(), 1);
+        // One `www A`, plus the apex NS RRset `zone_config` injects because
+        // RFC 1034 §4.2.1 makes one mandatory (VEGA-032 S5).
+        assert_eq!(h.zone().record_count(), 2);
     }
 
     #[test]
@@ -1169,9 +1182,9 @@ mod tests {
     fn other_origin_zone() -> (Arc<Zone>, ZoneConfig) {
         let mut cfg = zone_config(vec![spec("www", "A", &["198.51.100.7"])], true);
         cfg.origin = "example.net".to_owned();
-        // The fixture SOA names `example.com` hosts; a zone without one is enough
-        // here and keeps the fixture honest about what is being varied.
-        cfg.soa = None;
+        // The SOA stays: VEGA-032 S5 makes it mandatory, and its MNAME naming
+        // an `example.com` host is not something a resolver can observe here.
+        // What is being varied is the origin, and only the origin.
         let zone = Arc::new(Zone::from_config(&cfg).unwrap());
         (zone, cfg)
     }

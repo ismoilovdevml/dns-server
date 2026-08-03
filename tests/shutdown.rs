@@ -403,6 +403,11 @@ fn config_text(dns_port: u16, admin: Option<SocketAddr>, spawn: &Spawn) -> Strin
          rname = \"hostmaster.example.com.\"\n\
          \n\
          [[zone.records]]\n\
+         name = \"@\"\n\
+         type = \"NS\"\n\
+         values = [\"ns1.example.com.\"]\n\
+         \n\
+         [[zone.records]]\n\
          name = \"www\"\n\
          type = \"A\"\n\
          values = [\"192.0.2.1\"]\n"
