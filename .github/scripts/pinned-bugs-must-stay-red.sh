@@ -41,19 +41,29 @@ TEST_THREADS="${TEST_THREADS:-2}"
 # question is which commit fixed it. `saving_preserves_the_config_file_
 # permissions` is `#[cfg(unix)]`, which is why this script is pinned to a Unix
 # runner rather than added to the cross-platform matrix.
+# Seven lines were deleted by VEGA-032, each with the commit that earned it:
+#
+#   bd4b397  S2, empty non-terminals (VEGA-006)
+#     an_empty_non_terminal_answers_nodata_over_the_wire
+#     zone::tests::an_empty_non_terminal_is_nodata_not_nxdomain
+#     zone::tests::the_parent_of_a_wildcard_is_not_nxdomain
+#   a54ea5c  S3, the closest encloser (VEGA-009, VEGA-098)
+#     a_wildcard_does_not_reach_below_a_name_that_exists
+#     zone::tests::a_wildcard_does_not_apply_below_a_name_that_exists
+#   4a42fa4  S5, mandatory SOA and apex NS (VEGA-061, VEGA-064)
+#     an_rrset_never_mixes_ttls
+#     a_cname_is_alone_at_its_owner_name
+#
+# The three scope fences this script was written to protect are gone with them:
+# they existed to stop S1 or S2 quietly fixing an RFC bug that belonged to a
+# later step, and every step has now landed. What remains pins four bugs that
+# are still live.
 expected=$(
 	cat <<'EOF'
-a_cname_is_alone_at_its_owner_name
-a_wildcard_does_not_reach_below_a_name_that_exists
-an_empty_non_terminal_answers_nodata_over_the_wire
-an_rrset_never_mixes_ttls
 editor::tests::saving_preserves_the_config_file_permissions
 editor::tests::two_concurrent_writers_do_not_corrupt_the_config
 txt_record_values_round_trip_through_presentation_format
 ui::tests::colour_state_is_not_shared_between_concurrent_tests
-zone::tests::a_wildcard_does_not_apply_below_a_name_that_exists
-zone::tests::an_empty_non_terminal_is_nodata_not_nxdomain
-zone::tests::the_parent_of_a_wildcard_is_not_nxdomain
 EOF
 )
 
