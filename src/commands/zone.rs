@@ -176,8 +176,9 @@ pub fn check(config: &Config, config_path: Option<&Path>, as_json: bool) -> Resu
 
     if as_json {
         emit_json(&json!({
-            "ok": true,
+            "ok": zone.diagnostics().is_empty(),
             "config": config_path.map(|p| p.display().to_string()),
+            "findings": zone.diagnostics(),
             "zone": {
                 "origin": config.zone.origin,
                 "default_ttl": config.zone.default_ttl,
@@ -194,7 +195,7 @@ pub fn check(config: &Config, config_path: Option<&Path>, as_json: bool) -> Resu
             "rate_limit": config.rate_limit.map(|r| json!({ "qps": r.qps, "burst": r.burst })),
             "log": { "format": format!("{:?}", config.log_format).to_lowercase(), "level": config.log_level },
         }));
-        return Ok(());
+        return report_findings(&zone);
     }
 
     ui::section("CONFIGURATION");
@@ -269,8 +270,44 @@ pub fn check(config: &Config, config_path: Option<&Path>, as_json: bool) -> Resu
     );
 
     println!();
+    print_findings(&zone);
+    report_findings(&zone)?;
     println!("{} configuration is valid", ui::tick());
     Ok(())
+}
+
+/// Render the zone's build-time findings, one per line, or nothing at all.
+fn print_findings(zone: &Zone) {
+    if zone.diagnostics().is_empty() {
+        return;
+    }
+    ui::section("ZONE FINDINGS");
+    for note in zone.diagnostics() {
+        println!("  {} {note}", ui::bang());
+    }
+    println!();
+}
+
+/// Turn the zone's build-time findings into `check`'s exit status.
+///
+/// The asymmetry VEGA-032 §6.2 argues for, made concrete: occluded data and
+/// missing glue are a **WARN** at build time, because the zone still serves and
+/// refusing it would turn a config that works today into a failed reload — but
+/// they are an **error** here, because `check` exists to be run before the
+/// restart, where a non-zero exit costs nothing and a silent pass costs a
+/// subtree.
+fn report_findings(zone: &Zone) -> Result<()> {
+    let findings = zone.diagnostics();
+    if findings.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the zone builds and would be served, but {} finding(s) above need \
+         fixing: records occluded by a zone cut are silently not answered, and \
+         a delegation missing its in-bailiwick glue makes the whole delegated \
+         subtree unresolvable (RFC 1034 §4.2.1, RFC 2181 §6)",
+        findings.len()
+    )
 }
 
 /// Resolve the config path for a command that requires one.

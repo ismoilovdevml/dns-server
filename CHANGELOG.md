@@ -7,6 +7,47 @@ the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Delegation and glue.** A non-apex `NS` record set is now a zone cut. A query
+  at or below it is answered with a **referral** — the `NS` RRset in the
+  authority section, in-zone `A`/`AAAA` for its targets in the additional
+  section, **AA clear**, rcode `NOERROR` — instead of the AA-set `NXDOMAIN` it
+  used to get. That old answer was not merely unhelpful: it was authoritative
+  and cacheable, and RFC 8020 §2 lets a resolver apply one cached `NXDOMAIN` to
+  the entire delegated subtree.
+
+  ```toml
+  [[zone.records]]
+  name   = "sub"
+  type   = "NS"
+  values = ["ns1.sub.example.com."]
+
+  [[zone.records]]
+  name   = "ns1.sub"          # in-bailiwick, so its address is mandatory glue
+  type   = "A"
+  values = ["203.0.113.53"]
+  ```
+
+  Three consequences worth knowing before you upgrade:
+
+  - **The apex `NS` RRset is not a delegation** and is still answered
+    authoritatively. Only a *non-apex* `NS` creates a cut.
+  - **Glue is answered from the additional section, never from the answer
+    section.** A query for `ns1.sub.example.com/A` now returns the referral, not
+    the address, because RFC 2181 §6 makes data at or below a cut the child
+    zone's. An out-of-bailiwick target (`sub NS ns.other.example.`) gets no glue
+    at all and no warning — its address is not ours to assert.
+  - **Records below a cut that are not glue are dropped and not served**
+    (RFC 2181 §6, "occluded"), with a `WARN` naming each one and a non-zero exit
+    from `vega check`. They are dropped rather than refused, so an existing
+    config still loads; `dns_zone_records` will step *down* by the number of
+    occluded records.
+
+  `vega check` now exits non-zero, listing every finding in one run, when the
+  zone builds but carries occluded records or a delegation whose in-bailiwick
+  glue is missing.
+
 ### Changed — BREAKING
 
 - **`rate_limit.qps` and `.burst` now apply to a source network, not a source

@@ -1185,3 +1185,62 @@ async fn concurrent_queries_are_all_answered() {
         assert_eq!(task.await.expect("task completes"), ResponseCode::NoError);
     }
 }
+
+/// Scenario: Truncation clears the additional section with everything else
+/// AC-4.9 — RFC 1035 §4.1.1, §4.2.1
+///
+/// A referral is one of the largest responses this server produces: an NS RRset
+/// plus an address for every target. When it does not fit in the 512 octets a
+/// non-EDNS client is entitled to, the glue goes with the answer and the
+/// authority — leaving it behind would be unsolicited address data in a packet
+/// with nothing left to explain it, which is exactly the record a cache should
+/// never have been offered (RFC 2181 §5.4.1).
+#[tokio::test]
+async fn a_truncated_referral_carries_no_orphaned_glue() {
+    let mut records = vec![spec("@", "NS", &[&format!("ns1.{ZONE}.")])];
+    let targets: Vec<String> = (1..=8)
+        .map(|i| format!("ns{i}.a-rather-long-delegated-label.sub.{ZONE}."))
+        .collect();
+    records.push(spec(
+        "sub",
+        "NS",
+        &targets.iter().map(String::as_str).collect::<Vec<_>>(),
+    ));
+    for (i, _) in targets.iter().enumerate() {
+        records.push(spec(
+            &format!("ns{}.a-rather-long-delegated-label.sub", i + 1),
+            "A",
+            &[&format!("203.0.113.{}", i + 1)],
+        ));
+    }
+    let server = TestServer::start(records, None).await;
+
+    let request = query_message(&format!("host.sub.{ZONE}"), RecordType::A);
+    let (len, response) = round_trip_measured(&server, &request).await;
+
+    assert!(
+        len <= 512,
+        "a non-EDNS UDP referral must fit in 512, got {len}"
+    );
+    assert!(
+        response.metadata.truncation,
+        "a referral that did not fit must set TC so the client retries over TCP"
+    );
+    assert!(
+        response.additionals.is_empty(),
+        "glue survived a truncation that dropped the referral it belongs to: {:?}",
+        response.additionals
+    );
+    assert!(response.authorities.is_empty());
+    assert!(response.answers.is_empty());
+
+    // TCP has room, and must deliver the whole referral.
+    let over_tcp = ask_tcp(&server, &format!("host.sub.{ZONE}"), RecordType::A).await;
+    assert!(!over_tcp.metadata.truncation);
+    assert_eq!(over_tcp.authorities.len(), 8, "the full NS RRset");
+    assert_eq!(over_tcp.additionals.len(), 8, "glue for every target");
+    assert!(
+        !over_tcp.metadata.authoritative,
+        "a referral never carries AA, on any transport"
+    );
+}

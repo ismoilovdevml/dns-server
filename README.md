@@ -301,6 +301,38 @@ values = ["203.0.113.10", "203.0.113.11"]
 
 </details>
 
+### Delegating a subdomain
+
+A **non-apex** `NS` record set is a zone cut. Every name at or below it is
+answered with a referral — `NS` in the authority section, glue in the additional
+section, `AA` clear — instead of from our own data (RFC 1034 §4.3.2 step 3(b)).
+
+```toml
+[[zone.records]]
+name   = "sub"                       # a NON-apex NS: this is a delegation
+type   = "NS"
+values = ["ns1.sub.example.com."]
+
+[[zone.records]]
+name   = "ns1.sub"                   # inside the delegated subtree, so this
+type   = "A"                         # address is mandatory glue
+values = ["203.0.113.53"]
+```
+
+Three rules worth knowing:
+
+- The **apex** `NS` RRset (`name = "@"`) names the servers for *this* zone. It is
+  not a delegation and is answered authoritatively.
+- **Glue is mandatory when, and only when, the NS target is inside the delegated
+  subtree.** Without it the subtree is unresolvable — the resolver would have to
+  ask the very server whose address it is trying to learn. `vega check` fails on
+  a missing one. An out-of-bailiwick target (`ns.other.example.`) needs none, and
+  gets none: its address is not ours to assert.
+- **Anything else at or below the cut is not served** (RFC 2181 §6). A `TXT` at
+  `host.sub` is the child zone's to answer, so it is dropped with a `WARN` and
+  `vega check` reports it. It is dropped rather than refused, so an existing
+  config still loads — but `dns_zone_records` will not count it.
+
 ### Diagnostic sub-zones
 
 Enabled by default; a fast way to prove a deployment works end to end. Turn them

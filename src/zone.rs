@@ -28,16 +28,28 @@
 //! the entire subtree below it, so denying an empty non-terminal denies the
 //! records that do exist under it (VEGA-006).
 //!
+//! Every node also carries the **zone cut at or above it**, computed once at
+//! build time. RFC 1034 §4.3.2 step 3(b) asks "has the search left this zone's
+//! authoritative data", and that question is a field read here rather than a
+//! walk up the query name — which matters because the negative path never
+//! touches any node but the closest encloser, and because the client picks how
+//! many labels a walk would have to climb. A query at or below a cut is answered
+//! with a referral: the NS RRset in the authority section, in-zone glue in the
+//! additional section, AA clear.
+//!
 //! # What this module does NOT do yet
 //!
-//! This is S2 of the six commits VEGA-032 sequences. A wildcard still applies
-//! below a name that exists rather than only under the closest encloser (S3),
-//! there is no delegation, glue or occlusion handling (S4), and SOA and apex NS
-//! are still optional (S5). `tests/arena_differential.rs` holds this file to a
-//! transcription of the implementation S1 replaced, fed a node set closed under
-//! ancestry, and permits exactly three classes of difference — all three
-//! consequences of that closure and each derived from the config rather than
-//! from what this file returned.
+//! This is S4 of the six commits VEGA-032 sequences. SOA and apex NS are still
+//! optional, an RRset can still carry mixed TTLs, and a CNAME can still share
+//! its owner name with another type (all S5).
+//!
+//! `tests/arena_differential.rs` holds this file to a transcription of the
+//! implementation S1 replaced, fed a node set closed under ancestry, and permits
+//! only named classes of difference, each derived from the config rather than
+//! from what this file returned. Delegation is outside what those oracles model:
+//! their generators declare no non-apex NS RRset, so no zone they build has a
+//! cut, and a widened generator fails the comparison loudly rather than
+//! silently agreeing.
 //!
 //! Ruling: `.claude/backlog/decisions/VEGA-032-zone-data-model.md`.
 
@@ -115,11 +127,15 @@ impl NodeIdx {
 
     /// "No delegation at or above this node". A sentinel rather than an
     /// `Option<NodeIdx>` so the field stays four bytes instead of eight.
-    // Read by `Node::cut`, which arrives with delegation at S4. Kept here rather
-    // than added then, because it is the other half of `APEX`'s contract that a
-    // `u32` index reserves two values and the build must never hand out either.
-    #[allow(dead_code)]
+    ///
+    /// The other half of [`Self::APEX`]'s contract: a `u32` index reserves two
+    /// values and the build must never hand out either.
     pub(crate) const NONE: Self = Self(u32::MAX);
+
+    /// True when this is the [`Self::NONE`] sentinel rather than a real node.
+    pub(crate) const fn is_none(self) -> bool {
+        self.0 == Self::NONE.0
+    }
 
     /// The arena position, for slice access. Never `[]`: a range built at build
     /// time "must" be valid is exactly the assumption the next refactor
@@ -251,11 +267,46 @@ impl SuffixHashes {
 pub enum Answer {
     /// Records to place in the answer section.
     Records(Vec<Record>),
+    /// The query name is at or below a zone cut: RFC 1034 §4.3.2 step 3(b).
+    ///
+    /// The NS RRset at the delegation point goes in the authority section and
+    /// in-zone addresses for its targets in the additional section (§4.2.1).
+    Referral {
+        /// Normally empty. Non-empty in exactly one case: a CNAME we *are*
+        /// authoritative for whose target lies below a cut, where RFC 1034
+        /// §4.3.2 step 3(a) restarts the search into step 3(b) and the alias
+        /// itself is still our answer.
+        answers: Vec<Record>,
+        /// The delegating NS RRset, owned by the delegation point.
+        authority: Vec<Record>,
+        /// Glue: in-zone A/AAAA for the NS targets.
+        additional: Vec<Record>,
+    },
     /// The owner name exists but has no records of the requested type
     /// (RFC 2308 "NODATA"): `NOERROR` with an empty answer section.
     NoData,
     /// The owner name does not exist: `NXDOMAIN`.
     NxDomain,
+}
+
+impl Answer {
+    /// Whether the AA bit belongs on a response carrying this answer.
+    ///
+    /// RFC 1035 §4.1.1 defines AA as authority **for the name in the question
+    /// section**, so it comes off exactly when the answer section is empty and a
+    /// referral is all we have: the question is below a cut and is not ours. A
+    /// CNAME whose target happens to be below a cut keeps AA set, because the
+    /// alias at the QNAME *is* ours (RFC 1034 §4.3.2 step 3(a)).
+    ///
+    /// Here rather than in the handler because it is a statement about the zone
+    /// data, and because the handler already had two other places that could
+    /// have decided it differently.
+    pub fn is_authoritative(&self) -> bool {
+        match self {
+            Self::Referral { answers, .. } => !answers.is_empty(),
+            _ => true,
+        }
+    }
 }
 
 /// The `*` label, RFC 4592 §2.1.1. A wildcard is a node whose leftmost label is
@@ -301,15 +352,22 @@ fn span(range: Span) -> Range<usize> {
 /// named `*.something` and hold no records at all. An enum either loses one of
 /// those combinations or grows into a bitfield with extra steps
 /// (VEGA-032 §3.2).
-///
-/// Bits 1 and 4 are reserved for `DELEGATION` and `GLUE`, which arrive with S4.
-/// They are not declared here: a flag nothing reads is a flag nobody maintains.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct NodeFlags(u8);
 
 impl NodeFlags {
     /// No flags: an ordinary node.
     const NONE: Self = Self(0);
+
+    /// A non-apex NS RRset sits here, so this node is a zone cut
+    /// (RFC 1034 §4.2.1).
+    ///
+    /// **The apex is never this**, however many NS records it owns: the apex NS
+    /// RRset names the servers for *this* zone and is authoritative data we
+    /// answer with AA set (AC-4.8). A delegation names the servers for a
+    /// subtree we have given away, and everything at or below it is answered
+    /// with a referral instead.
+    const DELEGATION: Self = Self(1 << 1);
 
     /// The leftmost label is `*` (RFC 4592 §2.1.1), so this node is a source of
     /// synthesis.
@@ -338,6 +396,16 @@ impl NodeFlags {
     /// A CNAME RRset is present, so the RFC 1034 §3.6.2 substitution has
     /// something to find. Lets every other node skip a second type search.
     const HAS_CNAME: Self = Self(1 << 3);
+
+    /// Strictly below a zone cut: glue, not authoritative data (RFC 2181 §6).
+    ///
+    /// Nothing on the query path reads this — [`Node::cut`] answers "is this
+    /// below a cut" as one field read, and answers it at the delegation point
+    /// too, which this flag deliberately does not. It is set because it is the
+    /// build's own statement about which records survived occlusion, and
+    /// `debug_assert_invariants` holds the two to each other: a node whose `cut`
+    /// is set and is not itself the cut is glue, and nothing else is.
+    const GLUE: Self = Self(1 << 4);
 
     /// True when every bit of `other` is set here.
     const fn contains(self, other: Self) -> bool {
@@ -375,12 +443,17 @@ struct Rrset {
 
 /// One name in the zone.
 ///
-/// 96 bytes: an 80-byte `Name`, an 8-byte range, one byte of flags, padded.
-/// Measured, not computed — the ruling's §7.1 works from
+/// 96 bytes: an 80-byte `Name`, an 8-byte range, a 4-byte cut index, one byte of
+/// flags, padded. Measured, not computed — the ruling's §7.1 works from
 /// `size_of::<Name>() = 96` and `size_of::<RData>() = 168`, and hickory-proto
 /// 0.26.1 on this machine reports **80** and **184**. The two errors cancel and
 /// the ~303 B/record total stands; `tests/zone_memory.rs` prints all three on
 /// every run so a dependency bump that moves them is visible.
+///
+/// **S4's `cut` field is free.** It lands in padding the S1 layout was already
+/// spending, so the flat 100,000-record fixture measures the same byte count
+/// before and after — which is why `tests/zone_memory.rs`'s ±64 B window did not
+/// have to move for delegation.
 #[derive(Debug)]
 struct Node {
     /// The owner name, in the case the config wrote it, because that is the case
@@ -398,7 +471,37 @@ struct Node {
     /// descendants, and RFC 4035 §2.3 wants exactly that — an NSEC carrying only
     /// the NSEC and RRSIG bits — rather than a variant to special-case.
     rrsets: Span,
+    /// The zone cut at or above this node, or [`NodeIdx::NONE`].
+    ///
+    /// RFC 1034 §4.3.2 step 3(b) asks "has the search left the authoritative
+    /// data of this zone", and this is that question answered at **build time**,
+    /// as a field read rather than as a walk up the name. `cut == self` at the
+    /// delegation point itself; a strict ancestor's index at every glue name
+    /// beneath it; [`NodeIdx::NONE`] everywhere else, including the apex —
+    /// however many NS records the apex owns, it is not a cut (AC-4.8).
+    ///
+    /// One field read is the whole point. A walk would be O(labels) per query on
+    /// a name whose length the client chooses, and it would have to run on the
+    /// negative path too, where the closest encloser is the only node the lookup
+    /// ever touches.
+    cut: NodeIdx,
     flags: NodeFlags,
+}
+
+/// The two record sections of a referral, assembled once at build time.
+///
+/// Precomputed because a referral is otherwise the most expensive answer we
+/// produce: the NS RRset plus an address lookup per NS target, on a query an
+/// attacker can repeat as fast as the link allows. Here it is two slice clones
+/// into exactly-sized `Vec`s.
+#[derive(Debug)]
+struct Referral {
+    /// The NS RRset at the delegation point, owner = the delegation point.
+    /// Goes in the **authority** section (RFC 1034 §4.3.2 step 3(b)).
+    authority: Box<[Record]>,
+    /// In-zone A/AAAA for every NS target. Goes in the **additional** section
+    /// (RFC 1034 §4.2.1). Empty when every target is out of bailiwick.
+    additional: Box<[Record]>,
 }
 
 /// An immutable authoritative zone.
@@ -460,6 +563,28 @@ pub struct Zone {
     /// [`Self::origin_depth`], which it is stored next to because neither is
     /// meaningful alone.
     max_depth: u8,
+
+    /// One assembled referral per delegation, keyed by the delegation's node
+    /// index — [`Node::cut`], which every node at or below the cut already
+    /// carries.
+    ///
+    /// A map and not an arena slot on `Node`, because delegations are a handful
+    /// in a zone of a hundred thousand names and four bytes per node to reach
+    /// them would be four bytes every node pays for a branch it never takes.
+    /// Keys are our own node indices, never anything from a packet, so the
+    /// table's hasher is not an attack surface the way [`Self::index`]'s is.
+    referrals: HashMap<u32, Referral>,
+
+    /// Build-time findings that do not stop the zone being served: occluded
+    /// records that were dropped, and delegations missing in-bailiwick glue.
+    ///
+    /// Each is logged as a WARN as it is found, *and* kept here, because a WARN
+    /// at startup scrolls past and `vega check` is where an operator goes
+    /// looking. `check` reports every one and exits non-zero; the server serves
+    /// the zone anyway, which is the asymmetry VEGA-032 §6.2 argues for — these
+    /// configs work today and refusing them would turn a running deployment
+    /// into a failed reload.
+    diagnostics: Box<[String]>,
 
     /// Total number of records, for the `dns_zone_records` metric.
     record_count: usize,
@@ -547,6 +672,138 @@ impl Zone {
     /// True when `name` falls inside this zone.
     pub fn contains(&self, name: &LowerName) -> bool {
         self.lower_origin.zone_of(name)
+    }
+
+    /// Build-time findings that did not stop the zone being served.
+    ///
+    /// Occluded records that were dropped, and delegations whose in-bailiwick
+    /// glue is missing. Each was logged as a WARN when it was found; this is how
+    /// `vega check` reports **all** of them in one run instead of an operator
+    /// finding the first one in yesterday's log.
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+
+    /// Assemble one referral per delegation.
+    ///
+    /// Runs once per build, over the finished arena, so that answering a
+    /// referral on the query path is two slice clones instead of an NS lookup
+    /// plus an address lookup per target.
+    ///
+    /// # When glue is mandatory, and when it must be omitted
+    ///
+    /// Glue is **mandatory** exactly when the NS target is at or below the
+    /// delegation point (RFC 1034 §4.2.1): the child's servers are named inside
+    /// the subtree we have just told the resolver to ask them about, so without
+    /// their addresses the delegation cannot be followed at all. A target
+    /// missing that glue is a WARN naming the delegation, and `vega check`
+    /// reports it — not a build failure, because the zone still serves every
+    /// other name.
+    ///
+    /// Glue **must be omitted** for an out-of-bailiwick target: its address is
+    /// not ours to assert, RFC 2181 §5.4.1 ranks such data below the answer the
+    /// resolver will get from the authoritative source, and volunteering it is
+    /// how a cache gets fed records from a zone that never authorised them. An
+    /// out-of-bailiwick delegation is normal and gets **no** warning either
+    /// (AC-4.4).
+    ///
+    /// In-zone addresses for a target that is neither — a sibling name under
+    /// this origin but not under the cut — are included, because they are ours
+    /// to assert, they are free, and they save the resolver a round trip. That
+    /// is what BIND does.
+    fn build_referrals(&self, diagnostics: &mut Vec<String>) -> HashMap<u32, Referral> {
+        let mut referrals = HashMap::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            if !node.flags.contains(NodeFlags::DELEGATION) {
+                continue;
+            }
+            let Ok(index) = u32::try_from(index) else {
+                continue;
+            };
+
+            let ns = self.rrsets_of(node, RecordType::NS);
+            let mut authority = Vec::new();
+            self.emit(ns, &node.name, &mut authority);
+
+            let cut_name = LowerName::from(node.name.clone());
+            let mut additional: Vec<Record> = Vec::new();
+            let mut seen: Vec<LowerName> = Vec::new();
+            for value in ns
+                .iter()
+                .filter_map(|run| self.rdata.get(span(run.rdata)))
+                .flatten()
+            {
+                let RData::NS(target) = value else { continue };
+                let lower = LowerName::from(target.0.clone());
+                if seen.contains(&lower) {
+                    continue;
+                }
+                seen.push(lower.clone());
+
+                let before = additional.len();
+                if self.contains(&lower) {
+                    let hashes = SuffixHashes::new(self.hash_seed, &lower);
+                    if let Some(glue) = self
+                        .exact_node(&lower, &hashes)
+                        .and_then(|idx| self.nodes.get(idx.get()))
+                    {
+                        for rtype in [RecordType::A, RecordType::AAAA] {
+                            self.emit(self.rrsets_of(glue, rtype), &glue.name, &mut additional);
+                        }
+                    }
+                }
+                if additional.len() == before && cut_name.zone_of(&lower) {
+                    let note = format!(
+                        "delegation {cut_name} names {lower} as a name server but the zone \
+                         holds no A or AAAA for it. RFC 1034 §4.2.1 requires that glue: the \
+                         target sits inside the delegated subtree, so a resolver cannot \
+                         find its address without already being able to reach it, and the \
+                         whole subtree is unresolvable"
+                    );
+                    tracing::warn!(delegation = %cut_name, target = %lower, "{note}");
+                    diagnostics.push(note);
+                }
+            }
+
+            referrals.insert(
+                index,
+                Referral {
+                    authority: authority.into_boxed_slice(),
+                    additional: additional.into_boxed_slice(),
+                },
+            );
+        }
+        referrals
+    }
+
+    /// The precomputed referral for the cut at `idx`, as an [`Answer`].
+    ///
+    /// Two slice clones into exactly-sized `Vec`s and nothing else — no probe,
+    /// no name arithmetic, no map of records to walk. `answers` is whatever the
+    /// caller has already emitted, which is empty for a plain referral and holds
+    /// the alias when a CNAME chase walked into a delegated subtree.
+    ///
+    /// A cut index with no referral cannot happen — the build inserts one per
+    /// `DELEGATION` node — but it is answered as an empty referral rather than
+    /// with an `expect`, because with `panic = "abort"` the alternative to a
+    /// slightly wrong answer here is the whole server.
+    fn referral(&self, idx: NodeIdx, answers: Vec<Record>) -> Answer {
+        let Ok(key) = u32::try_from(idx.get()) else {
+            return Answer::Referral {
+                answers,
+                authority: Vec::new(),
+                additional: Vec::new(),
+            };
+        };
+        let (authority, additional) = self.referrals.get(&key).map_or_else(
+            || (Vec::new(), Vec::new()),
+            |r| (r.authority.to_vec(), r.additional.to_vec()),
+        );
+        Answer::Referral {
+            answers,
+            authority,
+            additional,
+        }
     }
 
     // ----------------------------------------------------------- the probe
@@ -697,6 +954,7 @@ impl Zone {
         let mut answers = Vec::new();
         match self.resolve(name, record_type, 0, &mut answers) {
             Resolution::Found => Answer::Records(answers),
+            Resolution::Referral(cut) => self.referral(cut, answers),
             Resolution::NoData => Answer::NoData,
             Resolution::NxDomain => Answer::NxDomain,
         }
@@ -719,32 +977,50 @@ impl Zone {
         // is bounded by MAX_CNAME_DEPTH.
         let hashes = SuffixHashes::new(self.hash_seed, name);
 
-        // RFC 1035 §3.2.3: ANY (255) is a QTYPE, never an RRTYPE, so it can
-        // never be the type of an RRset in the arena. RFC 8482 makes *what* to
-        // answer for it a responder policy, and that policy lives in
-        // `DnsHandler`; the zone layer reports existence and nothing else.
-        //
-        // This replaced a scan of the whole record map, which cost 1.83 ms on a
-        // 100k-record zone — 18,239x an A lookup, and one routing change away
-        // from the packet path — and which carried the same existence defect at
-        // its NXDOMAIN arm (VEGA-083 §4.4). Reporting existence is the only
-        // bounded answer, and it stays bounded now that a node arena exists:
-        // "iterate the nodes" is a very natural thing to reach for and would put
-        // the O(zone) scan straight back.
-        //
-        // A caller that reads `NoData` here as "the node is empty" is wrong.
-        // AXFR (VEGA-034) needs ordered node iteration and will not get it from
-        // this function, so do not reintroduce the scan to serve a transfer.
-        if record_type.is_any() {
-            return if self.exists_hashed(name, &hashes) {
-                Resolution::NoData
-            } else {
-                Resolution::NxDomain
-            };
-        }
-
         if let Some(idx) = self.exact_node(name, &hashes) {
             if let Some(node) = self.nodes.get(idx.get()) {
+                // RFC 1034 §4.3.2 step 3(b), as one field read. This fires at
+                // the delegation point itself and at every glue name beneath it:
+                // RFC 2181 §6 makes data at or below a cut the child zone's, so
+                // glue is never answered from the answer section — a resolver
+                // that asked us for the address of `ns1.sub` gets the referral,
+                // and takes the address from the additional section as the hint
+                // it is (AC-4.2).
+                //
+                // Ahead of the ANY branch on purpose: "any type" in AC-4.2
+                // includes QTYPE=ANY, and RFC 8482's synthesised HINFO is an
+                // authoritative answer about a name we have given away.
+                //
+                // When DNSSEC lands, QTYPE=DS at the cut is the one exception
+                // and is answered from the parent side (RFC 4035 §3.1.4.1). The
+                // branch point is here; it is not taken.
+                if !node.cut.is_none() {
+                    return Resolution::Referral(node.cut);
+                }
+
+                // RFC 1035 §3.2.3: ANY (255) is a QTYPE, never an RRTYPE, so it
+                // can never be the type of an RRset in the arena. RFC 8482 makes
+                // *what* to answer for it a responder policy, and that policy
+                // lives in `DnsHandler`; the zone layer reports existence and
+                // nothing else.
+                //
+                // This replaced a scan of the whole record map, which cost
+                // 1.83 ms on a 100k-record zone — 18,239x an A lookup, and one
+                // routing change away from the packet path — and which carried
+                // the same existence defect at its NXDOMAIN arm (VEGA-083 §4.4).
+                // Reporting existence is the only bounded answer, and it stays
+                // bounded now that a node arena exists: "iterate the nodes" is a
+                // very natural thing to reach for and would put the O(zone) scan
+                // straight back.
+                //
+                // A caller that reads `NoData` here as "the node is empty" is
+                // wrong. AXFR (VEGA-034) needs ordered node iteration and will
+                // not get it from this function, so do not reintroduce the scan
+                // to serve a transfer.
+                if record_type.is_any() {
+                    return Resolution::NoData;
+                }
+
                 let run = self.rrsets_of(node, record_type);
                 if !run.is_empty() {
                     self.emit(run, &node.name, out);
@@ -781,7 +1057,18 @@ impl Zone {
                             if self.contains(&target) {
                                 // A dangling in-zone target still yields the
                                 // CNAME itself.
-                                let _ = self.resolve(&target, record_type, depth + 1, out);
+                                //
+                                // A target below a zone cut yields the CNAME
+                                // *and* the referral, with AA still set: RFC
+                                // 1034 §4.3.2 step 3(a) restarts the search at
+                                // the target and lands in step 3(b), and the
+                                // alias at the QNAME is ours however far its
+                                // target has been delegated away (AC-4.7).
+                                if let Resolution::Referral(cut) =
+                                    self.resolve(&target, record_type, depth + 1, out)
+                                {
+                                    return Resolution::Referral(cut);
+                                }
                             }
                         }
                         return Resolution::Found;
@@ -796,12 +1083,30 @@ impl Zone {
         // when the queried name itself does not exist — which, since the probe
         // above sees wildcard nodes too, is now a statement about every name and
         // not only about ordinary ones (RFC 4592 §2.2.2).
-        let Some(idx) = self.source_of_synthesis(name, &hashes) else {
+        let (encloser_depth, encloser) = self.closest_encloser(name, &hashes);
+
+        // Step 3(b) again, and this is why `cut` is precomputed rather than
+        // walked. The closest encloser is the deepest name of ours the query
+        // reached; if a delegation sits at or above *it*, the query name is
+        // inside the delegated subtree and the answer is the referral, not a
+        // name error and not a wildcard synthesis from above the cut.
+        if let Some(cut) = self.nodes.get(encloser.get()).map(|node| node.cut) {
+            if !cut.is_none() {
+                return Resolution::Referral(cut);
+            }
+        }
+
+        let Some(idx) = self.wildcard_node(name, encloser_depth, &hashes) else {
             // "If the source of synthesis does not exist … there is no wildcard
             // match", and step 3(c)'s first paragraph then sets the
             // authoritative name error.
             return Resolution::NxDomain;
         };
+        if record_type.is_any() {
+            // The name exists — a wildcard covers it — so §A2's reasoning
+            // applies unchanged: existence, never enumeration.
+            return Resolution::NoData;
+        }
         if let Some(node) = self.nodes.get(idx.get()) {
             let run = self.rrsets_of(node, record_type);
             if !run.is_empty() {
@@ -850,17 +1155,24 @@ impl Zone {
     /// answer section. Reading them from two places is how they drifted apart
     /// and made the rcode depend on the QTYPE (VEGA-083).
     fn source_of_synthesis(&self, name: &LowerName, hashes: &SuffixHashes) -> Option<NodeIdx> {
-        let encloser = self.closest_encloser(name, hashes);
-        self.wildcard_node(name, encloser, hashes)
+        let (depth, _) = self.closest_encloser(name, hashes);
+        self.wildcard_node(name, depth, hashes)
     }
 
-    /// The depth of the **closest encloser** of `name`: the deepest proper
-    /// ancestor of `name` that exists as a node (RFC 4592 §3.3.1).
+    /// The **closest encloser** of `name`: the deepest proper ancestor of `name`
+    /// that exists as a node (RFC 4592 §3.3.1), as `(depth, node)`.
     ///
-    /// A depth and not a [`NodeIdx`], because that is all the source-of-synthesis
-    /// probe needs and an index nothing reads is an index nobody maintains. S4
-    /// wants the node itself, for the RFC 1034 §4.3.2 step 3(b) cut check, and
-    /// widening the return type is the whole of that change.
+    /// Both halves are needed and neither is derivable from the other for free.
+    /// The depth is what the source-of-synthesis probe folds a `*` label onto;
+    /// the node is what carries [`Node::cut`], and the RFC 1034 §4.3.2 step 3(b)
+    /// check on the negative path is a read of that field (S4). Returning the
+    /// depth alone would mean re-probing to get the node, on the path that has
+    /// no allocations and no spare probes.
+    ///
+    /// The node is [`NodeIdx::APEX`] whenever the search returns the floor
+    /// without probing. That is sound for the one thing the caller reads it for:
+    /// the apex is never a cut, so a floor that is a lie about an out-of-zone
+    /// name still yields "no delegation above this", which is the truth.
     ///
     /// # Why a binary search is correct here
     ///
@@ -888,7 +1200,7 @@ impl Zone {
     /// The first probe is speculative and pays for itself on the traffic that
     /// dominates: a miss one label below something that exists, where the
     /// immediate parent is the answer and the bisection never runs.
-    fn closest_encloser(&self, name: &LowerName, hashes: &SuffixHashes) -> usize {
+    fn closest_encloser(&self, name: &LowerName, hashes: &SuffixHashes) -> (usize, NodeIdx) {
         let (floor, ceiling) = self.encloser_window(hashes.labels());
         if ceiling <= floor {
             // The apex is a node and every in-zone name descends from it, so the
@@ -902,17 +1214,23 @@ impl Zone {
             // It is still safe, because the caller's probe compares the actual
             // labels through `node_name_matches`, so a floor that is a lie yields
             // a miss and never a name from another zone.
-            return floor;
+            return (floor, NodeIdx::APEX);
         }
-        if self.node_at(name, ceiling, hashes).is_some() {
-            return ceiling;
+        if let Some(idx) = self.node_at(name, ceiling, hashes) {
+            return (ceiling, idx);
         }
 
         // Bisect the monotone predicate over `[floor, ceiling - 1]`. `floor` is
         // the apex, known to exist without probing, and `ceiling` is known not to
         // from the probe above — so the invariant "`low` exists, `high + 1` does
         // not" holds on entry and `low` is the answer on exit.
+        //
+        // `found` tracks the node at `low` and is written in the same statement
+        // `low` is, so the two cannot disagree about which name the search
+        // settled on. When no probe ever succeeds, `low` stays at the floor and
+        // the apex is the answer, which is what the floor means.
         let (mut low, mut high) = (floor, ceiling - 1);
+        let mut found = NodeIdx::APEX;
         while low < high {
             // `high - low` strictly decreases every pass — `mid` is at least
             // `low + 1` and at most `high` — so termination is structural rather
@@ -920,13 +1238,14 @@ impl Zone {
             // matters for `origin = "."`, where the floor is 0 and a decrementing
             // walk needs an extra guard to avoid spinning on the root.
             let mid = low + (high - low).div_ceil(2);
-            if self.node_at(name, mid, hashes).is_some() {
+            if let Some(idx) = self.node_at(name, mid, hashes) {
                 low = mid;
+                found = idx;
             } else {
                 high = mid - 1;
             }
         }
-        low
+        (low, found)
     }
 
     /// The depths the closest-encloser search may probe, as inclusive bounds
@@ -1041,6 +1360,38 @@ impl Zone {
              reaches into a subtree that name carves out (RFC 4592 §3.3.1). This \
              is what replaced VEGA-065's depth-bitmap invariant, and it is \
              load-bearing for the same reason"
+        );
+        debug_assert!(
+            self.nodes.iter().enumerate().all(|(i, node)| {
+                let delegation = node.flags.contains(NodeFlags::DELEGATION);
+                let glue = node.flags.contains(NodeFlags::GLUE);
+                let at_self = u32::try_from(i).is_ok_and(|i| node.cut == NodeIdx(i));
+                // The three statements the cut pass makes, held to each other:
+                // a delegation is its own cut and has a referral; glue is
+                // strictly below one; nothing else carries a cut at all.
+                delegation == (!node.cut.is_none() && at_self)
+                    && glue == (!node.cut.is_none() && !at_self)
+                    && (!delegation
+                        || u32::try_from(i).is_ok_and(|i| self.referrals.contains_key(&i)))
+                    && (node.cut.is_none() || node.cut.get() < self.nodes.len())
+            }),
+            "a node's DELEGATION/GLUE flags disagree with its `cut`, or a \
+             delegation has no assembled referral. The query path reads `cut` \
+             and the build writes the flags, so a disagreement is a name below a \
+             zone cut answered as if it were ours (RFC 2181 §6)"
+        );
+        debug_assert!(
+            self.nodes.iter().all(|node| {
+                node.cut.is_none()
+                    || self.nodes.get(node.cut.get()).is_some_and(|cut| {
+                        LowerName::from(cut.name.clone())
+                            .zone_of(&LowerName::from(node.name.clone()))
+                    })
+            }),
+            "a node's `cut` names something that is not an ancestor of it. The \
+             cut pass walks canonical order as a pre-order tree walk, so this \
+             means the canonical sort key stopped being prefix-closed and a \
+             delegation has leaked into a sibling subtree"
         );
     }
 }
@@ -1381,36 +1732,11 @@ impl<'a> ZoneBuilder<'a> {
             .map(|r| r.rdata.len())
             .sum();
 
-        // Sorted by a precomputed byte key, not by `LowerName: Ord`. Each `Ord`
-        // comparison is O(labels × octets) through two iterators, which at
-        // 100,000 names is hundreds of milliseconds on every reload; the key is
-        // a `memcmp`. Correctness still rests on `Ord`, which is what
-        // `debug_assert_invariants` and `tests/canonical_order.rs` hold it to.
-        //
-        // Every key goes into **one** scratch buffer and what gets sorted is a
-        // permutation of indices, so the sort costs three allocations rather
-        // than one per name. `sort_by_cached_key` would be 100,000 allocations
-        // and 100,000 frees on the reload path, and VEGA-069 measured RSS
-        // ratcheting 1,736 -> 2,676 -> 3,095 MiB across three reloads on exactly
-        // that kind of churn. The buffer is dropped with the permutation.
-        let mut keys: Vec<u8> = Vec::with_capacity(entries.len() * TYPICAL_KEY_OCTETS);
-        let mut key_spans: Vec<Span> = Vec::with_capacity(entries.len());
-        for (lower, _) in &entries {
-            let start = arena_offset(keys.len())?;
-            write_canonical_sort_key(lower, &mut keys);
-            key_spans.push((start, arena_offset(keys.len())?));
-        }
-        let key_of = |i: usize| -> &[u8] {
-            key_spans
-                .get(i)
-                .and_then(|&s| keys.get(span(s)))
-                .unwrap_or_default()
-        };
-        let mut order: Vec<usize> = (0..entries.len()).collect();
-        // Unstable is safe: no two nodes share a key. Equal keys mean equal
-        // names under RFC 4034 §6.1, and the scratch map is keyed by exactly
-        // that equivalence, so a duplicate cannot have survived to here.
-        order.sort_unstable_by(|&a, &b| key_of(a).cmp(key_of(b)));
+        let Layout {
+            order,
+            cut_of,
+            delegations,
+        } = layout(&entries)?;
 
         let mut slots: Vec<Option<(LowerName, ScratchNode)>> =
             entries.into_iter().map(Some).collect();
@@ -1426,10 +1752,16 @@ impl<'a> ZoneBuilder<'a> {
         // not the depth of the last node in canonical order — canonical order
         // sorts on the rightmost label first and says nothing about depth.
         let mut max_depth = 0usize;
+        // Records dropped by occlusion, so `record_count` reports what is
+        // served rather than what was configured. That gauge is an operator's
+        // only view of whether a reload truncated the zone, and a count that
+        // includes records no query can reach is a count that hides a truncation.
+        let mut dropped = 0usize;
+        let mut diagnostics: Vec<String> = Vec::new();
 
         let hash_seed = RandomState::new().hash_one(0u64);
 
-        for position in order {
+        for (rank, position) in order.into_iter().enumerate() {
             let Some((lower, mut scratch)) = slots.get_mut(position).and_then(Option::take) else {
                 continue;
             };
@@ -1437,11 +1769,19 @@ impl<'a> ZoneBuilder<'a> {
             // declared them.
             scratch.rrsets.sort_by_key(|r| u16::from(r.rtype));
 
-            let rrsets_start = arena_offset(rrsets.len())?;
-            let mut flags = NodeFlags::NONE;
+            let cut = cut_of.get(rank).copied().unwrap_or(NodeIdx::NONE.0);
+            let mut flags = apply_cut(
+                &mut scratch,
+                &lower,
+                (cut, arena_offset(rank)?),
+                &delegations,
+                (&mut dropped, &mut diagnostics),
+            );
             if scratch.wildcard {
                 flags.insert(NodeFlags::WILDCARD);
             }
+
+            let rrsets_start = arena_offset(rrsets.len())?;
             for run in scratch.rrsets {
                 if run.rtype == RecordType::CNAME {
                     flags.insert(NodeFlags::HAS_CNAME);
@@ -1462,24 +1802,14 @@ impl<'a> ZoneBuilder<'a> {
             nodes.push(Node {
                 name: scratch.name,
                 rrsets: (rrsets_start, rrsets_end),
+                cut: NodeIdx(cut),
                 flags,
             });
         }
 
-        // Sized exactly, so no insertion resizes and the hasher below is never
-        // called — it is required by the signature, not by the work.
-        let mut index = HashTable::with_capacity(nodes.len());
-        for (i, &hash) in hashes.iter().enumerate() {
-            index.insert_unique(hash, arena_offset(i)?, |&other| {
-                usize::try_from(other)
-                    .ok()
-                    .and_then(|o| hashes.get(o))
-                    .copied()
-                    .unwrap_or(hash)
-            });
-        }
+        let index = build_index(&hashes)?;
 
-        Ok(Zone {
+        let mut zone = Zone {
             lower_origin,
             default_ttl,
             soa,
@@ -1488,16 +1818,243 @@ impl<'a> ZoneBuilder<'a> {
             rdata: rdata.into_boxed_slice(),
             index,
             hash_seed,
-            // Both saturate at `MAX_LABELS` rather than being asserted to fit.
-            // Neither can exceed it — hickory refuses to build a name past RFC
-            // 1035 §2.3.4's 255 octets, which is what MAX_LABELS is derived from
-            // — but a saturating conversion on the reload path costs one
-            // instruction, and the alternative is an `expect` in a function an
-            // operator runs on every reload.
+            // Both saturate at `MAX_LABELS` (see `depth_byte`) rather than
+            // being asserted to fit: the alternative is an `expect` in a
+            // function an operator runs on every reload.
             origin_depth,
             max_depth: depth_byte(max_depth),
-            record_count: self.record_count,
-        })
+            referrals: HashMap::new(),
+            diagnostics: Box::new([]),
+            record_count: self.record_count.saturating_sub(dropped),
+        };
+
+        // After the arena, because assembling a referral means looking its glue
+        // up by name and the index is what makes that O(1). Nothing here can
+        // fail: a delegation with no reachable glue is a WARN, never a refusal
+        // (VEGA-032 §6.2).
+        let referrals = zone.build_referrals(&mut diagnostics);
+        zone.referrals = referrals;
+        zone.diagnostics = diagnostics.into_boxed_slice();
+        Ok(zone)
+    }
+}
+
+/// Build the owner-name index: node hash to arena position.
+///
+/// Sized exactly from the node count, so no insertion resizes the table and the
+/// rehash closure is never called — it is required by the signature, not by the
+/// work.
+fn build_index(hashes: &[u64]) -> Result<HashTable<u32>> {
+    let mut index = HashTable::with_capacity(hashes.len());
+    for (i, &hash) in hashes.iter().enumerate() {
+        index.insert_unique(hash, arena_offset(i)?, |&other| {
+            usize::try_from(other)
+                .ok()
+                .and_then(|o| hashes.get(o))
+                .copied()
+                .unwrap_or(hash)
+        });
+    }
+    Ok(index)
+}
+
+/// Where every scratch node goes in the arena, and which of them are cuts.
+struct Layout {
+    /// Positions into the scratch entries, in RFC 4034 §6.1 canonical order.
+    /// Position `order[rank]` becomes `nodes[rank]`.
+    order: Vec<usize>,
+    /// `cut_of[rank]` is the delegation at or above that node as an arena
+    /// index, or [`NodeIdx::NONE`].
+    cut_of: Vec<u32>,
+    /// The NS targets of each delegation, keyed by its arena index. What the
+    /// occlusion pass needs to tell glue from data below a cut.
+    delegations: HashMap<u32, Vec<LowerName>>,
+}
+
+/// Sort the scratch nodes into canonical order and find every zone cut.
+///
+/// # The sort
+///
+/// By a precomputed byte key, not by `LowerName: Ord`. Each `Ord` comparison is
+/// O(labels × octets) through two iterators, which at 100,000 names is hundreds
+/// of milliseconds on every reload; the key is a `memcmp`. Correctness still
+/// rests on `Ord`, which is what `debug_assert_invariants` and
+/// `tests/canonical_order.rs` hold it to.
+///
+/// Every key goes into **one** scratch buffer and what gets sorted is a
+/// permutation of indices, so the sort costs three allocations rather than one
+/// per name. `sort_by_cached_key` would be 100,000 allocations and 100,000 frees
+/// on the reload path, and VEGA-069 measured RSS ratcheting 1,736 → 2,676 →
+/// 3,095 MiB across three reloads on exactly that kind of churn. The buffer is
+/// dropped with the permutation.
+///
+/// # Why the cuts come out of the same pass
+///
+/// Canonical order is a pre-order walk of the name tree, and a node's canonical
+/// sort key is a strict prefix of every descendant's key (see
+/// [`is_strict_prefix`]). So the ancestors of the node being visited are exactly
+/// the entries still on the stack, its parent is the top of that stack, and "the
+/// cut at or above me" is "the cut at or above my parent, unless I am one".
+///
+/// O(N) amortised: every rank is pushed once and popped at most once. The
+/// alternative — probing for each node's parent by name — is a hash lookup and a
+/// `base_name()` allocation per node on the reload path.
+fn layout(entries: &[(LowerName, ScratchNode)]) -> Result<Layout> {
+    let mut keys: Vec<u8> = Vec::with_capacity(entries.len() * TYPICAL_KEY_OCTETS);
+    let mut key_spans: Vec<Span> = Vec::with_capacity(entries.len());
+    for (lower, _) in entries {
+        let start = arena_offset(keys.len())?;
+        write_canonical_sort_key(lower, &mut keys);
+        key_spans.push((start, arena_offset(keys.len())?));
+    }
+    let key_of = |i: usize| -> &[u8] {
+        key_spans
+            .get(i)
+            .and_then(|&s| keys.get(span(s)))
+            .unwrap_or_default()
+    };
+
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    // Unstable is safe: no two nodes share a key. Equal keys mean equal names
+    // under RFC 4034 §6.1, and the scratch map is keyed by exactly that
+    // equivalence, so a duplicate cannot have survived to here.
+    order.sort_unstable_by(|&a, &b| key_of(a).cmp(key_of(b)));
+
+    let mut cut_of: Vec<u32> = Vec::with_capacity(order.len());
+    let mut ancestry: Vec<usize> = Vec::new();
+    let mut delegations: HashMap<u32, Vec<LowerName>> = HashMap::new();
+
+    for (rank, &position) in order.iter().enumerate() {
+        let key = key_of(position);
+        while ancestry
+            .last()
+            .and_then(|&a| order.get(a))
+            .is_some_and(|&a| !is_strict_prefix(key_of(a), key))
+        {
+            ancestry.pop();
+        }
+        let inherited = ancestry
+            .last()
+            .and_then(|&a| cut_of.get(a))
+            .copied()
+            .unwrap_or(NodeIdx::NONE.0);
+
+        // Rank 0 is the apex — canonical order puts the shortest name in the
+        // zone first — and the apex is never a cut however many NS records it
+        // owns. That RRset names the servers for *this* zone (RFC 1034 §4.2.1)
+        // and is ours to answer with AA set; a delegation names the servers for
+        // a subtree we have given away (AC-4.8).
+        let targets = if rank == 0 {
+            None
+        } else {
+            entries.get(position).and_then(|(_, node)| ns_targets(node))
+        };
+        let cut = match targets {
+            Some(targets) => {
+                let here = arena_offset(rank)?;
+                delegations.insert(here, targets);
+                here
+            }
+            None => inherited,
+        };
+        cut_of.push(cut);
+        ancestry.push(rank);
+    }
+
+    Ok(Layout {
+        order,
+        cut_of,
+        delegations,
+    })
+}
+
+/// The NS targets declared at `node`, or `None` when it holds no NS RRset.
+///
+/// `Some(vec![])` cannot happen — [`ZoneBuilder::insert_spec`] refuses a record
+/// set with no values — but an empty vector would still be a delegation with no
+/// servers, which is what the missing-glue diagnostic is for.
+fn ns_targets(node: &ScratchNode) -> Option<Vec<LowerName>> {
+    let mut targets: Vec<LowerName> = Vec::new();
+    let mut found = false;
+    for run in node.rrsets.iter().filter(|r| r.rtype == RecordType::NS) {
+        found = true;
+        for value in &run.rdata {
+            if let RData::NS(ns) = value {
+                targets.push(LowerName::from(ns.0.clone()));
+            }
+        }
+    }
+    found.then_some(targets)
+}
+
+/// True when `parent` is the canonical sort key of a strict ancestor of the name
+/// whose key is `child`.
+///
+/// Sound because [`write_canonical_sort_key`] terminates every label with
+/// `0x00 0x00` and escapes a NUL *inside* a label as `0x00 0x01`: a prefix of a
+/// key can therefore only end on a label boundary, so a prefix relation between
+/// two keys is exactly an ancestor relation between the two names. Without the
+/// terminator `b.com` would prefix `bx.com` and the cut pass would inherit a
+/// delegation into a sibling subtree.
+fn is_strict_prefix(parent: &[u8], child: &[u8]) -> bool {
+    parent.len() < child.len() && child.starts_with(parent)
+}
+
+/// Flag one node's position relative to a zone cut, and drop the records at it
+/// that RFC 2181 §6 says are not ours to answer.
+///
+/// Returns [`NodeFlags::DELEGATION`] at the cut itself, [`NodeFlags::GLUE`]
+/// strictly below it, and [`NodeFlags::NONE`] when there is no cut above this
+/// node at all — the case that costs nothing, and the case almost every node in
+/// a zone is in.
+///
+/// At or below a zone cut the only data this server may serve is the delegating
+/// NS RRset itself and the A/AAAA glue for its targets. Everything else is
+/// **occluded**: it sits in the config, it is in the child zone's half of the
+/// namespace, and answering it would be an authoritative answer for records we
+/// have given away.
+///
+/// Dropped with a WARN and served anyway, rather than refused. BIND, NSD and
+/// Knot all warn and occlude; refusing would turn a config that works today into
+/// a failed reload, and a failed reload is an outage (VEGA-032 §6.2).
+///
+/// DS is the named exception when DNSSEC lands (RFC 4035 §2.4 makes it
+/// parent-side data at the cut) and is deliberately not carved out yet: nothing
+/// signs a zone here, and the lookup would answer a referral for it regardless.
+fn apply_cut(
+    scratch: &mut ScratchNode,
+    owner: &LowerName,
+    (cut, here): (u32, u32),
+    delegations: &HashMap<u32, Vec<LowerName>>,
+    (dropped, diagnostics): (&mut usize, &mut Vec<String>),
+) -> NodeFlags {
+    if cut == NodeIdx::NONE.0 {
+        return NodeFlags::NONE;
+    }
+    let at_the_cut = cut == here;
+    let targets = delegations.get(&cut).map_or(&[][..], Vec::as_slice);
+    let is_glue_name = targets.contains(owner);
+    scratch.rrsets.retain(|run| {
+        let keep = (at_the_cut && run.rtype == RecordType::NS)
+            || (is_glue_name && matches!(run.rtype, RecordType::A | RecordType::AAAA));
+        if !keep {
+            *dropped += run.rdata.len();
+            let note = format!(
+                "{} {} is occluded by a zone cut and is not served: RFC 2181 §6 \
+                 makes data at or below a delegation the child zone's, and only \
+                 the NS RRset and A/AAAA glue for its targets are answered here",
+                owner, run.rtype
+            );
+            tracing::warn!(owner = %owner, rtype = %run.rtype, "{note}");
+            diagnostics.push(note);
+        }
+        keep
+    });
+
+    if at_the_cut {
+        NodeFlags::DELEGATION
+    } else {
+        NodeFlags::GLUE
     }
 }
 
@@ -1529,10 +2086,16 @@ fn arena_offset(len: usize) -> Result<u32> {
     })
 }
 
-/// Internal three-way result of [`Zone::resolve`].
+/// Internal result of [`Zone::resolve`].
+///
+/// Carries the delegation's [`NodeIdx`] rather than the assembled referral so
+/// that a CNAME chase which walks into a delegated subtree can propagate it out
+/// of the recursion without cloning records at every level.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Resolution {
     Found,
+    /// The name is at or below the zone cut at this index.
+    Referral(NodeIdx),
     NoData,
     NxDomain,
 }
@@ -5058,5 +5621,346 @@ mod tests {
              forbidden — and the apex `* TXT` must not be reached either, \
              because RFC 4592 §3.3.1 permits no search for an alternate"
         );
+    }
+
+    // =======================================================================
+    // VEGA-032 S4 — DELEGATION AND GLUE (closes VEGA-011 and VEGA-042)
+    //
+    // RFC 1034 §4.3.2 step 3(b): a query at or below a zone cut is answered
+    // with a referral — the NS RRset in the authority section, in-zone glue in
+    // the additional section, AA clear — and never with our own data and never
+    // with a name error. Before S4 `sub NS ns1.sub` produced an AA-set NXDOMAIN
+    // for every name under `sub`, which tells a resolver the subtree does not
+    // exist rather than where to ask.
+    // =======================================================================
+
+    /// The delegated zone this section's fixtures all use.
+    ///
+    /// `sub` is delegated to `ns1.sub`, which is inside the delegated subtree —
+    /// so its address is glue and RFC 1034 §4.2.1 makes it mandatory. `plain`
+    /// has the same shape with no NS, and is what makes "always refer" fail.
+    fn delegated_zone() -> Zone {
+        zone(vec![
+            spec("@", "NS", &["ns1.example.com."]),
+            spec("ns1", "A", &["203.0.113.1"]),
+            spec("sub", "NS", &["ns1.sub.example.com."]),
+            spec("ns1.sub", "A", &["203.0.113.53"]),
+            spec("plain", "A", &["203.0.113.9"]),
+        ])
+    }
+
+    /// The three sections of a referral, or a panic naming what came back.
+    fn referral_of(answer: &Answer) -> (&[Record], &[Record], &[Record]) {
+        match answer {
+            Answer::Referral {
+                answers,
+                authority,
+                additional,
+            } => (answers, authority, additional),
+            other => panic!("expected a referral, got {other:?}"),
+        }
+    }
+
+    /// Scenario: A query below a delegation is a referral, not a name error
+    /// AC-4.1
+    ///
+    /// VEGA-011's headline. The failure this replaces was an **AA-set NXDOMAIN**
+    /// for a name we had explicitly given away: authoritative, cacheable, and
+    /// under RFC 8020 §2 licence for a resolver to deny the whole delegated
+    /// subtree from one packet.
+    #[test]
+    fn a_query_below_a_delegation_is_a_referral_with_its_glue() {
+        let _watchdog = watchdog();
+        let z = delegated_zone();
+
+        let answer = z.lookup(&lower("host.sub.example.com."), RecordType::A);
+        let (answers, authority, additional) = referral_of(&answer);
+
+        assert!(
+            answers.is_empty(),
+            "the answer section of a referral is empty: we hold no records for a \
+             name below the cut (RFC 2181 §6)"
+        );
+        assert!(
+            !answer.is_authoritative(),
+            "AA is authority for the name in the QUESTION section (RFC 1035 \
+             §4.1.1), and that name is below the cut"
+        );
+
+        assert_eq!(authority.len(), 1);
+        assert_eq!(
+            authority[0].name,
+            Name::from(lower("sub.example.com.")),
+            "the NS RRset is owned by the DELEGATION POINT, not by the query name"
+        );
+        assert_eq!(authority[0].record_type(), RecordType::NS);
+
+        assert_eq!(additional.len(), 1, "glue for the in-bailiwick NS target");
+        assert_eq!(
+            additional[0].name,
+            Name::from(lower("ns1.sub.example.com."))
+        );
+        assert_eq!(additional[0].data, a("203.0.113.53"));
+    }
+
+    /// Scenario: The delegation point and its glue name are referrals too
+    /// AC-4.2
+    ///
+    /// The glue half is the one worth having. `ns1.sub/A` looks exactly like an
+    /// ordinary A query against a name we hold a record for, and answering it
+    /// from the answer section would be an authoritative claim about an address
+    /// RFC 2181 §6 says is the child's to assert.
+    #[test]
+    fn the_delegation_point_and_its_glue_are_referrals_not_answers() {
+        let _watchdog = watchdog();
+        let z = delegated_zone();
+
+        for (name, qtype) in [
+            ("sub.example.com.", RecordType::A),
+            ("sub.example.com.", RecordType::NS),
+            ("sub.example.com.", RecordType::ANY),
+            ("ns1.sub.example.com.", RecordType::A),
+            ("ns1.sub.example.com.", RecordType::ANY),
+        ] {
+            let answer = z.lookup(&lower(name), qtype);
+            let (answers, authority, _) = referral_of(&answer);
+            assert!(answers.is_empty(), "{name}/{qtype} answered from our data");
+            assert_eq!(authority.len(), 1, "{name}/{qtype} carried no NS RRset");
+            assert!(!answer.is_authoritative(), "{name}/{qtype} kept AA set");
+        }
+    }
+
+    /// Scenario: A name below a non-delegation node is still ours
+    /// AC-4.3 — the discriminating negative
+    ///
+    /// Without this, "refer for everything" passes every other test in this
+    /// section. `plain` has exactly the shape of a delegation point minus the NS
+    /// RRset, so the only thing separating the two answers is the cut itself.
+    #[test]
+    fn a_name_below_an_ordinary_node_is_answered_authoritatively() {
+        let _watchdog = watchdog();
+        let z = delegated_zone();
+
+        assert_eq!(
+            z.lookup(&lower("host.plain.example.com."), RecordType::A),
+            Answer::NxDomain,
+            "`plain` holds an A and no NS, so it is not a cut and the name below \
+             it is ours to deny"
+        );
+        let answer = z.lookup(&lower("plain.example.com."), RecordType::A);
+        assert!(
+            matches!(&answer, Answer::Records(records) if records.len() == 1),
+            "got {answer:?}"
+        );
+        assert!(answer.is_authoritative());
+    }
+
+    /// Scenario: The apex NS RRset is not a delegation
+    /// AC-4.8
+    ///
+    /// The apex NS names the servers for **this** zone (RFC 1034 §4.2.1). Read
+    /// as a cut it would make every name in the zone — including the apex — a
+    /// referral to ourselves, which is a server that answers nothing.
+    #[test]
+    fn the_apex_ns_rrset_is_not_a_zone_cut() {
+        let _watchdog = watchdog();
+        let z = delegated_zone();
+
+        let answer = z.lookup(&lower("example.com."), RecordType::NS);
+        let Answer::Records(records) = &answer else {
+            panic!("the apex NS RRset is authoritative data, got {answer:?}");
+        };
+        assert_eq!(records.len(), 1);
+        assert!(answer.is_authoritative());
+
+        assert!(
+            matches!(
+                z.lookup(&lower("plain.example.com."), RecordType::A),
+                Answer::Records(_)
+            ),
+            "a name under the apex is not below a cut"
+        );
+    }
+
+    /// Scenario: An out-of-bailiwick delegation carries no glue and no warning
+    /// AC-4.4
+    ///
+    /// RFC 2181 §5.4.1 ranks glue below the data the resolver will get from the
+    /// authoritative source, and an address for `ns.other.test.` is not ours to
+    /// assert at all. Volunteering one is how a cache is fed a record from a
+    /// zone that never authorised it.
+    #[test]
+    fn an_out_of_bailiwick_delegation_has_no_glue_and_no_diagnostic() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("@", "NS", &["ns1.example.com."]),
+            spec("sub", "NS", &["ns.other.test."]),
+        ]);
+
+        let answer = z.lookup(&lower("host.sub.example.com."), RecordType::A);
+        let (_, authority, additional) = referral_of(&answer);
+        assert_eq!(authority.len(), 1);
+        assert!(
+            additional.is_empty(),
+            "an out-of-bailiwick target's address is not ours to assert"
+        );
+        assert!(
+            z.diagnostics().is_empty(),
+            "an out-of-bailiwick delegation is normal and needs no glue, so it \
+             must not be reported: {:?}",
+            z.diagnostics()
+        );
+    }
+
+    /// Scenario: Missing in-bailiwick glue is a diagnostic, not a build failure
+    /// AC-4.5
+    ///
+    /// The zone is still served: refusing it would turn a config that works
+    /// today into a failed reload, and a failed reload is an outage
+    /// (VEGA-032 §6.2). But the subtree really is unreachable — the resolver is
+    /// told to ask a server whose address it can only learn from that same
+    /// server — so `vega check` reports it and exits non-zero.
+    #[test]
+    fn a_delegation_missing_its_in_bailiwick_glue_is_reported_and_still_served() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("@", "NS", &["ns1.example.com."]),
+            spec("sub", "NS", &["ns1.sub.example.com."]),
+        ]);
+
+        let answer = z.lookup(&lower("host.sub.example.com."), RecordType::A);
+        let (_, authority, additional) = referral_of(&answer);
+        assert_eq!(authority.len(), 1, "the zone is still served");
+        assert!(additional.is_empty());
+
+        assert_eq!(z.diagnostics().len(), 1, "{:?}", z.diagnostics());
+        let note = &z.diagnostics()[0];
+        assert!(
+            note.contains("sub.example.com") && note.contains("ns1.sub.example.com"),
+            "the diagnostic must name the delegation and the target an operator \
+             has to add a record for: {note}"
+        );
+    }
+
+    /// Scenario: Data occluded by a zone cut is dropped, not answered
+    /// AC-4.6
+    ///
+    /// RFC 2181 §6: below a cut the data belongs to the child. A TXT at
+    /// `host.sub` is in our config and is not ours to answer, and answering it
+    /// authoritatively is worse than not holding it — it contradicts the
+    /// delegation in the same breath as making it.
+    #[test]
+    fn data_occluded_by_a_cut_is_dropped_and_the_name_refers() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("@", "NS", &["ns1.example.com."]),
+            spec("sub", "NS", &["ns1.sub.example.com."]),
+            spec("ns1.sub", "A", &["203.0.113.53"]),
+            spec("ns1.sub", "TXT", &["\"not glue\""]),
+            spec("host.sub", "TXT", &["\"occluded\""]),
+            spec("sub", "TXT", &["\"occluded at the cut itself\""]),
+        ]);
+
+        for name in [
+            "host.sub.example.com.",
+            "ns1.sub.example.com.",
+            "sub.example.com.",
+        ] {
+            let answer = z.lookup(&lower(name), RecordType::TXT);
+            let (_, authority, _) = referral_of(&answer);
+            assert_eq!(authority.len(), 1, "{name} answered its occluded TXT");
+        }
+
+        // The glue itself survives — it is the one thing at or below a cut this
+        // server may serve, and it still leaves through the additional section.
+        let answer = z.lookup(&lower("host.sub.example.com."), RecordType::A);
+        let (_, _, additional) = referral_of(&answer);
+        assert_eq!(additional.len(), 1);
+        assert_eq!(additional[0].data, a("203.0.113.53"));
+
+        // Three TXT record sets dropped, three diagnostics, and a record count
+        // that reports what is served rather than what was configured — that
+        // gauge is an operator's only view of a truncated reload.
+        assert_eq!(z.diagnostics().len(), 3, "{:?}", z.diagnostics());
+        assert_eq!(z.record_count(), 3, "1 apex NS + 1 sub NS + 1 glue A");
+    }
+
+    /// Scenario: A CNAME whose target is below a cut keeps AA and gains a referral
+    /// AC-4.7
+    ///
+    /// RFC 1034 §4.3.2 step 3(a) restarts the search at the CNAME's target and
+    /// lands in step 3(b). The alias at the QNAME is ours — we are authoritative
+    /// for `www` — so AA stays set even though the referral says the target is
+    /// not.
+    #[test]
+    fn a_cname_into_a_delegated_subtree_answers_the_alias_and_refers() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("@", "NS", &["ns1.example.com."]),
+            spec("www", "CNAME", &["host.sub.example.com."]),
+            spec("sub", "NS", &["ns1.sub.example.com."]),
+            spec("ns1.sub", "A", &["203.0.113.53"]),
+        ]);
+
+        let answer = z.lookup(&lower("www.example.com."), RecordType::A);
+        let (answers, authority, additional) = referral_of(&answer);
+
+        assert_eq!(answers.len(), 1, "the alias itself is still the answer");
+        assert_eq!(answers[0].record_type(), RecordType::CNAME);
+        assert_eq!(answers[0].name, Name::from(lower("www.example.com.")));
+        assert_eq!(authority.len(), 1);
+        assert_eq!(additional.len(), 1);
+        assert!(
+            answer.is_authoritative(),
+            "we are authoritative for `www.example.com.`, whatever its target \
+             has been delegated to (RFC 1035 §4.1.1)"
+        );
+    }
+
+    /// Scenario: not a behaviour — the cut is a field read, not a walk
+    ///
+    /// RFC 1034 §4.3.2 step 3(b) as designed (VEGA-032 §4.5): every node carries
+    /// the cut at or above it, computed once at build time. This asserts the
+    /// three statements the build makes about a five-deep chain under one
+    /// delegation, because the alternative — a walk on the query path — is
+    /// O(labels) per query on a name whose length the client picks, and it is
+    /// the shape this model exists to remove.
+    #[test]
+    fn every_node_below_a_cut_carries_the_cut_itself() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("@", "NS", &["ns1.example.com."]),
+            spec("sub", "NS", &["ns1.sub.example.com."]),
+            spec("a.b.c.ns1.sub", "A", &["203.0.113.53"]),
+            spec("elsewhere", "A", &["203.0.113.9"]),
+        ]);
+
+        let cut_of = |name: &str| -> NodeIdx {
+            let name = lower(name);
+            let hashes = SuffixHashes::new(z.hash_seed, &name);
+            let idx = z.exact_node(&name, &hashes).expect("node exists");
+            z.nodes.get(idx.get()).expect("node in arena").cut
+        };
+        let delegation = cut_of("sub.example.com.");
+
+        assert!(!delegation.is_none(), "`sub` is its own cut");
+        for below in [
+            "ns1.sub.example.com.",
+            "c.ns1.sub.example.com.",
+            "b.c.ns1.sub.example.com.",
+            "a.b.c.ns1.sub.example.com.",
+        ] {
+            assert_eq!(
+                cut_of(below),
+                delegation,
+                "{below} must carry the delegation four levels above it as one \
+                 field, not find it by walking"
+            );
+        }
+        assert!(
+            cut_of("elsewhere.example.com.").is_none(),
+            "a sibling of the cut is not below it"
+        );
+        assert!(cut_of("example.com.").is_none(), "the apex is never a cut");
     }
 }

@@ -112,8 +112,12 @@ impl Builtins {
 struct Resolved {
     code: ResponseCode,
     answers: Vec<Record>,
-    /// Records for the authority section — the zone SOA on a negative answer.
+    /// Records for the authority section — the zone SOA on a negative answer,
+    /// the delegating NS RRset on a referral.
     authority: Vec<Record>,
+    /// Records for the additional section. Only ever glue: in-zone addresses for
+    /// the NS targets of a referral (RFC 1034 §4.2.1).
+    additional: Vec<Record>,
     authoritative: bool,
 }
 
@@ -123,6 +127,7 @@ impl Resolved {
             code: ResponseCode::NoError,
             answers,
             authority: Vec::new(),
+            additional: Vec::new(),
             authoritative: true,
         }
     }
@@ -132,7 +137,32 @@ impl Resolved {
             code,
             answers: Vec::new(),
             authority: soa.cloned().into_iter().collect(),
+            additional: Vec::new(),
             authoritative: true,
+        }
+    }
+
+    /// RFC 1034 §4.3.2 step 3(b): NS in authority, glue in additional.
+    ///
+    /// `authoritative` is **passed in**, from [`Answer::is_authoritative`], and
+    /// not recomputed here. Two places deciding the AA bit is how they come to
+    /// disagree, and a referral that keeps AA set is a cacheable authoritative
+    /// claim about a subtree we have given away.
+    ///
+    /// The rcode is NOERROR. A referral is not an error and not a denial: it is
+    /// the correct, complete answer to "who knows about this name".
+    fn referral(
+        authoritative: bool,
+        answers: Vec<Record>,
+        authority: Vec<Record>,
+        additional: Vec<Record>,
+    ) -> Self {
+        Self {
+            code: ResponseCode::NoError,
+            authoritative,
+            answers,
+            authority,
+            additional,
         }
     }
 
@@ -141,6 +171,7 @@ impl Resolved {
             code: ResponseCode::Refused,
             answers: Vec::new(),
             authority: Vec::new(),
+            additional: Vec::new(),
             authoritative: false,
         }
     }
@@ -150,6 +181,7 @@ impl Resolved {
             code,
             answers: Vec::new(),
             authority: Vec::new(),
+            additional: Vec::new(),
             authoritative: false,
         }
     }
@@ -262,10 +294,21 @@ impl DnsHandler {
             // wildcard-aware, while the gate was not, so a name covered by a
             // wildcard CNAME was denied before ever reaching the CNAME it owed
             // (RFC 4592 §3.4.3 with RFC 8482 §4.2).
-            if let Answer::Records(cnames) = zone.lookup(name, RecordType::CNAME) {
-                if !cnames.is_empty() {
+            let answer = zone.lookup(name, RecordType::CNAME);
+            let authoritative = answer.is_authoritative();
+            match answer {
+                // RFC 1034 §4.3.2 step 3(b) outranks RFC 8482 §4.2: below a zone
+                // cut the name is not ours, and a synthesised HINFO would be an
+                // authoritative statement about a subtree we delegated away.
+                Answer::Referral {
+                    answers,
+                    authority,
+                    additional,
+                } => return Resolved::referral(authoritative, answers, authority, additional),
+                Answer::Records(cnames) if !cnames.is_empty() => {
                     return Resolved::found(cnames);
                 }
+                _ => {}
             }
             return Resolved::found(vec![minimal_any(
                 Name::from(name.clone()),
@@ -281,11 +324,21 @@ impl DnsHandler {
             }
         }
 
-        match zone.lookup(name, qtype) {
+        let answer = zone.lookup(name, qtype);
+        // Read once, before the answer is taken apart. The AA bit is the zone's
+        // determination (RFC 1035 §4.1.1), and deciding it a second time here is
+        // how the two come to disagree.
+        let authoritative = answer.is_authoritative();
+        match answer {
             Answer::Records(records) if records.is_empty() => {
                 Resolved::negative(ResponseCode::NoError, zone.soa())
             }
             Answer::Records(records) => Resolved::found(records),
+            Answer::Referral {
+                answers,
+                authority,
+                additional,
+            } => Resolved::referral(authoritative, answers, authority, additional),
             Answer::NoData => Resolved::negative(ResponseCode::NoError, zone.soa()),
             Answer::NxDomain => Resolved::negative(ResponseCode::NXDomain, zone.soa()),
         }
@@ -466,6 +519,12 @@ impl RequestHandler for DnsHandler {
         {
             resolved.answers.clear();
             resolved.authority.clear();
+            // The additional section goes with them. Glue left behind after the
+            // referral it belongs to has been dropped is worse than useless: it
+            // is unsolicited address data with nothing in the response to
+            // explain it, and it is exactly the kind of record a cache should
+            // never have been offered (RFC 2181 §5.4.1).
+            resolved.additional.clear();
             truncated = true;
         }
 
@@ -483,7 +542,7 @@ impl RequestHandler for DnsHandler {
             &resolved.answers,
             &resolved.authority,
             NO_RECORDS,
-            NO_RECORDS,
+            &resolved.additional,
         );
 
         let outcome = response_handle.send_response(response).await;
@@ -558,6 +617,12 @@ fn response_size_bound(request: &Request, resolved: &Resolved) -> usize {
             .answers
             .iter()
             .chain(resolved.authority.iter())
+            // Glue counts against the 512-octet budget like everything else. A
+            // referral with four name servers and their addresses is one of the
+            // largest responses this server produces, and leaving it out of the
+            // bound is how a response gets truncated by the encoder instead of
+            // by us — with no TC bit to tell the client to retry over TCP.
+            .chain(resolved.additional.iter())
             .map(record_size_bound)
             .sum::<usize>()
 }

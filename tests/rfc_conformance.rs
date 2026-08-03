@@ -418,3 +418,54 @@ async fn a_wildcard_does_not_reach_below_a_name_that_exists() {
         response.answers
     );
 }
+
+/// VEGA-011 and VEGA-042, closed at VEGA-032 S4, over the wire.
+///
+/// RFC 1034 §4.3.2 step 3(b) and §4.2.1. This is the whole shape of a referral
+/// in one packet, asserted where an operator would see it with `dig`: rcode
+/// NOERROR, **AA clear**, answer section empty, the delegating NS RRset in the
+/// authority section owned by the delegation point, and the in-bailiwick glue in
+/// the additional section.
+///
+/// The behaviour this replaces was an **AA-set NXDOMAIN** for every name below
+/// `sub`. That is not a missing feature, it is a wrong answer: it is
+/// authoritative, it is cacheable, and RFC 8020 §2 lets a resolver apply it to
+/// the entire delegated subtree from a single query.
+#[tokio::test]
+async fn a_name_below_a_delegation_gets_a_referral_over_the_wire() {
+    let server = start(vec![
+        spec("@", "NS", &[&format!("ns1.{ZONE}.")]),
+        spec("ns1", "A", &["203.0.113.1"]),
+        spec("sub", "NS", &[&format!("ns1.sub.{ZONE}.")]),
+        spec("ns1.sub", "A", &["203.0.113.53"]),
+    ])
+    .await;
+
+    let response = ask(
+        &server,
+        &format!("host.sub.{ZONE}"),
+        RecordType::A,
+        DNSClass::IN,
+    )
+    .await;
+
+    assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+    assert!(
+        !response.metadata.authoritative,
+        "AA is authority for the name in the QUESTION section (RFC 1035 §4.1.1) \
+         and that name is below the cut; leaving it set is what let a resolver \
+         cache our NXDOMAIN for a subtree we do not hold"
+    );
+    assert!(response.answers.is_empty(), "{:?}", response.answers);
+
+    assert_eq!(response.authorities.len(), 1);
+    assert_eq!(response.authorities[0].record_type(), RecordType::NS);
+    assert_eq!(response.authorities[0].name, fqdn(&format!("sub.{ZONE}")));
+
+    assert_eq!(response.additionals.len(), 1);
+    assert_eq!(response.additionals[0].record_type(), RecordType::A);
+    assert_eq!(
+        response.additionals[0].name,
+        fqdn(&format!("ns1.sub.{ZONE}"))
+    );
+}

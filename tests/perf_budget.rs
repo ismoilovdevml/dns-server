@@ -715,3 +715,92 @@ fn a_zone_with_many_wildcard_depths_costs_no_more_than_one_with_a_single_depth()
          what made VEGA-078 a security issue"
     );
 }
+
+/// BUDGET (VEGA-032 §5.2, AC-4.10): a referral costs no more than **2x** a
+/// shallow exact hit.
+///
+/// Scenario: A referral is assembled from precomputed sections, not searched for
+/// features/zone-lookup.feature — AC-4.10
+///
+/// A referral is the one answer with two record sections, so it is the one an
+/// attacker would pick if assembling it cost anything per query. The budget is
+/// what makes "precomputed at build time" a checked claim rather than a comment:
+/// if the NS RRset were looked up and its glue resolved per query, this would be
+/// an extra probe per name server plus their rdata copies, on top of the same
+/// hash probe the exact hit pays for.
+///
+/// 2x rather than 1x because the referral really does copy more records — one NS
+/// plus one glue A against one A — and that copy is the answer, not overhead.
+/// What the budget excludes is *searching* for them.
+///
+/// Both sides of the ratio run against the same 100,000-record zone, so the
+/// index, the arena and the cache state are shared and the only difference is
+/// which branch of `Zone::resolve` runs.
+#[test]
+fn a_referral_costs_no_more_than_twice_a_shallow_exact_hit() {
+    let _watchdog = testutil::arm(WATCHDOG);
+
+    let mut records = vec![
+        spec("@", "NS", &["ns1.example.com."]),
+        spec("sub", "NS", &["ns1.sub.example.com."]),
+        spec("ns1.sub", "A", &["203.0.113.53"]),
+    ];
+    records.reserve(ZONE_SIZE);
+    for i in 0..ZONE_SIZE {
+        records.push(spec(
+            &format!("h{i}"),
+            "A",
+            &[&format!(
+                "10.{}.{}.{}",
+                (i >> 16) & 0xff,
+                (i >> 8) & 0xff,
+                i & 0xff
+            )],
+        ));
+    }
+    let z = Zone::from_config(&ZoneConfig {
+        origin: "example.com".to_owned(),
+        default_ttl: 300,
+        builtins: false,
+        soa: Some(SoaSpec {
+            mname: "ns1.example.com.".to_owned(),
+            rname: "hostmaster.example.com.".to_owned(),
+            serial: 1,
+            refresh: 3600,
+            retry: 900,
+            expire: 604_800,
+            minimum: 60,
+        }),
+        records,
+    })
+    .expect("zone builds");
+
+    let hit = lower("h1.example.com.");
+    let below_cut = lower("host.sub.example.com.");
+
+    assert!(
+        matches!(z.lookup(&hit, RecordType::A), Answer::Records(_)),
+        "the baseline must be an exact hit"
+    );
+    assert!(
+        matches!(z.lookup(&below_cut, RecordType::A), Answer::Referral { .. }),
+        "the measured case must be a referral, or this times a name error"
+    );
+
+    let exact = best_of(5, 5_000, || {
+        std::hint::black_box(z.lookup(std::hint::black_box(&hit), RecordType::A));
+    });
+    let referral = best_of(5, 5_000, || {
+        std::hint::black_box(z.lookup(std::hint::black_box(&below_cut), RecordType::A));
+    });
+
+    let r = referral.as_secs_f64() / exact.as_secs_f64();
+    println!("shallow exact hit {exact:?}  referral {referral:?}  ratio {r:.2}x");
+    assert!(
+        r < 2.0,
+        "a referral costs {r:.2}x a shallow exact hit ({referral:?} vs \
+         {exact:?}). The NS RRset and its glue are assembled once per build and \
+         answered as two slice clones; a higher cost means they are being \
+         searched for per query"
+    );
+}

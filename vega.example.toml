@@ -125,6 +125,33 @@ name = "*.apps"
 type = "A"
 values = ["203.0.113.30"]
 
+# --- Delegation ---------------------------------------------------------------
+# A NON-apex NS record set is a zone cut: every name at or below it is answered
+# with a referral (NS in authority, glue in additional, AA clear) rather than
+# from our own data. The apex NS above is NOT a delegation — it names the servers
+# for this zone.
+#
+# Uncomment to hand sub.example.com to another server.
+#
+# [[zone.records]]
+# name = "sub"
+# type = "NS"
+# values = ["ns1.sub.example.com."]
+#
+# The NS target is INSIDE the delegated subtree, so its address is mandatory
+# glue: without it nobody can reach the servers we just pointed them at, and
+# `vega check` fails. An out-of-bailiwick target (ns.other.example.) needs none
+# and gets none — its address is not ours to assert.
+#
+# [[zone.records]]
+# name = "ns1.sub"
+# type = "A"
+# values = ["203.0.113.53"]
+#
+# Anything else at or below the cut belongs to the child zone (RFC 2181 §6). It
+# is dropped with a WARN, reported by `vega check`, and not counted in
+# dns_zone_records.
+
 [[zone.records]]
 name = "_dmarc"
 type = "TXT"

@@ -1100,22 +1100,41 @@ fn classify_s3(
 /// arena so that answers are deterministic across builds and reloads, and an
 /// arena that reordered an RRset would be invisible to a sorted comparison.
 fn rendered(answer: &Answer) -> (&'static str, Vec<String>) {
+    let render = |records: &[Record]| -> Vec<String> {
+        records
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {} {} {}",
+                    r.name.to_string().to_lowercase(),
+                    r.record_type(),
+                    r.ttl,
+                    r.data
+                )
+            })
+            .collect()
+    };
     match answer {
         Answer::NxDomain => ("NXDOMAIN", Vec::new()),
         Answer::NoData => ("NODATA", Vec::new()),
-        Answer::Records(records) => (
-            "RECORDS",
-            records
-                .iter()
-                .map(|r| {
-                    format!(
-                        "{} {} {} {}",
-                        r.name.to_string().to_lowercase(),
-                        r.record_type(),
-                        r.ttl,
-                        r.data
-                    )
-                })
+        Answer::Records(records) => ("RECORDS", render(records)),
+        // Unreachable as the generator stands: `typed_value` draws A, AAAA, TXT,
+        // MX and CNAME, so no zone it builds carries a non-apex NS RRset and no
+        // zone cut exists to refer to. Rendered rather than `unreachable!` so
+        // that widening the generator to declare NS fails this comparison with a
+        // readable diff instead of aborting the process — the oracles predate
+        // S4 and know nothing about delegation, and that is what they should
+        // say out loud.
+        Answer::Referral {
+            answers,
+            authority,
+            additional,
+        } => (
+            "REFERRAL",
+            render(answers)
+                .into_iter()
+                .chain(render(authority))
+                .chain(render(additional))
                 .collect(),
         ),
     }

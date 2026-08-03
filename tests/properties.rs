@@ -937,6 +937,12 @@ fn canonical(answer: &Answer) -> (u8, Vec<String>) {
             rendered.sort();
             (2, rendered)
         }
+        // Unreachable as the generators stand — none of them declares a non-apex
+        // NS RRset, so no zone they build has a cut. Given a distinct tag rather
+        // than folded into an existing one, so that widening a generator to
+        // declare NS shows up as a mismatch against the RFC 4592 oracle (which
+        // predates delegation) instead of silently comparing equal to NODATA.
+        Answer::Referral { .. } => (3, Vec::new()),
     }
 }
 
