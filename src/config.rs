@@ -1180,7 +1180,7 @@ mod tests {
     }
 
     /// Scenario: A duplicated admin_token key does not echo either value
-    /// features/live-reload.feature:354
+    /// features/live-reload.feature:380
     #[test]
     fn a_duplicate_admin_token_key_does_not_echo_either_value() {
         let toml = format!("[server]\nadmin_token = \"{SECRET}\"\nadmin_token = \"{SECRET}\"\n");

@@ -519,11 +519,128 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 // ==========================================================================
+// A0. The swap itself, end to end
+// ==========================================================================
+
+/// Scenario: A reload replaces the served zone
+/// features/live-reload.feature:31
+///
+/// The whole feature in one test: an edit on disk, a real `POST /reload`, and a
+/// query over UDP that gets the new value. The handler-level version, which is
+/// where a gutted `replace_zone` is caught first, is
+/// `src/handler.rs::replace_zone_swaps_the_records_being_served`.
+#[tokio::test]
+async fn a_reload_replaces_the_served_zone() {
+    let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
+        .start()
+        .await;
+    assert_eq!(
+        a_values(&vega.ask("www.example.test.", RecordType::A).await),
+        vec!["203.0.113.10".to_owned()],
+        "the fixture must start on the old address"
+    );
+
+    vega.write_config(&zone_file(Some("example.test"), "198.51.100.1"));
+    let (status, body) = vega.reload().await;
+    assert_eq!(status, 200, "{body}");
+
+    assert_eq!(
+        a_values(&vega.ask("www.example.test.", RecordType::A).await),
+        vec!["198.51.100.1".to_owned()],
+        "the reload reported 200 and went on serving the pre-reload address"
+    );
+}
+
+/// Scenario: A record removed by a reload stops being answered
+/// features/live-reload.feature:40
+///
+/// A reload that only ever adds is half a reload. The `www` assertion at the end
+/// is what stops this passing against a reload that installed an empty zone.
+#[tokio::test]
+async fn a_record_removed_by_a_reload_stops_being_answered() {
+    let with_old = zone_file(Some("example.test"), "203.0.113.10")
+        + "\n[[zone.records]]\nname = \"old\"\ntype = \"A\"\nvalues = [\"203.0.113.11\"]\n";
+    let vega = Spawn::new(with_old).start().await;
+
+    let before = vega.ask("old.example.test.", RecordType::A).await;
+    assert_eq!(
+        before.metadata.response_code,
+        ResponseCode::NoError,
+        "the fixture must start with `old` answering"
+    );
+    assert_eq!(a_values(&before), vec!["203.0.113.11".to_owned()]);
+
+    vega.write_config(&zone_file(Some("example.test"), "203.0.113.10"));
+    let (status, body) = vega.reload().await;
+    assert_eq!(status, 200, "{body}");
+
+    let after = vega.ask("old.example.test.", RecordType::A).await;
+    assert_eq!(
+        after.metadata.response_code,
+        ResponseCode::NXDomain,
+        "a name deleted from the config file is still being answered after a reload"
+    );
+    assert_eq!(
+        a_values(&vega.ask("www.example.test.", RecordType::A).await),
+        vec!["203.0.113.10".to_owned()],
+        "the reload took the rest of the zone with it"
+    );
+}
+
+/// Scenario: A reload can turn the diagnostic built-ins off
+/// features/live-reload.feature:72
+///
+/// The file tier, not the command line: `builtins` is a reloadable setting, so
+/// `reload` must hand `fresh.zone.builtins` to `replace_zone` and not the value
+/// the process started with. The mirror image — the command line winning over
+/// the file — is
+/// `a_reload_does_not_re_enable_builtins_turned_off_on_the_command_line`.
+#[tokio::test]
+async fn a_reload_can_turn_the_diagnostic_builtins_off() {
+    let vega = Spawn::new(config_file(
+        Some("example.test"),
+        "builtins = true\n",
+        "",
+        "203.0.113.10",
+    ))
+    .start()
+    .await;
+
+    let before = vega.ask("myip.example.test.", RecordType::A).await;
+    assert_eq!(
+        before.metadata.response_code,
+        ResponseCode::NoError,
+        "the fixture must start with built-ins answering"
+    );
+
+    vega.write_config(&config_file(
+        Some("example.test"),
+        "builtins = false\n",
+        "",
+        "203.0.113.10",
+    ));
+    let (status, body) = vega.reload().await;
+    assert_eq!(status, 200, "{body}");
+
+    let after = vega.ask("myip.example.test.", RecordType::A).await;
+    assert_eq!(
+        after.metadata.response_code,
+        ResponseCode::NXDomain,
+        "the file turned the diagnostic sub-zones off and the reload kept serving them"
+    );
+    assert_eq!(
+        a_values(&vega.ask("www.example.test.", RecordType::A).await),
+        vec!["203.0.113.10".to_owned()],
+        "the zone itself must still be served"
+    );
+}
+
+// ==========================================================================
 // A. The invocation survives a reload
 // ==========================================================================
 
 /// Scenario: A reload keeps the origin given on the command line
-/// features/live-reload.feature:100
+/// features/live-reload.feature:115
 #[tokio::test]
 async fn a_reload_keeps_the_domain_given_on_the_command_line() {
     let vega = Spawn::new(zone_file(None, "203.0.113.10"))
@@ -547,7 +664,7 @@ async fn a_reload_keeps_the_domain_given_on_the_command_line() {
 }
 
 /// Scenario: A reload does not re-enable built-ins the operator turned off
-/// features/live-reload.feature:111
+/// features/live-reload.feature:126
 #[tokio::test]
 async fn a_reload_does_not_re_enable_builtins_turned_off_on_the_command_line() {
     let vega = Spawn::new(config_file(
@@ -579,7 +696,7 @@ async fn a_reload_does_not_re_enable_builtins_turned_off_on_the_command_line() {
 }
 
 /// Scenario: A file origin shadowed by --domain still reloads
-/// features/live-reload.feature:117
+/// features/live-reload.feature:132
 #[tokio::test]
 async fn a_file_origin_edit_shadowed_by_the_domain_flag_still_reloads() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -602,8 +719,8 @@ async fn a_file_origin_edit_shadowed_by_the_domain_flag_still_reloads() {
     assert_eq!(a_values(&answer), vec!["203.0.113.11".to_owned()]);
 }
 
-/// Scenario: A shadowed file origin is named in the ignored array and warned about
-/// features/live-reload.feature:126
+/// Scenario: A shadowed file origin is named in the ignored array
+/// features/live-reload.feature:141
 #[tokio::test]
 async fn a_shadowed_file_origin_is_reported_as_ignored_and_warned_about() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -623,7 +740,7 @@ async fn a_shadowed_file_origin_is_reported_as_ignored_and_warned_about() {
 }
 
 /// Scenario: Every flag from the invocation is still in force after a reload
-/// features/live-reload.feature:135
+/// features/live-reload.feature:150
 #[tokio::test]
 async fn every_flag_from_the_invocation_is_still_in_force_after_a_reload() {
     let server_section = "\
@@ -702,7 +819,7 @@ async fn a_reload_keeps_the_origin_supplied_by_the_environment() {
 }
 
 /// Scenario: Ten successive reloads with no file change are identical
-/// features/live-reload.feature:144
+/// features/live-reload.feature:159
 #[tokio::test]
 async fn ten_successive_reloads_with_no_file_change_are_identical() {
     let vega = Spawn::new(zone_file(None, "203.0.113.10"))
@@ -921,7 +1038,7 @@ fn every_configuration_field_is_classified_as_reloadable_or_fixed() {
 // ==========================================================================
 
 /// Scenario: A reload that would change the origin is refused
-/// features/live-reload.feature:162
+/// features/live-reload.feature:177
 #[tokio::test]
 async fn a_reload_that_would_change_the_origin_is_refused_with_409() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -942,7 +1059,7 @@ async fn a_reload_that_would_change_the_origin_is_refused_with_409() {
 }
 
 /// Scenario: A refused origin change leaves the previous zone answering
-/// features/live-reload.feature:174
+/// features/live-reload.feature:189
 #[tokio::test]
 async fn a_refused_origin_change_leaves_the_previous_zone_answering() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -963,7 +1080,7 @@ async fn a_refused_origin_change_leaves_the_previous_zone_answering() {
 }
 
 /// Scenario: A refused origin change moves neither the gauge nor the reload counter
-/// features/live-reload.feature:181
+/// features/live-reload.feature:196
 #[tokio::test]
 async fn a_refused_origin_change_moves_neither_the_gauge_nor_the_reload_counter() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -989,7 +1106,7 @@ async fn a_refused_origin_change_moves_neither_the_gauge_nor_the_reload_counter(
 }
 
 /// Scenario: Adding a trailing dot to the origin is not an origin change
-/// features/live-reload.feature:190
+/// features/live-reload.feature:205
 #[tokio::test]
 async fn a_trailing_dot_added_to_the_origin_is_not_an_origin_change() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1010,7 +1127,7 @@ async fn a_trailing_dot_added_to_the_origin_is_not_an_origin_change() {
 }
 
 /// Scenario: Changing the case of the origin is not an origin change
-/// features/live-reload.feature:199
+/// features/live-reload.feature:214
 #[tokio::test]
 async fn a_case_change_in_the_origin_is_not_an_origin_change() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1031,7 +1148,7 @@ async fn a_case_change_in_the_origin_is_not_an_origin_change() {
 }
 
 /// Scenario: A refused origin change never builds the new zone
-/// features/live-reload.feature:206
+/// features/live-reload.feature:221
 #[tokio::test]
 async fn a_file_that_changes_the_origin_is_refused_before_the_zone_is_built() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1052,7 +1169,7 @@ async fn a_file_that_changes_the_origin_is_refused_before_the_zone_is_built() {
 // ==========================================================================
 
 /// Scenario: A changed UDP listener is reported and not applied
-/// features/live-reload.feature:225
+/// features/live-reload.feature:251
 #[tokio::test]
 async fn a_changed_udp_listener_is_reported_as_ignored_and_not_applied() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1081,7 +1198,7 @@ async fn a_changed_udp_listener_is_reported_as_ignored_and_not_applied() {
 }
 
 /// Scenario: A changed rate limit is reported and not applied
-/// features/live-reload.feature:237
+/// features/live-reload.feature:263
 #[tokio::test]
 async fn a_changed_rate_limit_is_reported_as_ignored_and_not_applied() {
     let vega = Spawn::new(config_file(
@@ -1123,7 +1240,7 @@ async fn a_changed_rate_limit_is_reported_as_ignored_and_not_applied() {
 }
 
 /// Scenario: Every fixed setting that drifts is named in the ignored array
-/// features/live-reload.feature:248
+/// features/live-reload.feature:274
 #[tokio::test]
 async fn every_fixed_setting_that_drifts_is_named_in_the_ignored_array() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1166,7 +1283,7 @@ async fn every_fixed_setting_that_drifts_is_named_in_the_ignored_array() {
 }
 
 /// Scenario: A drifted admin token reports its key path and never its value
-/// features/live-reload.feature:258
+/// features/live-reload.feature:284
 #[tokio::test]
 async fn a_drifted_admin_token_reports_the_key_path_and_never_the_value() {
     let vega = Spawn::new(config_file(
@@ -1207,7 +1324,7 @@ async fn a_drifted_admin_token_reports_the_key_path_and_never_the_value() {
 }
 
 /// Scenario: A fixed setting that still drifts is reported on every reload
-/// features/live-reload.feature:270
+/// features/live-reload.feature:296
 #[tokio::test]
 async fn a_fixed_setting_that_still_drifts_is_reported_on_every_reload() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1238,7 +1355,7 @@ async fn a_fixed_setting_that_still_drifts_is_reported_on_every_reload() {
 }
 
 /// Scenario: A reload with nothing drifted reports an empty ignored array
-/// features/live-reload.feature:279
+/// features/live-reload.feature:305
 #[tokio::test]
 async fn a_reload_with_no_drift_reports_an_empty_ignored_array() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1256,7 +1373,7 @@ async fn a_reload_with_no_drift_reports_an_empty_ignored_array() {
 }
 
 /// Scenario: The reload command prints the ignored keys to the terminal
-/// features/live-reload.feature:288
+/// features/live-reload.feature:314
 #[tokio::test]
 async fn the_reload_command_prints_the_ignored_keys_to_the_terminal() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1292,8 +1409,8 @@ async fn the_reload_command_prints_the_ignored_keys_to_the_terminal() {
 // E. Failure modes leave the zone untouched
 // ==========================================================================
 
-/// Scenario: A reload of a deleted config file is refused as config_read_failed
-/// features/live-reload.feature:349
+/// Scenario: A reload of a deleted config file is refused
+/// features/live-reload.feature:401
 #[tokio::test]
 async fn a_reload_of_a_deleted_config_file_is_config_read_failed() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1315,8 +1432,8 @@ async fn a_reload_of_a_deleted_config_file_is_config_read_failed() {
     );
 }
 
-/// Scenario: A reload of unparseable TOML is refused as config_parse_failed
-/// features/live-reload.feature:331
+/// Scenario: A reload of unparseable TOML is refused
+/// features/live-reload.feature:357
 #[tokio::test]
 async fn a_reload_of_unparseable_toml_is_config_parse_failed() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1334,7 +1451,10 @@ async fn a_reload_of_unparseable_toml_is_config_parse_failed() {
 }
 
 /// Scenario: A refused reload never echoes the admin_token line
-/// features/live-reload.feature:339
+/// features/live-reload.feature:365
+///
+/// Scenario: A duplicated admin_token key does not echo either value
+/// features/live-reload.feature:380
 ///
 /// The whole point of doing this end to end: the leak had two exits, the
 /// response body and the WARN line `admin.rs` writes next to it, and only a real
@@ -1409,8 +1529,8 @@ async fn a_refused_reload_puts_the_admin_token_in_neither_the_body_nor_the_log()
     );
 }
 
-/// Scenario: A semantically invalid config is refused as config_invalid
-/// features/live-reload.feature:339
+/// Scenario: A semantically invalid config is refused
+/// features/live-reload.feature:391
 #[tokio::test]
 async fn a_reload_of_a_semantically_invalid_config_is_config_invalid() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1430,8 +1550,8 @@ async fn a_reload_of_a_semantically_invalid_config_is_config_invalid() {
     );
 }
 
-/// Scenario: A config whose zone will not build is refused as zone_build_failed
-/// features/live-reload.feature:321
+/// Scenario: A config whose zone will not build is refused
+/// features/live-reload.feature:347
 #[tokio::test]
 async fn a_reload_that_cannot_build_the_zone_is_zone_build_failed() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1450,7 +1570,7 @@ async fn a_reload_that_cannot_build_the_zone_is_zone_build_failed() {
 }
 
 /// Scenario: No failing reload moves the reload counter or the records gauge
-/// features/live-reload.feature:361
+/// features/live-reload.feature:413
 #[tokio::test]
 async fn no_failing_reload_moves_the_reload_counter_or_the_records_gauge() {
     let good = zone_file(Some("example.test"), "203.0.113.10");
@@ -1493,7 +1613,7 @@ async fn no_failing_reload_moves_the_reload_counter_or_the_records_gauge() {
 }
 
 /// Scenario: Every reload error body carries a code from the documented set
-/// features/live-reload.feature:368
+/// features/live-reload.feature:420
 #[tokio::test]
 async fn every_reload_error_body_carries_a_code_from_the_documented_set() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1516,7 +1636,7 @@ async fn every_reload_error_body_carries_a_code_from_the_documented_set() {
 // ==========================================================================
 
 /// Scenario: Concurrent reload requests are each applied or refused as in progress
-/// features/live-reload.feature:436
+/// features/live-reload.feature:501
 #[tokio::test]
 async fn ten_concurrent_reloads_are_each_either_applied_or_refused_as_in_progress() {
     let vega = Spawn::new(zone_file(Some("example.test"), "203.0.113.10"))
@@ -1557,7 +1677,7 @@ async fn ten_concurrent_reloads_are_each_either_applied_or_refused_as_in_progres
 }
 
 /// Scenario: Fifty reloads under a steady query stream never drop or mix an answer
-/// features/live-reload.feature:389
+/// features/live-reload.feature:446
 #[tokio::test]
 async fn fifty_reloads_under_a_steady_query_stream_never_drop_or_mix_an_answer() {
     let vega = Arc::new(

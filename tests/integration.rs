@@ -821,11 +821,25 @@ async fn a_response_sent_to_the_server_is_ignored() {
     );
 }
 
+/// Scenario: A query that started before a reload finishes against the old zone
+/// features/live-reload.feature:432
+///
+/// The property the whole `ArcSwap` design exists for: a lookup that loaded the
+/// zone before a swap finishes against the zone it loaded, so no answer is ever
+/// half old and half new.
+///
+/// The `seen_old > 0 && seen_new > 0` bound is what makes it discriminating.
+/// Without it every assertion here is satisfied by the pre-reload zone alone, so
+/// the test passed against a `replace_zone` gutted to `()` — the same defect
+/// VEGA-027 found in its sibling `a_failing_reload_leaves_the_previous_zone_in_place`.
 #[tokio::test]
 async fn queries_keep_being_answered_across_a_zone_reload() {
     // A reload swaps an ArcSwap under live traffic. Nothing covered the two
     // happening at once, so a torn swap would have gone unnoticed.
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Instant,
+    };
 
     let cfg = zone_config(vec![spec("www", "A", &["203.0.113.10"])]);
     let zone = Arc::new(Zone::from_config(&cfg).expect("zone builds"));
@@ -857,32 +871,50 @@ async fn queries_keep_being_answered_across_a_zone_reload() {
     };
 
     // Hammer the lookup path while the zone is being swapped underneath it.
-    let mut seen_a = 0u32;
-    let mut seen_b = 0u32;
-    for _ in 0..20_000 {
+    let name =
+        hickory_proto::rr::LowerName::from(format!("www.{ZONE}.").parse::<Name>().expect("name"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen_old = 0u32;
+    let mut seen_new = 0u32;
+    let mut lookups = 0u32;
+    loop {
         let z = handler.zone();
-        match z.lookup(
-            &hickory_proto::rr::LowerName::from(
-                format!("www.{ZONE}.").parse::<Name>().expect("name"),
-            ),
-            RecordType::A,
-        ) {
+        match z.lookup(&name, RecordType::A) {
             vega::zone::Answer::Records(records) => {
                 assert_eq!(records.len(), 1, "a reload must never yield a partial set");
                 match &records[0].data {
-                    RData::A(a) if a.0.to_string() == "203.0.113.10" => seen_a += 1,
-                    RData::A(a) if a.0.to_string() == "198.51.100.7" => seen_b += 1,
+                    RData::A(a) if a.0.to_string() == "203.0.113.10" => seen_old += 1,
+                    RData::A(a) if a.0.to_string() == "198.51.100.7" => seen_new += 1,
                     other => panic!("unexpected record during a reload: {other:?}"),
                 }
             }
             other => panic!("a query in flight during a reload lost its answer: {other:?}"),
+        }
+        lookups += 1;
+
+        // Both zones must actually reach the query path, or this test proves
+        // only that a handler nobody reloaded keeps answering.
+        if lookups >= 20_000 && seen_old > 0 && seen_new > 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            stop.store(true, Ordering::Relaxed);
+            panic!(
+                "after {lookups} lookups the query path only ever saw one zone \
+                 (203.0.113.10: {seen_old}, 198.51.100.7: {seen_new}); replace_zone \
+                 is not installing the zone it was handed"
+            );
         }
     }
 
     stop.store(true, Ordering::Relaxed);
     let reloads = reloader.await.expect("reloader finishes");
     assert!(reloads > 0, "the reloader never ran");
-    assert_eq!(seen_a + seen_b, 20_000);
+    assert_eq!(
+        seen_old + seen_new,
+        lookups,
+        "every lookup must have been counted as one zone or the other"
+    );
 }
 
 /// The single A value the installed zone currently answers `name` with.
@@ -897,7 +929,7 @@ fn installed_a_value(handler: &DnsHandler, name: &hickory_proto::rr::LowerName) 
 }
 
 /// Scenario: A config whose zone will not build is refused
-/// features/live-reload.feature:321
+/// features/live-reload.feature:347
 ///
 /// VEGA-027. The previous version of this test never attempted a reload: it
 /// asserted the fixture was broken and then asserted the handler was unchanged,

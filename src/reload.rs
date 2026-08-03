@@ -660,7 +660,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Scenario: A refused origin change never builds the new zone
-    /// features/live-reload.feature:206
+    /// features/live-reload.feature:221
     #[test]
     fn an_origin_change_is_refused_before_the_zone_is_built() {
         let fixture = Fixture::start(&zone_toml("example.test", 1, ""), &[]);
@@ -687,8 +687,33 @@ mod tests {
         assert_eq!(gauge(&fixture.metrics), before as u64);
     }
 
+    /// Scenario: A reload whose file origin is not a DNS name is refused
+    /// features/live-reload.feature:230
+    ///
+    /// `Config` validation only rejects an *empty* origin, so a name that is
+    /// syntactically a string but not a domain name reaches the origin gate. It
+    /// must be reported as a bad config and not as an origin change: `zone.origin
+    /// = "bad..name"` is a typo an operator fixes in the file, where 409
+    /// origin_changed means "this needs a restart". Different runbooks.
+    #[test]
+    fn a_file_origin_that_is_not_a_dns_name_is_refused_as_config_invalid() {
+        let fixture = Fixture::start(&zone_toml("example.test", 1, ""), &[]);
+        fixture.write(&zone_toml("bad..name", 3, ""));
+
+        let error = fixture
+            .reload()
+            .expect_err("an unparseable origin is refused");
+        assert_eq!(error.code, ReloadErrorCode::ConfigInvalid);
+        assert_eq!(
+            fixture.handler.zone().record_count(),
+            1,
+            "a refused reload replaced the serving zone"
+        );
+        assert_eq!(gauge(&fixture.metrics), 1);
+    }
+
     /// Scenario: Adding a trailing dot to the origin is not an origin change
-    /// features/live-reload.feature:190
+    /// features/live-reload.feature:205
     #[test]
     fn a_cosmetic_origin_edit_is_not_an_origin_change() {
         for spelling in ["example.test.", "EXAMPLE.TEST", "Example.Test."] {
@@ -837,7 +862,7 @@ mod tests {
     }
 
     /// Scenario: A fixed setting that still drifts is reported on every reload
-    /// features/live-reload.feature:270
+    /// features/live-reload.feature:296
     #[test]
     fn a_fixed_setting_that_still_drifts_is_reported_on_every_reload() {
         let fixture = Fixture::start(&zone_toml("example.test", 1, ""), &[]);
@@ -932,6 +957,67 @@ mod tests {
         );
     }
 
+    /// Scenario: A reload updates the zone record count metric
+    /// features/live-reload.feature:82
+    ///
+    /// Every other gauge assertion in the suite asserts that it did *not* move —
+    /// on a refusal, on a failure, on a no-op reload. Nothing asserted it moves
+    /// on a success, so deleting `set_zone_records` from the reload path left the
+    /// whole suite green while `dns_zone_records` described a zone two edits ago.
+    #[test]
+    fn a_successful_reload_moves_the_records_gauge_to_the_new_count() {
+        let fixture = Fixture::start(&zone_toml("example.test", 3, ""), &[]);
+        assert_eq!(gauge(&fixture.metrics), 3, "the fixture must start at 3");
+
+        fixture.write(&zone_toml("example.test", 5, ""));
+        let outcome = fixture.reload().expect("the reload succeeds");
+
+        assert_eq!(outcome.records, 5);
+        assert_eq!(fixture.handler.zone().record_count(), 5);
+        assert_eq!(
+            gauge(&fixture.metrics),
+            5,
+            "dns_zone_records still describes the pre-reload zone"
+        );
+    }
+
+    /// Scenario: A reload drops the zone it replaced
+    /// features/live-reload.feature:456
+    ///
+    /// The decidable form of "repeated reloads do not leak zones": RSS is not a
+    /// test oracle, but reachability is. With no reader holding a snapshot, every
+    /// zone a swap displaced must be unreachable — a `replace_zone` that pushed
+    /// the outgoing zone onto anything, or an `ArcSwap` reader that leaked its
+    /// guard, leaves it alive and this counts it.
+    #[test]
+    fn fifty_reloads_retain_no_zone_but_the_one_installed() {
+        let fixture = Fixture::start(&zone_toml("example.test", 1, ""), &[]);
+
+        let mut displaced: Vec<std::sync::Weak<Zone>> = Vec::new();
+        for count in 2..=51usize {
+            // The `Arc` this borrows is a temporary: the handler holds the only
+            // other strong reference, so the swap below is what decides whether
+            // the weak one can still be upgraded.
+            displaced.push(Arc::downgrade(&fixture.handler.zone()));
+            fixture.write(&zone_toml("example.test", count, ""));
+            fixture.reload().expect("the reload succeeds");
+        }
+
+        let alive = displaced.iter().filter(|z| z.upgrade().is_some()).count();
+        assert_eq!(
+            alive,
+            0,
+            "{alive} of the {} zones a reload displaced are still reachable; \
+             repeated reloads retain every zone they ever served",
+            displaced.len()
+        );
+        assert_eq!(
+            fixture.handler.zone().record_count(),
+            51,
+            "the last reload must still be the one installed"
+        );
+    }
+
     #[test]
     fn a_reloadable_setting_is_applied_and_never_reported_as_ignored() {
         let fixture = Fixture::start(&zone_toml("example.test", 1, ""), &[]);
@@ -995,7 +1081,7 @@ mod tests {
     }
 
     /// Scenario: A refused reload never echoes the admin_token line
-    /// features/live-reload.feature:339
+    /// features/live-reload.feature:365
     ///
     /// The counterpart to `drift`'s rule three lines above its body: the key
     /// path is reportable, the value never is. `drift` honoured it and this
@@ -1052,7 +1138,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Scenario: A reload arriving after the drain has started is refused
-    /// features/live-reload.feature (group F, VEGA-046 invariant I1)
+    /// features/live-reload.feature:514
     #[test]
     fn a_reload_after_the_drain_has_started_is_refused_and_swaps_nothing() {
         let fixture = Fixture::start(&zone_toml("example.test", 1, ""), &[]);
@@ -1070,7 +1156,7 @@ mod tests {
     }
 
     /// Scenario: Concurrent reload requests are each applied or refused as in progress
-    /// features/live-reload.feature:436
+    /// features/live-reload.feature:501
     #[test]
     fn a_second_reload_holding_no_lock_is_refused_as_in_progress() {
         let fixture = Fixture::start(&zone_toml("example.test", 1, ""), &[]);
@@ -1086,7 +1172,7 @@ mod tests {
     }
 
     /// Scenario: A panicking reload does not leave the reload mutex poisoned
-    /// features/live-reload.feature (group F)
+    /// features/live-reload.feature:490
     #[test]
     fn a_poisoned_state_lock_is_recovered_rather_than_bricking_reload() {
         // Debug builds only in production terms — `panic = "abort"` means a
@@ -1110,7 +1196,7 @@ mod tests {
     }
 
     /// Scenario: The record-count gauge never describes a zone that is not installed
-    /// features/live-reload.feature (group G)
+    /// features/live-reload.feature:554
     #[test]
     fn the_records_gauge_never_leads_the_zone_swap() {
         // The zones only ever grow, so "the gauge is ahead of the installed zone"

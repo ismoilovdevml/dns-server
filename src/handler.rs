@@ -1100,6 +1100,85 @@ mod tests {
         );
     }
 
+    /// A zone under a different origin, for the two swap-coupling tests below.
+    fn other_origin_zone() -> (Arc<Zone>, ZoneConfig) {
+        let mut cfg = zone_config(vec![spec("www", "A", &["198.51.100.7"])], true);
+        cfg.origin = "example.net".to_owned();
+        // The fixture SOA names `example.com` hosts; a zone without one is enough
+        // here and keeps the fixture honest about what is being varied.
+        cfg.soa = None;
+        let zone = Arc::new(Zone::from_config(&cfg).unwrap());
+        (zone, cfg)
+    }
+
+    /// Scenario: A swap rebuilds the built-ins under the new zone's origin
+    /// features/live-reload.feature:47
+    ///
+    /// `Active` couples the zone with the built-in names derived from it
+    /// precisely so the two can never disagree about which zone this process is.
+    /// Kills a `replace_zone` that installs the new zone but carries the previous
+    /// `Builtins` forward: `myip` would then answer only under an origin the
+    /// process no longer serves.
+    #[test]
+    fn replace_zone_rebuilds_the_builtins_under_the_new_origin() {
+        let h = handler(vec![], true);
+        assert_eq!(
+            h.resolve(&lower("myip.example.com."), RecordType::A, client())
+                .answers
+                .len(),
+            1,
+            "the fixture must start with built-ins answering under example.com"
+        );
+
+        let (zone, _cfg) = other_origin_zone();
+        h.replace_zone(zone, true);
+
+        assert_eq!(
+            h.resolve(&lower("myip.example.net."), RecordType::A, client())
+                .answers
+                .len(),
+            1,
+            "the swap kept built-ins derived from the zone it replaced, so the \
+             diagnostic names and the zone disagree about which zone this is"
+        );
+    }
+
+    /// Scenario: After a swap the handler refuses names outside the new zone
+    /// features/live-reload.feature:61
+    ///
+    /// Not reachable through `POST /reload` — VEGA-005 answers 409 to an origin
+    /// change — but `replace_zone` is the mechanism that gate protects, and a
+    /// handler that kept answering under the old origin would make the gate the
+    /// only thing standing between an operator and a silently split identity.
+    #[test]
+    fn a_name_outside_the_zone_a_swap_installed_is_refused() {
+        let h = handler(vec![spec("www", "A", &["203.0.113.20"])], true);
+        assert_eq!(
+            h.resolve(&lower("www.example.com."), RecordType::A, client())
+                .answers
+                .len(),
+            1,
+            "the fixture must start authoritative for example.com"
+        );
+
+        let (zone, _cfg) = other_origin_zone();
+        h.replace_zone(zone, true);
+
+        assert_eq!(
+            h.resolve(&lower("www.example.com."), RecordType::A, client())
+                .code,
+            ResponseCode::Refused,
+            "the handler still claims a zone it no longer serves"
+        );
+        assert_eq!(
+            h.resolve(&lower("www.example.net."), RecordType::A, client())
+                .answers
+                .len(),
+            1,
+            "the zone the swap installed is not being served"
+        );
+    }
+
     #[test]
     fn a_builtin_answers_an_any_query_with_its_txt() {
         // Kills `==` -> `!=` on the ANY check in txt_builtin, which turns the

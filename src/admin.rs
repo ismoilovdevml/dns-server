@@ -660,6 +660,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
+    /// Scenario: A successful reload reports the new origin and record count
+    /// features/live-reload.feature:91
     #[tokio::test]
     async fn reload_from_loopback_succeeds_without_a_token() {
         let state = state().with_reload(ok_hook());
@@ -724,6 +726,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// Scenario: A reload that fails to build a zone is reported as a bad request
+    /// features/live-reload.feature:328
+    ///
+    /// Scenario: A failed reload says the configuration is unchanged
+    /// features/live-reload.feature:334
     #[tokio::test]
     async fn a_failing_reload_reports_the_error_and_keeps_serving() {
         let hook: ReloadFn = Arc::new(|| {
@@ -742,6 +749,8 @@ mod tests {
         assert!(body.contains("unchanged"), "{body}");
     }
 
+    /// Scenario: Each successful reload increments the reload counter
+    /// features/live-reload.feature:99
     #[tokio::test]
     async fn reload_counter_increments() {
         let state = state().with_reload(ok_hook());
@@ -769,7 +778,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Scenario: Reload is unavailable when the server was started without a config file
-    /// features/live-reload.feature:407
+    /// features/live-reload.feature:472
     #[tokio::test]
     async fn reload_without_a_hook_names_the_not_configured_code() {
         let response = send(state(), Method::POST, "/reload", "127.0.0.1:1", None).await;
@@ -783,7 +792,7 @@ mod tests {
     }
 
     /// Scenario: Every reload error body carries a code from the documented set
-    /// features/live-reload.feature:368
+    /// features/live-reload.feature:420
     #[tokio::test]
     async fn an_unauthorised_reload_names_the_forbidden_code() {
         let state = state().with_reload(ok_hook());
@@ -795,7 +804,7 @@ mod tests {
     }
 
     /// Scenario: A failed reload does not increment the reload counter
-    /// features/live-reload.feature:315
+    /// features/live-reload.feature:341
     #[tokio::test]
     async fn a_failing_reload_does_not_increment_the_reload_counter() {
         // VEGA-049 is about to alert on this series. A counter that moves on
@@ -812,8 +821,12 @@ mod tests {
         assert!(body.contains("\"reloads\":0"), "{body}");
     }
 
-    /// Scenario: A reload hook that panics is reported as a server error rather than killing the process
-    /// features/live-reload.feature:415
+    /// Scenario: A reload hook that panics is reported as a server error
+    /// features/live-reload.feature:480
+    ///
+    /// The release profile sets `panic = "abort"`, so this arm is reachable in a
+    /// debug build only — which is the point of pinning it here rather than
+    /// end to end.
     #[tokio::test]
     async fn a_panicking_hook_is_reported_as_500_and_a_later_reload_still_succeeds() {
         // Debug builds only: the release profile sets `panic = "abort"`, so this
@@ -851,7 +864,7 @@ mod tests {
     }
 
     /// Scenario: Every reload error body carries a code from the documented set
-    /// features/live-reload.feature:368
+    /// features/live-reload.feature:420
     #[test]
     fn every_reload_error_code_has_a_wire_form_and_a_status() {
         // Enumerated by `match`, not by a list: a variant added without a wire
@@ -891,7 +904,7 @@ mod tests {
     }
 
     /// Scenario: A reload that would change the origin is refused
-    /// features/live-reload.feature:162
+    /// features/live-reload.feature:177
     #[tokio::test]
     async fn an_origin_change_answers_409_with_both_origins() {
         let hook: ReloadFn = Arc::new(|| {
@@ -918,7 +931,7 @@ mod tests {
     }
 
     /// Scenario: A reload with nothing drifted reports an empty ignored array
-    /// features/live-reload.feature:279
+    /// features/live-reload.feature:305
     #[tokio::test]
     async fn the_ignored_array_is_always_present_and_carries_the_key_paths() {
         let empty = state().with_reload(ok_hook());
