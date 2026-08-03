@@ -313,7 +313,7 @@ fn an_any_lookup_does_not_scan_the_whole_record_map() {
 ///
 /// Scenario: An empty non-terminal is answered as cheaply as any other existing
 /// name
-/// features/empty-non-terminals.feature:437
+/// features/empty-non-terminals.feature:448
 ///
 /// An empty non-terminal is "a node with no RRsets" (RFC 4592 §2.2.2), so
 /// answering one is a hash probe, a hit, and an empty RRset range — strictly
@@ -502,5 +502,195 @@ fn the_protocol_ceiling_name_does_not_cost_more_than_a_shallow_one() {
         "a {PROTOCOL_MAX_LABELS}-label lookup costs {r:.1}x a 1-label one \
          (budget 25x, measured {d:?} vs {s:?}). The depth walk is a function of \
          the query name again, at the deepest name the wire can carry"
+    );
+}
+
+/// How many distinct label depths the hostile zone declares a wildcard at.
+///
+/// VEGA-078's own evidence used 120, measured on a running server: one 276-byte
+/// packet bought ~222 µs of server work (~229 µs measured in-process by
+/// perf-engineer), against a 9.1 µs per-query CPU budget. Kept at 120 so the
+/// number this test prints can be compared with that issue's directly.
+const HOSTILE_WILDCARD_DEPTHS: usize = 120;
+
+/// A zone declaring a wildcard at each of `depths` distinct label depths.
+///
+/// `*.a`, `*.a.a`, `*.a.a.a`, … — VEGA-078's shape exactly. Deliberately **no
+/// bare `*` at the apex**: an apex wildcard is the closest encloser of every
+/// name in the zone, so it answers the query and the miss path — the one that
+/// pays for every probe — is never reached. That is the difference between
+/// measuring the attack and measuring a cache hit.
+fn multi_depth_wildcard_zone(depths: usize) -> Zone {
+    let mut records = Vec::with_capacity(depths + 1);
+    records.push(spec("www", "A", &["203.0.113.20"]));
+    for d in 1..=depths {
+        let parent = std::iter::repeat_n("a", d).collect::<Vec<_>>().join(".");
+        records.push(spec(&format!("*.{parent}"), "A", &["203.0.113.1"]));
+    }
+    Zone::from_config(&ZoneConfig {
+        origin: "example.com".to_owned(),
+        default_ttl: 300,
+        builtins: false,
+        soa: Some(SoaSpec {
+            mname: "ns1.example.com.".to_owned(),
+            rname: "hostmaster.example.com.".to_owned(),
+            serial: 1,
+            refresh: 3600,
+            retry: 900,
+            expire: 604_800,
+            minimum: 60,
+        }),
+        records,
+    })
+    .expect("multi-depth wildcard zone builds")
+}
+
+/// BUDGET (VEGA-078; VEGA-032 §5.2 and §13 AC-3.6): the cost of answering a
+/// query does not depend on how many distinct label depths the zone declares a
+/// wildcard at.
+///
+/// Scenario: A zone with wildcards at 120 depths costs no more than one with a
+/// single depth
+/// features/closest-encloser.feature:443
+///
+/// # The issue, in one paragraph
+///
+/// VEGA-065 replaced the `base_name()` climb with a descending probe over a
+/// `u128` of wildcard depths. The loop runs once per **set bit inside the
+/// window** — once per distinct depth at which the zone holds a wildcard — so
+/// the per-query cost stopped being a function of the client's name and became a
+/// function of the operator's zone. Nothing bounds the operator's side, nothing
+/// warns about it, and `wildcard_zone()` above holds exactly one wildcard, so
+/// the existing budget measures the single-probe case and stays green at any
+/// count. Measured on a running server: 1 depth 33.6 µs RTT, 8 depths 35.9 µs,
+/// **120 depths 251.3 µs** against a ~29 µs loopback floor — ~222 µs of server
+/// work, slightly worse than the 174.7 µs that opened VEGA-065, and 24x the
+/// 9.1 µs per-query budget. ~4,500 pps occupies a core.
+///
+/// It carries `security: true` for a reason worth restating: the operator
+/// supplies the wildcard count, but the **query name is attacker-chosen** and it
+/// is what decides that every probe misses. Operator-enabled, attacker-triggered.
+///
+/// # MEASURED AT `bd4b397`, AND THE NUMBER IS NOT THE ONE THE ISSUE PREDICTED
+///
+/// ```text
+///   1 depth    307 ns
+///   8 depths   304 ns
+///   32 depths  390 ns
+///   120 depths 546 ns        ratio 1.9x
+/// ```
+///
+/// VEGA-078 was filed at ~229 µs for the 120-depth case and the ruling promised
+/// ≤ 2 µs at S3. **S1 already delivered 99.7% of that**, and nobody noticed,
+/// because this case did not exist to notice it with. The reason is in that
+/// issue's own analysis: its cost was dominated by `name.trim_to(depth)` —
+/// `Name::from_labels`, an allocation plus a revalidation of `depth` labels —
+/// and by a `LowerName` clone into a tuple key, per probe. The arena replaced
+/// both with a hash comparison against a precomputed suffix hash, so the probe
+/// stopped allocating and the walk collapsed to ~2 ns per depth.
+///
+/// So the honest statement of what each step buys, and both gates are written to
+/// say exactly that:
+///
+///   * the **absolute** (≤ 2 µs) is the ruling's committed number, it is
+///     **already met at `bd4b397`**, and it is here as a RATCHET rather than as
+///     an acceptance criterion. It fails the moment anyone reintroduces a
+///     per-probe allocation or a materialised lookup key — which is precisely
+///     the change that made this a security issue in the first place, and which
+///     nothing else in the tree would catch;
+///   * the **ratio** (≤ 1.5x) is **S3's own claim, and it is red today at 1.9x**.
+///     The probe count is still `popcount(wildcard_depths ∩ window)`; only its
+///     constant got smaller. The closest-encloser rule makes it a constant
+///     outright, so 120 depths must cost what 1 depth costs.
+///
+/// A ratio is the right shape for the structural claim because it survives a
+/// shared runner: if the box is 5x slower both halves are 5x slower. What a
+/// ratio cannot survive is a change of complexity class. The spread above is
+/// printed on every run so that a future failure can be read as "constant factor"
+/// or "the walk came back" without anyone re-deriving it.
+///
+/// perf-engineer's ruling on this issue asked for a ratio case to land
+/// immediately and for the absolute to be "a tightening of the same case ...
+/// measured, in the commit that implements it — not written down in advance as a
+/// number nobody has run". Both land here, measured, in that commit.
+///
+/// # Status: FAILS TODAY on the ratio, and for the right reason
+#[test]
+fn a_zone_with_many_wildcard_depths_costs_no_more_than_one_with_a_single_depth() {
+    let _watchdog = testutil::arm(WATCHDOG);
+
+    let one = multi_depth_wildcard_zone(1);
+    let many = multi_depth_wildcard_zone(HOSTILE_WILDCARD_DEPTHS);
+    let spread = [1usize, 8, 32, 120];
+
+    // The attack shape: a 123-label name of `b` labels, which is the deepest a
+    // name can be under `example.com.` and matches no wildcard parent in either
+    // zone, so every probe misses and `trim_to` pays its worst case.
+    let hostile = lower(&format!(
+        "{}example.com.",
+        "b.".repeat(MAX_QUERY_LABELS - 2)
+    ));
+    assert_eq!(
+        Name::from(hostile.clone()).iter().len(),
+        MAX_QUERY_LABELS,
+        "the query must sit at this zone's depth ceiling, which is where the \
+         probe window is widest"
+    );
+
+    // Both must reach the SAME answer through the same arm, or the two timings
+    // are of two different code paths and the ratio means nothing. NXDOMAIN:
+    // nothing encloses this name but the apex, and the apex holds no wildcard.
+    for (label, z) in [("1-depth", &one), ("120-depth", &many)] {
+        assert_eq!(
+            z.lookup(&hostile, RecordType::A),
+            Answer::NxDomain,
+            "the {label} zone must answer the hostile name with a name error, or \
+             the measurement below is of a wildcard hit rather than of the miss \
+             path that pays for every probe"
+        );
+    }
+
+    let single = best_of(5, 2_000, || {
+        std::hint::black_box(one.lookup(std::hint::black_box(&hostile), RecordType::A));
+    });
+    let hostile_cost = best_of(5, 2_000, || {
+        std::hint::black_box(many.lookup(std::hint::black_box(&hostile), RecordType::A));
+    });
+
+    // The curve, printed rather than asserted. A single ratio says "this got
+    // worse"; the curve says whether it got worse by a constant or by a
+    // complexity class, which is the difference between a slow machine and the
+    // walk coming back.
+    for d in spread {
+        let z = multi_depth_wildcard_zone(d);
+        let t = best_of(5, 2_000, || {
+            std::hint::black_box(z.lookup(std::hint::black_box(&hostile), RecordType::A));
+        });
+        println!("  spread: {d} depths {t:?}");
+    }
+
+    let r = hostile_cost.as_secs_f64() / single.as_secs_f64();
+    println!(
+        "wildcard depths 1 {single:?}   {HOSTILE_WILDCARD_DEPTHS} {hostile_cost:?}   ratio {r:.1}x"
+    );
+
+    assert!(
+        r < 1.5,
+        "a zone declaring wildcards at {HOSTILE_WILDCARD_DEPTHS} distinct depths \
+         costs {r:.1}x one declaring a single depth ({hostile_cost:?} vs \
+         {single:?}). The probe count is a function of the zone again, which is \
+         VEGA-078: the operator supplies the depth count, the attacker supplies \
+         the query name that makes every probe miss, and one 276-byte packet \
+         buys the difference"
+    );
+    assert!(
+        hostile_cost < Duration::from_micros(2),
+        "one query against a {HOSTILE_WILDCARD_DEPTHS}-depth wildcard zone costs \
+         {hostile_cost:?}, against the ruling's 2 µs (§5.2) and a 9.1 µs \
+         per-query CPU budget. This gate was already GREEN at `bd4b397` (546 ns) \
+         because the arena removed the per-probe allocation, so a failure here \
+         is a regression rather than an unmet criterion: something on the miss \
+         path is materialising a name or a lookup key again, which is exactly \
+         what made VEGA-078 a security issue"
     );
 }

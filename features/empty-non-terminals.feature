@@ -69,7 +69,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
   # HAPPY PATH — the name exists, so it is NOERROR
   # =========================================================================
 
-  @happy @enforced src/zone.rs:3545
+  @happy @enforced src/zone.rs:3676
   Scenario: A name that exists only as an ancestor is NODATA, not NXDOMAIN
     # AC-2.1, and the headline of VEGA-006. The record at the bottom of the chain
     # is configured and must keep answering; the names above it exist because it
@@ -78,7 +78,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     When a client queries "b.ent.example.com." for type A
     Then the lookup result is NoData
 
-  @happy @enforced src/zone.rs:3647
+  @happy @enforced src/zone.rs:3781
   Scenario: Every strict ancestor of an owner exists, not just the immediate parent
     # A loop that stops after one level passes the scenario above and leaves
     # every grandparent NXDOMAIN — which is the same RFC 8020 denial one label
@@ -87,7 +87,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     When each of "b.c.d.example.com.", "c.d.example.com." and "d.example.com." is queried for type A
     Then every one of them is NoData
 
-  @happy @enforced src/zone.rs:3673
+  @happy @enforced src/zone.rs:3807
   Scenario: The record beneath an empty non-terminal still answers
     # The half that makes the fix worth having. A build that materialised
     # ancestors but dropped or shadowed the leaf would satisfy every negative
@@ -96,7 +96,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     When a client queries "a.b.ent.example.com." for type A
     Then the answer holds 1 record with value "203.0.113.41"
 
-  @happy @enforced src/zone.rs:3694
+  @happy @enforced src/zone.rs:3828
   Scenario: The service-record shapes that created this bug are all NODATA
     # VEGA-006's own evidence, verified live: SRV, TLSA and DKIM are the three
     # shapes that put a record two or three labels below a name nobody writes.
@@ -108,7 +108,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     Then every one of them is NoData
     And each configured record still answers at its own name
 
-  @happy @enforced src/zone.rs:3588
+  @happy @enforced src/zone.rs:3722
   Scenario: The parent of a wildcard exists
     # AC-2.2. "*.apps.example.com" is a node whose owner name has a parent, so
     # "apps.example.com" exists for exactly the same reason any other ancestor
@@ -159,7 +159,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
   # BOUNDARY — where the ancestor walk starts and stops
   # =========================================================================
 
-  @boundary @enforced src/zone.rs:3742
+  @boundary @enforced src/zone.rs:3876
   Scenario: An owner one label below the apex creates no empty non-terminal
     # The discriminating negative for the whole feature. "www.example.com" has
     # exactly one strict ancestor inside the zone — the apex — which already
@@ -170,7 +170,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     When a client queries "nope.example.com." for type A
     Then the lookup result is NxDomain
 
-  @boundary @enforced src/zone.rs:3769
+  @boundary @enforced src/zone.rs:3903
   Scenario: The ancestor walk stops at the origin and never materialises a name above it
     # An off-by-one in the other direction: walking past the origin would put
     # "com." and the root in the node set, and a server that believes it holds a
@@ -181,7 +181,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     When the zone is asked whether "com." and "." exist
     Then neither of them exists
 
-  @boundary @enforced src/zone.rs:3798
+  @boundary @enforced src/zone.rs:3932
   Scenario: An empty non-terminal is NODATA for every type, including ANY
     # Existence is a property of the NAME, not of the QTYPE (RFC 1034 §4.3.2 step
     # 3(c)). A fix that materialised ancestors only for the type that created
@@ -191,7 +191,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     When "b.ent.example.com." is queried for A, AAAA, TXT, MX, SRV, CNAME, SOA and ANY
     Then every answer is NoData
 
-  @boundary @enforced src/zone.rs:3834
+  @boundary @enforced src/zone.rs:3968
   Scenario: An empty non-terminal is not counted as a record
     # AC-2.4. `record_count` is the dns_zone_records gauge and an operator's only
     # view of whether a reload truncated the zone. Empty non-terminals are nodes,
@@ -201,7 +201,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     When the record count is read
     Then it is 1
 
-  @boundary @enforced src/zone.rs:3865
+  @boundary @enforced src/zone.rs:3999
   Scenario: Every node in the arena has its parent in the arena
     # Invariant I-3, asserted structurally rather than through an answer, because
     # it is what S3's closest-encloser BINARY SEARCH rests on: the predicate "a
@@ -214,7 +214,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     Then each one other than the apex has its immediate parent in the arena
     And every ancestor still precedes its descendant in canonical order
 
-  @boundary @enforced src/zone.rs:3924
+  @boundary @enforced src/zone.rs:4058
   Scenario: An ancestor that is also a declared owner keeps its records
     # The collision case: "b.example.com" is both a configured owner and the
     # strict ancestor of "a.b.example.com". Materialising it twice, or letting
@@ -225,7 +225,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     When "b.example.com." is queried for type A
     Then the answer holds 1 record with value "203.0.113.20"
 
-  @boundary @enforced src/zone.rs:3961
+  @boundary @enforced src/zone.rs:4095
   Scenario: An ancestor that is also a declared wildcard keeps its records and stays a wildcard
     # The same collision one step nastier: "*.dev" is a declared wildcard AND the
     # strict ancestor of "x.*.dev" (RFC 4592 §2.1.3 permits further asterisks
@@ -244,7 +244,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
   # EMPTY — nothing to materialise
   # =========================================================================
 
-  @empty @enforced src/zone.rs:3998
+  @empty @enforced src/zone.rs:4132
   Scenario: A zone holding no records materialises no empty non-terminals
     # The apex exists on its own account and nothing else does. An ancestor loop
     # that ran over an empty owner set and inserted something — the root, or an
@@ -254,7 +254,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     Then the lookup result is NxDomain
     And the apex is still NoData rather than NXDOMAIN
 
-  @empty @enforced src/zone.rs:4020
+  @empty @enforced src/zone.rs:4154
   Scenario: An apex-only owner adds nothing to the node set
     # "@" qualifies to the origin, whose only strict ancestors are outside the
     # zone. The walk must produce an empty set here rather than one entry for the
@@ -277,7 +277,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     When the zone is built
     Then the build fails with an error mentioning "is not inside zone"
 
-  @malformed @enforced src/zone.rs:4046
+  @malformed @enforced src/zone.rs:4180
   Scenario: A wildcard whose own owner name exceeds 255 octets materialises no ancestors
     # RFC 1035 §2.3.4 caps a name at 255 octets, so a wildcard whose parent sits
     # within two octets of the ceiling has no representable owner name and is not
@@ -293,7 +293,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     Then the lookup result is NxDomain
     And the build emits a warning naming the record
 
-  @malformed @enforced tests/arena_differential.rs:970
+  @malformed @enforced tests/arena_differential.rs:1544
   Scenario: A config the transcription refuses is still a config the arena refuses
     # Ancestor materialisation must not make a config load that fails today, nor
     # fail one that loads. The build outcome is compared before any answer is,
@@ -323,21 +323,32 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     Then the lookup result is NoData
     And "x.*.dev.example.com." still answers with its own record
 
-  @hostile @enforced src/zone.rs:3565 @enforced tests/arena_differential.rs:1312
-  Scenario: A wildcard still applies below a name that exists — S2 does not fix VEGA-009
-    # The fence. Ancestor closure makes it TEMPTING to also fix the
-    # closest-encloser rule here, and doing so would leave S3 with nothing to
-    # prove and no differential to prove it against. "*.dev" and "deep.dev" both
-    # present: "a.deep.dev" must still be answered from "*.dev", wrongly, exactly
-    # as it is today. The test pinning the defect stays #[ignore]d and RED, and
-    # its ignore reason stays pinned verbatim by the source-level guard.
+  @hostile
+  Scenario: The wildcard no longer applies below a name that exists — S3 discharges the fence
+    # DISCHARGED AT VEGA-032 S3, in the commit that closes VEGA-009, which is the
+    # only commit allowed to touch this scenario.
+    #
+    # It used to read "S2 does not fix VEGA-009" and asserted that
+    # "a.deep.dev.example.com." was STILL answered from "*.dev", wrongly, with
+    # a_wildcard_does_not_apply_below_a_name_that_exists still #[ignore]d and
+    # red. That was the right fence for S2: ancestor closure makes the
+    # closest-encloser fix look like a two-line change, and making it there would
+    # have left S3 with nothing to prove and no differential to prove it against.
+    #
+    # S3 has landed the rule, so the fence comes down and the assertion INVERTS.
+    # It is kept rather than deleted because it is the clearest statement in this
+    # file of what S2 was and was not responsible for, and because the two S2
+    # behaviours it depends on — "deep.dev" existing, and existing as a node the
+    # closest-encloser search can find — are exactly what S3 is built on.
+    #
+    # Full specification: features/closest-encloser.feature.
     Given the zone contains record set "*.dev" of type "A" with values "203.0.113.50"
     And the zone contains record set "deep.dev" of type "A" with values "203.0.113.51"
     When "a.deep.dev.example.com." is queried for type A
-    Then it is still answered from the wildcard, non-conformantly
-    And a_wildcard_does_not_apply_below_a_name_that_exists is still ignored and red
+    Then the lookup result is NxDomain
+    And a_wildcard_does_not_apply_below_a_name_that_exists is green and not ignored
 
-  @hostile @enforced src/zone.rs:4139
+  @hostile @enforced src/zone.rs:4273
   Scenario: An empty non-terminal chain at the protocol's label ceiling is answered
     # 127 labels is the deepest name the wire can carry (RFC 1035 §3.1:
     # 127 * 2 + 1 = 255) and is reachable only under origin ".". A single owner
@@ -351,7 +362,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     Then each one is NoData and none panics
     And the whole sweep completes inside the watchdog
 
-  @hostile @enforced tests/properties.rs:1571
+  @hostile @enforced tests/properties.rs:1932
   Scenario: No strict ancestor of any configured owner is ever NXDOMAIN
     # RFC 8020 §2 as a property over generated zones rather than the handful of
     # shapes anyone thinks to write. Cases are CONSTRUCTED, never filtered: the
@@ -366,7 +377,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     When that ancestor is looked up for any type
     Then the answer is never NxDomain
 
-  @hostile @enforced tests/arena_differential.rs:970
+  @hostile @enforced tests/arena_differential.rs:1544
   Scenario: S2 changes the answer at an empty non-terminal and nowhere else
     # The differential, re-armed. Its oracle is the same transcription of the
     # pre-S1 implementation, run over a node set that has been closed under
@@ -391,7 +402,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     Then the answer matches the transcription over the ancestor-closed node set
     And every difference from the pre-S2 transcription is one of the three classes
 
-  @hostile @enforced tests/arena_differential.rs:1387
+  @hostile @enforced tests/arena_differential.rs:2032
   Scenario: All three transition classes are actually reached
     # A classification nothing exercises is a classification that permits
     # everything. The deterministic fixture must hit each of the three classes at
@@ -406,7 +417,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
   # BUDGETS — what ancestor closure costs
   # =========================================================================
 
-  @boundary @enforced tests/zone_memory.rs:439
+  @boundary @enforced tests/zone_memory.rs:498
   Scenario: An empty non-terminal costs one node and nothing else
     # AC-2.6, and the number the release note owes an operator: RSS grows on
     # upgrade with no config change. MEASURED, not projected, on this machine at
@@ -444,7 +455,7 @@ Feature: Empty non-terminals exist (RFC 4592 §2.2.2, RFC 8020 §2)
     When the empty non-terminal and an ordinary owner are each looked up many times
     Then the empty non-terminal costs no more than twice the ordinary owner
 
-  @boundary @enforced tests/zone_memory.rs:439
+  @boundary @enforced tests/zone_memory.rs:498
   Scenario: A negative answer still allocates nothing after ancestors are materialised
     # S1's zero-allocation guarantee on the three negative shapes is a property
     # of the probe, not of the node set, and it must survive a node set that is

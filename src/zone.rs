@@ -2506,34 +2506,55 @@ mod tests {
         assert_eq!(LowerName::from(records[0].name.clone()), name);
     }
 
+    /// Scenario: The closest encloser search costs at most eight probes at the
+    /// deepest name the wire can carry
+    /// features/closest-encloser.feature:289
+    ///
+    /// REWRITTEN AT VEGA-032 S3, and strengthened rather than weakened. It
+    /// asserted `wildcard_depths & (1 << 127) != 0` — the top bit of VEGA-065's
+    /// bitmap, which nothing else reached. That field is deleted at S3, so an
+    /// assertion about it would have to go one way or the other, and the two
+    /// options are not equal: deleting the test loses the mutation kills
+    /// (`MAX_LABELS: 127 -> 126`, `127 -> 128` and `depth <= MAX_LABELS` -> `<`
+    /// ALL survived the whole suite before it existed), while restating it as an
+    /// ANSWER keeps every one of them and stops depending on a private field.
+    ///
+    /// So it now asserts what the bit was a proxy for: **the deepest wildcard a
+    /// zone can hold still synthesises.** That is a strictly stronger claim — a
+    /// bit can be set on a wildcard the search never reaches.
+    ///
+    /// The arithmetic of "deepest", which is why the parent sits at 126 and not
+    /// at 127. RFC 1035 §2.3.4 caps a name at 255 octets and §3.1 spends two
+    /// octets on a single-character label plus one terminator, so a name carries
+    /// at most 127 of them. A wildcard at parent depth `d` is a node of `d + 1`
+    /// labels, and the shallowest name it covers also has `d + 1` — one label
+    /// below the parent, RFC 4592 §3.3.1 — so both hit the ceiling together at
+    /// `d = 126`. At `d = 127` the wildcard has no representable owner name at
+    /// all, which is a different case and is pinned separately by
+    /// `a_wildcard_whose_owner_name_exceeds_the_octet_limit_materialises_no_ancestors`.
+    ///
+    /// Getting this wrong is easy and quiet — the first version of this test
+    /// used `d = 125` and asserted a 127-label covered name, which is 126. The
+    /// length assertion below is there because a fixture that misses the ceiling
+    /// by one measures the ordinary case and reports it as the boundary.
     #[test]
-    fn a_wildcard_parent_at_the_label_ceiling_is_registered_not_silently_dropped() {
-        // The bit-127 boundary of `wildcard_depths`, which nothing else reaches.
-        //
-        // `MAX_LABELS: 127 -> 126`, `127 -> 128` and `depth <= MAX_LABELS` ->
-        // `<` ALL SURVIVED the whole suite before this test existed. Each drops
-        // a wildcard out of the depth bitmap while leaving it in `self.wildcard`
-        // — a configured wildcard that is silently unreachable for the life of
-        // the process, with nothing in the logs.
-        //
-        // The ceiling is hard-coded rather than written as `MAX_LABELS`, because
-        // a test that builds its fixture from the constant it is checking moves
-        // with the mutation and pins nothing. 127 is derived, not tuned: RFC
-        // 1035 §2.3.4 caps a name at 255 octets and §3.1 spends two octets on a
-        // single-character label plus one terminator, so 2n + 1 <= 255.
+    fn the_deepest_wildcard_a_zone_can_hold_still_synthesises() {
+        // Hard-coded rather than written as `MAX_LABELS`, because a test that
+        // builds its fixture from the constant it is checking moves with the
+        // mutation and pins nothing.
         const CEILING: usize = 127;
+        const DEEPEST_USEFUL_PARENT: usize = CEILING - 1;
 
         let _watchdog = watchdog();
         assert_eq!(
             MAX_LABELS, CEILING,
             "MAX_LABELS is the arithmetic consequence of RFC 1035 §2.3.4 and \
-             §3.1, and it is also the highest bit of the u128 the depth bitmap \
-             lives in. Moving it is not a tuning decision"
+             §3.1. It sizes the suffix hash array the closest-encloser search \
+             indexes on every negative query, and moving it is not a tuning \
+             decision"
         );
 
-        // 127 single-octet labels in a root-origin zone is 255 octets exactly:
-        // the deepest wildcard parent that can be configured at all.
-        let parent = std::iter::repeat_n("a", CEILING)
+        let parent = std::iter::repeat_n("a", DEEPEST_USEFUL_PARENT)
             .collect::<Vec<_>>()
             .join(".");
         let z = zone_with_origin(
@@ -2541,12 +2562,30 @@ mod tests {
             vec![spec(&format!("*.{parent}"), "A", &["203.0.113.1"])],
         );
 
-        assert_ne!(
-            z.wildcard_depths & (1u128 << CEILING),
-            0,
-            "a wildcard whose parent sits at exactly {CEILING} labels was left \
-             out of the depth bitmap; it is in the wildcard map and the walk \
-             will never probe for it"
+        // 127 labels exactly: the shallowest name this wildcard can cover, and
+        // the deepest name the wire can carry.
+        let covered = lower(&format!("q.{parent}."));
+        assert_eq!(
+            Name::from(covered.clone()).iter().len(),
+            CEILING,
+            "the covered name must sit exactly at the decoder's ceiling"
+        );
+
+        let Answer::Records(records) = z.lookup(&covered, RecordType::A) else {
+            panic!(
+                "a wildcard whose parent sits at {DEEPEST_USEFUL_PARENT} labels \
+                 is the deepest one a zone can usefully hold, and the name it \
+                 covers is the deepest the wire can carry. Failing here means \
+                 the wildcard is configured, counted and permanently \
+                 unreachable, with nothing in the logs to say so"
+            );
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].data, a("203.0.113.1"));
+        assert_eq!(
+            LowerName::from(records[0].name.clone()),
+            covered,
+            "RFC 4592 §3.3.1: the synthesised record is owned by the query name"
         );
     }
 
@@ -3373,11 +3412,44 @@ mod tests {
     /// The text of this module, read at compile time.
     const THIS_MODULE: &str = include_str!("zone.rs");
 
-    /// Scenario: A wildcard still applies below a name that exists — S2 does not
-    /// fix VEGA-009
-    /// features/empty-non-terminals.feature:327
+    /// The text of `tests/rfc_conformance.rs`, read at compile time.
     ///
-    /// AMENDED AT VEGA-032 S2, in the commit that discharges two thirds of it —
+    /// The wire-level twin of VEGA-009's unit test lives there, and the fence
+    /// has to cover both or it covers neither: a zone layer that answers
+    /// NXDOMAIN while the handler renders NOERROR is the same bug wearing a
+    /// green unit test. Reading the file rather than calling into it keeps this
+    /// a source-level guard with no runtime cost and no dependency on the
+    /// integration harness.
+    const RFC_CONFORMANCE: &str = include_str!("../tests/rfc_conformance.rs");
+
+    /// Scenario: The pinned VEGA-009 tests are green and no longer ignored
+    /// features/closest-encloser.feature:694
+    ///
+    /// AMENDED AT VEGA-032 S3, in the commit that discharges the last third of
+    /// it — which is the only commit in which editing it is legitimate (ruling
+    /// §13, the same rule VEGA-005 Amendment 3a set for the reload
+    /// classification table).
+    ///
+    /// It has now inverted completely. It began as VEGA-083's AC-9, asserting
+    /// that all **three** `#[ignore]`d tests stayed ignored with their reasons
+    /// pinned verbatim. S2 turned two of them green. S3 turns the third green,
+    /// so there is no longer any `#[ignore]` for it to pin — and a guard that
+    /// still said "one is still ignored" would be drift wearing a passing test.
+    ///
+    /// What is left is the direction that stays load-bearing forever: **none of
+    /// them may be `#[ignore]`d again**, in either file. Re-ignoring a test is
+    /// the cheapest way to make a regression disappear, every one of these was
+    /// un-ignored by a ruling, and each pins a defect that is silent in
+    /// production — a wildcard leaking into a subtree an operator carved out
+    /// answers with a correct-looking address, and an empty non-terminal
+    /// answering NXDOMAIN takes live records out of service through RFC 8020 §2
+    /// rather than through an error anyone sees.
+    ///
+    /// The needle is spliced from `concat!` fragments on purpose: a literal
+    /// copy would match itself in `THIS_MODULE` and the guard would pass against
+    /// a re-added attribute.
+    ///
+    /// AMENDED AT VEGA-032 S2, in the commit that discharged two thirds of it —
     /// which is the only commit in which editing it is legitimate (ruling §13,
     /// the same rule VEGA-005 Amendment 3a set for the reload classification
     /// table). It was AC-9 of the VEGA-083 ruling and it asserted that all
@@ -3392,35 +3464,31 @@ mod tests {
     /// tempting to fold in here, and folding it in would leave S3 with nothing
     /// to prove and no differential to prove it against.
     ///
-    /// So the guard now checks **both directions**, and both are load-bearing:
+    /// S3 discharges the last of the three. The guard therefore checks **one**
+    /// direction now, in **two** files:
     ///
-    ///  * VEGA-009's test is still `#[ignore]`d with its reason spelled exactly
-    ///    as it is today — the fence S3 has to climb over;
-    ///  * VEGA-006's two are still here and are **not** `#[ignore]`d — because
-    ///    the cheapest way to make a regression disappear is to re-ignore the
-    ///    test that catches it, and a test that was un-ignored by a ruling must
-    ///    not be re-ignored by a bad afternoon.
+    ///  * all three are still present — deleting a test is how a fence stops
+    ///    being checked without anyone reading a diff that says so;
+    ///  * none of them carries an `#[ignore]`, in `src/zone.rs` or in
+    ///    `tests/rfc_conformance.rs`.
     ///
-    /// The expected text is spliced from `concat!` fragments on purpose: a
-    /// literal copy would match itself in `THIS_MODULE` and the guard would pass
-    /// against a deleted attribute.
+    /// And it checks that the *reason strings* are gone from both files as
+    /// literals, so an `#[ignore]` cannot come back spelled the way it was.
     #[test]
-    fn the_rfc_bug_this_step_must_not_touch_is_still_ignored_and_the_two_it_fixes_are_not() {
-        let lines: Vec<&str> = THIS_MODULE.lines().collect();
-        let find = |name: &str| -> usize {
+    fn every_rfc_bug_this_model_fixes_is_green_and_none_of_them_is_ignored_again() {
+        let ignored_near = |source: &str, name: &str| -> Option<String> {
+            let lines: Vec<&str> = source.lines().collect();
             let needle = format!("fn {name}(");
-            lines
+            let at = lines
                 .iter()
                 .position(|line| line.contains(&needle))
                 .unwrap_or_else(|| {
                     panic!(
-                        "{name} is gone from this module. It pins a known RFC \
-                         defect, or the fix for one; deleting it is how the \
-                         fence stops being checked"
+                        "{name} is gone. It pins a known RFC defect, or the fix \
+                         for one; deleting it is how the fence stops being \
+                         checked"
                     )
-                })
-        };
-        let ignored_near = |at: usize| -> Option<String> {
+                });
             lines[at.saturating_sub(4)..at]
                 .iter()
                 .map(|l| l.trim())
@@ -3428,35 +3496,78 @@ mod tests {
                 .map(str::to_owned)
         };
 
-        // Still red, and S3's. VEGA-009.
-        let still_broken = "a_wildcard_does_not_apply_below_a_name_that_exists";
-        let reason = concat!(
-            "BUG: a wildcard is applied below a name that exists ",
-            "(RFC 4592 s3.3.1)"
-        );
-        let attribute = format!("#[ignore = \"{reason}\"]");
-        assert_eq!(
-            ignored_near(find(still_broken)).as_deref(),
-            Some(attribute.as_str()),
-            "{still_broken} is no longer `{attribute}`. Either it turned green — \
-             in which case S2 went outside its fence, took VEGA-009's work with \
-             it and left S3 unable to prove anything — or its reason drifted, \
-             which is how the next reader loses the RFC citation"
-        );
-
-        // Discharged at S2. VEGA-006. These must carry no `#[ignore]` at all.
-        for fixed in [
-            "an_empty_non_terminal_is_nodata_not_nxdomain",
-            "the_parent_of_a_wildcard_is_not_nxdomain",
+        // VEGA-006, discharged at S2. VEGA-009, discharged at S3. All three are
+        // now green and none may be `#[ignore]`d again.
+        for (source, file, name, issue) in [
+            (
+                THIS_MODULE,
+                "src/zone.rs",
+                "an_empty_non_terminal_is_nodata_not_nxdomain",
+                "VEGA-006",
+            ),
+            (
+                THIS_MODULE,
+                "src/zone.rs",
+                "the_parent_of_a_wildcard_is_not_nxdomain",
+                "VEGA-006",
+            ),
+            (
+                THIS_MODULE,
+                "src/zone.rs",
+                "a_wildcard_does_not_apply_below_a_name_that_exists",
+                "VEGA-009",
+            ),
+            (
+                RFC_CONFORMANCE,
+                "tests/rfc_conformance.rs",
+                "an_empty_non_terminal_answers_nodata_over_the_wire",
+                "VEGA-006",
+            ),
+            (
+                RFC_CONFORMANCE,
+                "tests/rfc_conformance.rs",
+                "a_wildcard_does_not_reach_below_a_name_that_exists",
+                "VEGA-009",
+            ),
         ] {
             assert_eq!(
-                ignored_near(find(fixed)),
+                ignored_near(source, name),
                 None,
-                "{fixed} is `#[ignore]`d again. It pins VEGA-006, a blocker \
-                 closed by ancestor materialisation, and it was un-ignored by a \
-                 ruling. Re-ignoring a test is not a way to fix the code it \
-                 catches; if it is failing, the zone stopped materialising \
-                 empty non-terminals and RFC 8020 §2 is denying live records"
+                "{file}::{name} is `#[ignore]`d again. It pins {issue}, closed by \
+                 the VEGA-032 zone data model, and it was un-ignored by a ruling. \
+                 Re-ignoring a test is not a way to fix the code it catches: if \
+                 it is failing, either a wildcard is leaking into a subtree an \
+                 operator carved out (RFC 4592 §3.3.1) or a name that exists only \
+                 as an ancestor is answering NXDOMAIN and RFC 8020 §2 is denying \
+                 the live records beneath it. Both are silent in production"
+            );
+        }
+
+        // The reason strings themselves, so the attribute cannot come back
+        // wearing its old text. Spliced, or the needles would match here.
+        for (source, file, reason) in [
+            (
+                THIS_MODULE,
+                "src/zone.rs",
+                concat!(
+                    "BUG: a wildcard is applied below a name that exists ",
+                    "(RFC 4592 s3.3.1)"
+                ),
+            ),
+            (
+                RFC_CONFORMANCE,
+                "tests/rfc_conformance.rs",
+                concat!(
+                    "BUG: a wildcard is applied below an existing closest ",
+                    "encloser (RFC 4592 s3.3.1)"
+                ),
+            ),
+        ] {
+            assert!(
+                !source.contains(&format!("#[ignore = \"{reason}\"]")),
+                "{file} still carries `#[ignore = \"{reason}\"]`. VEGA-009 is \
+                 closed at VEGA-032 S3; an ignore attribute quoting it is either \
+                 a fence that was never taken down or one that was put back"
             );
         }
     }
@@ -3494,20 +3605,35 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Known bugs, written against the RFC. One of these still fails today and is
-    // ignored so the suite stays green until the behaviour is fixed. The other
-    // two were this list's oldest residents and are **discharged at VEGA-032
-    // S2** — they are un-`#[ignore]`d in the commit that materialises every
-    // strict ancestor, which is the only commit allowed to touch them.
+    // Known bugs, written against the RFC. This list is **empty at VEGA-032
+    // S3**: all three of its residents are green and none of them carries an
+    // `#[ignore]` any more. They are kept here, together, because what they pin
+    // is what the model exists to get right, and because a regression test is
+    // worth most when the reader can see the defect it was written against.
     //
-    // WHAT IS LEFT, AND WHOSE IT IS. `a_wildcard_does_not_apply_below_a_name_
-    // that_exists` pins RFC 4592 §3.3.1: the source of synthesis is `*` under
-    // the CLOSEST ENCLOSER, and Vega instead walks up to the first wildcard it
-    // can find. That is VEGA-009 and it is **S3's**, not S2's. Ancestor closure
-    // makes fixing it look like a two-line change from here; doing it here would
-    // leave S3 with nothing to prove and would retire VEGA-065's differential
-    // oracle in a commit that has no ruling to retire it. If it turns green at
-    // S2, S2 is wrong, not the test.
+    // THE ORDER THEY WERE DISCHARGED IN, AND BY WHAT.
+    //
+    //   * `an_empty_non_terminal_is_nodata_not_nxdomain` — VEGA-006, **S2**.
+    //     Every strict ancestor of every owner is a node with an empty RRset
+    //     range, so a name that exists only as an ancestor is NODATA (RFC 4592
+    //     §2.2.2, RFC 2308 §2.2) and RFC 8020 §2 can no longer be used to deny
+    //     the subtree beneath it.
+    //   * `the_parent_of_a_wildcard_is_not_nxdomain` — VEGA-006, **S2**. A
+    //     wildcard is a node named `*.x`, so `x` exists for exactly the same
+    //     reason as any other ancestor.
+    //   * `a_wildcard_does_not_apply_below_a_name_that_exists` — VEGA-009,
+    //     **S3**. RFC 4592 §3.3.1: the source of synthesis is `*` under the
+    //     CLOSEST ENCLOSER and no other name. The walk that climbed to the
+    //     first wildcard it could find is deleted; the lookup finds the closest
+    //     encloser by binary search over label depth and makes exactly ONE
+    //     probe at `*.<CE>`. "There is no search for an alternate" is now a
+    //     property of the code rather than a comment above a loop.
+    //
+    // WHY S3 NEEDED S2 UNDERNEATH IT. The binary search reads "a node exists at
+    // this depth" as a MONOTONE predicate, which it is only while the node set
+    // is closed under ancestry. And the rule is only *expressible* once empty
+    // non-terminals exist: in `*.dev` + `a.b.deep.dev`, the closest encloser of
+    // `x.b.deep.dev` is `b.deep.dev`, a name the operator never wrote.
     //
     // VEGA-065 NOTE, kept for the history it records — that issue was strictly
     // behaviour-preserving and all three stayed red under it.
@@ -3519,19 +3645,24 @@ mod tests {
     // ancestor of the names it covers and `wildcard_window` caps the walk at the
     // query's parent depth.
     //
-    // VEGA-032 S2 NOTE — what changed, and why it is only these two. Every
-    // strict ancestor of every owner is now a node with an empty RRset range, so
-    // a name that exists only as an ancestor is NODATA (RFC 4592 §2.2.2, RFC
-    // 2308 §2.2) and RFC 8020 §2 can no longer be used to deny the subtree
-    // beneath it. A wildcard is a node named `*.x`, so `x` is its parent and
-    // exists for exactly the same reason — which is the second test. Neither
-    // touches which wildcard answers a covered name, which is why the third
-    // stays red.
+    // VEGA-032 S3 NOTE — what it cost to close the third. The bounded walk over
+    // `wildcard_depths` is gone, and with it the u128: ancestor closure makes
+    // the populated depths contiguous, so the bitmap carries no information a
+    // `u8` pair does not. VEGA-065's *invariant* is kept verbatim — raw label
+    // counting, `MAX_LABELS = 127`, the `num_labels` ban — and only its
+    // mechanism is replaced. VEGA-065's differential oracle
+    // (`tests/properties.rs::the_wildcard_walk_agrees_with_a_naive_base_name_walk`)
+    // is RETIRED here, in the commit that makes it wrong, and replaced by a
+    // brute-force transcription of RFC 4592 §3.3.1 that permits no transitions
+    // at all. Retiring it silently would have been the failure mode.
     //
-    // Both directions are pinned by
-    // `the_rfc_bug_this_step_must_not_touch_is_still_ignored_and_the_two_it_fixes_are_not`:
-    // the remaining `ignore` reason verbatim, and the absence of an `ignore` on
-    // the two that are now green.
+    // VEGA-078 closes with it, and not as a patch: the probe count stops being
+    // `popcount(wildcard_depths)` and becomes a constant, so the 120-depth zone
+    // that bought an attacker ~229 µs of CPU for one 276-byte packet is now the
+    // same cost as a one-depth zone.
+    //
+    // The absence of an `#[ignore]` on all three, in both files, is pinned by
+    // `every_rfc_bug_this_model_fixes_is_green_and_none_of_them_is_ignored_again`.
     //
     // (VEGA-010 used to be on this list. It was the same defect as VEGA-083 seen
     // through another QTYPE, and closed with it.)
@@ -3560,16 +3691,19 @@ mod tests {
         );
     }
 
+    /// Scenario: A wildcard does not apply below a name that exists
+    /// features/closest-encloser.feature:117
+    ///
+    /// VEGA-009's headline, un-`#[ignore]`d at VEGA-032 S3.
     #[test]
-    #[ignore = "BUG: a wildcard is applied below a name that exists (RFC 4592 s3.3.1)"]
     fn a_wildcard_does_not_apply_below_a_name_that_exists() {
         let _watchdog = watchdog();
         // RFC 4592: the source of synthesis is `*` under the *closest
         // encloser*. For `a.deep.dev.example.com` the closest encloser is
         // `deep.dev.example.com`, which exists, so the source of synthesis is
         // `*.deep.dev.example.com` — which does not exist, hence NXDOMAIN.
-        // `Zone::resolve` instead walks up until it finds any wildcard at all,
-        // so `*.dev` leaks in underneath a name that already exists.
+        // `Zone::resolve` used to walk up until it found any wildcard at all,
+        // so `*.dev` leaked in underneath a name that already existed.
         let z = zone(vec![
             spec("*.dev", "A", &["203.0.113.50"]),
             spec("deep.dev", "A", &["203.0.113.51"]),
@@ -4125,7 +4259,7 @@ mod tests {
 
     /// Scenario: An empty non-terminal chain at the protocol's label ceiling is
     /// answered
-    /// features/empty-non-terminals.feature:341
+    /// features/empty-non-terminals.feature:352
     ///
     /// 127 labels is the deepest name the wire can carry — RFC 1035 §3.1 encodes
     /// a single-octet label in two octets and terminates with one, so
@@ -4168,5 +4302,649 @@ mod tests {
                  of bounds"
             );
         }
+    }
+
+    // =======================================================================
+    // VEGA-032 S3 — THE CLOSEST ENCLOSER (closes VEGA-009 and VEGA-078)
+    //
+    // Spec: features/closest-encloser.feature
+    // Ruling: .claude/backlog/decisions/VEGA-032-zone-data-model.md §4.2 step B,
+    //         §4.3, §5.4, §10.2 (S3), §13 AC-3.1 … AC-3.7
+    //
+    // RFC 4592 §3.3.1, in full, because every test below is one clause of it:
+    //
+    //   "If the 'closest encloser' of the query name is a wildcard domain name
+    //    ... the wildcard record is the source of synthesis ... If the source of
+    //    synthesis does not exist ... there is no wildcard match. There is no
+    //    search for an alternate ... the lookup does not look for other wildcard
+    //    records."
+    //
+    // Two behaviours fall out, and the second is the one Vega got wrong:
+    //
+    //   1. a name that EXISTS between the wildcard's parent and the query name
+    //      makes that name the closest encloser, and the wildcard no longer
+    //      reaches past it;
+    //   2. when the source of synthesis exists but carries no RRset of the
+    //      queried type, the lookup STOPS — it does not fall back to a shallower
+    //      wildcard.
+    //
+    // The second is what distinguishes the closest-encloser rule from
+    // "deepest wildcard wins", which is what the bounded walk implemented. A
+    // test suite that only tested (1) would pass an implementation that found
+    // the closest encloser correctly and then kept walking on a type miss.
+    // `there_is_no_search_for_an_alternate_above_the_closest_encloser` is that
+    // test, and it is the most load-bearing example in this section.
+    // =======================================================================
+
+    /// Scenario: A wildcard synthesises for a name whose closest encloser is its
+    /// parent
+    /// features/closest-encloser.feature:80
+    ///
+    /// The control for every negative below. A fix that simply stopped
+    /// synthesising would pass `a_wildcard_does_not_apply_below_a_name_that_exists`
+    /// and fail here, which is why the two are separate tests rather than two
+    /// assertions in one.
+    #[test]
+    fn a_wildcard_synthesises_when_its_parent_is_the_closest_encloser() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("*.dev", "A", &["203.0.113.50"])]);
+        let Answer::Records(records) = z.lookup(&lower("x.dev.example.com."), RecordType::A) else {
+            panic!(
+                "`dev.example.com.` is the closest encloser of \
+                 `x.dev.example.com.` and it holds a wildcard, so \
+                 `*.dev.example.com.` is the source of synthesis (RFC 4592 \
+                 §3.3.1)"
+            );
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].data, a("203.0.113.50"));
+        assert_eq!(
+            records[0].name,
+            Name::from(lower("x.dev.example.com.")),
+            "RFC 4592 §3.3.1: the synthesised record is owned by the QUERY name, \
+             never by the wildcard's own name"
+        );
+    }
+
+    /// Scenario: The carved-out name itself still answers
+    /// features/closest-encloser.feature:130
+    ///
+    /// Scenario: The sibling of a carved-out name is still synthesised
+    /// features/closest-encloser.feature:140
+    ///
+    /// The two anti-vacuity halves of VEGA-009's headline, in one fixture
+    /// because they are one claim: the carve-out is respected and nothing else
+    /// moved. Without the sibling half, "delete the wildcard" passes.
+    #[test]
+    fn a_carve_out_blocks_the_wildcard_without_disabling_it() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("*.dev", "A", &["203.0.113.50"]),
+            spec("deep.dev", "A", &["203.0.113.51"]),
+        ]);
+
+        let Answer::Records(carved) = z.lookup(&lower("deep.dev.example.com."), RecordType::A)
+        else {
+            panic!("the carved-out name must still serve its own record");
+        };
+        assert_eq!(carved[0].data, a("203.0.113.51"));
+
+        let Answer::Records(sibling) = z.lookup(&lower("other.dev.example.com."), RecordType::A)
+        else {
+            panic!(
+                "`other.dev.example.com.` does not exist, so its closest \
+                 encloser is still `dev.example.com.` and the catch-all still \
+                 applies to it. A fix that switched the wildcard off entirely \
+                 would answer NXDOMAIN here"
+            );
+        };
+        assert_eq!(sibling[0].data, a("203.0.113.50"));
+    }
+
+    /// Scenario: The nested carve-out holds two levels down
+    /// features/closest-encloser.feature:151
+    ///
+    /// AC-3.2. Three names in a chain, so an implementation that compares only
+    /// against the query's IMMEDIATE parent passes
+    /// `a_wildcard_does_not_apply_below_a_name_that_exists` and fails here.
+    #[test]
+    fn the_nested_carve_out_blocks_the_wildcard_two_levels_down() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("*.dev", "A", &["203.0.113.50"]),
+            spec("b.dev", "A", &["203.0.113.51"]),
+            spec("c.b.dev", "A", &["203.0.113.52"]),
+        ]);
+        assert_eq!(
+            z.lookup(&lower("x.c.b.dev.example.com."), RecordType::A),
+            Answer::NxDomain,
+            "the closest encloser is `c.b.dev.example.com.`, so the only source \
+             of synthesis is `*.c.b.dev.example.com.` and it does not exist"
+        );
+        let Answer::Records(records) = z.lookup(&lower("x.dev.example.com."), RecordType::A) else {
+            panic!("the wildcard must still answer where nothing encloses more tightly");
+        };
+        assert_eq!(records[0].data, a("203.0.113.50"));
+    }
+
+    /// Scenario: An empty non-terminal is a closest encloser like any other name
+    /// features/closest-encloser.feature:162
+    ///
+    /// The S2/S3 interaction, and the reason S3 could not have been built first.
+    /// `b.deep.dev.example.com.` is configured NOWHERE — it exists only because
+    /// `a.b.deep.dev` does (RFC 4592 §2.2.2). It is still a name that exists, so
+    /// it is still the closest encloser, and `*.dev` must not reach past it.
+    ///
+    /// An implementation whose closest-encloser search consulted only DECLARED
+    /// owner names answers `203.0.113.50` here, which is VEGA-009 reopened
+    /// through the empty non-terminal that VEGA-006 introduced.
+    #[test]
+    fn an_empty_non_terminal_is_a_closest_encloser_like_any_other_name() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("*.dev", "A", &["203.0.113.50"]),
+            spec("a.b.deep.dev", "A", &["203.0.113.53"]),
+        ]);
+
+        // `deep.dev` and `b.deep.dev` are empty non-terminals, so both enclose.
+        for name in ["x.b.deep.dev.example.com.", "x.deep.dev.example.com."] {
+            assert_eq!(
+                z.lookup(&lower(name), RecordType::A),
+                Answer::NxDomain,
+                "{name}'s closest encloser exists only as an empty non-terminal, \
+                 and RFC 4592 §3.3.1 makes `*.<that name>` the only source of \
+                 synthesis. Answering from `*.dev` reaches past a name that \
+                 exists"
+            );
+        }
+
+        // …and the wildcard still applies where nothing encloses more tightly.
+        let Answer::Records(records) = z.lookup(&lower("x.dev.example.com."), RecordType::A) else {
+            panic!("`dev.example.com.` still encloses `x.dev.example.com.`");
+        };
+        assert_eq!(records[0].data, a("203.0.113.50"));
+    }
+
+    /// Scenario: There is no search for an alternate wildcard above the closest
+    /// encloser
+    /// features/closest-encloser.feature:176
+    ///
+    /// RFC 4592 §3.3.1's last sentence, made observable — and the single most
+    /// discriminating example in this section.
+    ///
+    /// The source of synthesis EXISTS here (`*.dev.example.com.`) and simply
+    /// carries no A record. The bounded walk continues past it to the apex
+    /// wildcard and serves 203.0.113.1. The closest-encloser rule stops, and RFC
+    /// 1034 §4.3.2 step 3(c) makes that NODATA rather than a name error, because
+    /// the `*` node exists (VEGA-083, preserved exactly).
+    ///
+    /// Every other test in this section is about WHICH name encloses. This one
+    /// is about what happens after the right name has been found, so an
+    /// implementation that computes the closest encloser correctly and then
+    /// keeps walking on a type miss fails here and nowhere else.
+    #[test]
+    fn there_is_no_search_for_an_alternate_above_the_closest_encloser() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("*", "A", &["203.0.113.1"]),
+            spec("*.dev", "TXT", &["\"only text here\""]),
+        ]);
+        assert_eq!(
+            z.lookup(&lower("x.dev.example.com."), RecordType::A),
+            Answer::NoData,
+            "`*.dev.example.com.` is the source of synthesis and holds no A \
+             record. RFC 4592 §3.3.1: \"there is no search for an alternate\" — \
+             the apex wildcard's 203.0.113.1 must not appear. RFC 1034 §4.3.2 \
+             step 3(c) sets the name error only when the `*` node does not \
+             exist, and it does, so this is NODATA and not NXDOMAIN"
+        );
+
+        // The type it does carry still answers from the same node, so this is a
+        // statement about the search and not about the wildcard being broken.
+        let Answer::Records(records) = z.lookup(&lower("x.dev.example.com."), RecordType::TXT)
+        else {
+            panic!("the source of synthesis still answers the type it carries");
+        };
+        assert_eq!(records.len(), 1);
+
+        // …and the apex wildcard still answers names it genuinely encloses.
+        let Answer::Records(apex) = z.lookup(&lower("elsewhere.example.com."), RecordType::A)
+        else {
+            panic!("the apex wildcard is the closest encloser of `elsewhere.example.com.`");
+        };
+        assert_eq!(apex[0].data, a("203.0.113.1"));
+    }
+
+    /// Scenario: A closest encloser computed one level short is visible in an
+    /// answer
+    /// features/closest-encloser.feature:265
+    ///
+    /// The mutant the ruling calls the most dangerous in the model (§4.3, §8),
+    /// given a fixture shaped so it cannot hide.
+    ///
+    /// S2's first transition classifier accepted an ancestor-closure walk that
+    /// stopped one level short, because the fixture it was checked against still
+    /// produced every transition class with the shallower closure. The lesson is
+    /// that an off-by-one in a depth search is only visible on a LADDER: two
+    /// wildcards at adjacent depths with an existing name between them.
+    ///
+    ///   *.dev          answers x.dev
+    ///   deep.dev       exists, holds no wildcard
+    ///   x.deep.dev     exists, so it encloses q.x.deep.dev
+    ///   *.x.deep.dev   answers q.x.deep.dev
+    ///
+    /// A search that is short by one answers `q.x.deep.dev` NXDOMAIN (it looks
+    /// for `*.deep.dev`) *and* answers `q.deep.dev` from `*.dev` (it looks for
+    /// `*.dev`). Two failures in opposite directions from one off-by-one, and
+    /// either alone would be invisible without the ladder.
+    #[test]
+    fn a_closest_encloser_computed_one_level_short_is_visible_in_an_answer() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("*.dev", "A", &["203.0.113.50"]),
+            spec("deep.dev", "A", &["203.0.113.51"]),
+            spec("x.deep.dev", "A", &["203.0.113.52"]),
+            spec("*.x.deep.dev", "A", &["203.0.113.53"]),
+        ]);
+
+        let Answer::Records(deepest) = z.lookup(&lower("q.x.deep.dev.example.com."), RecordType::A)
+        else {
+            panic!(
+                "the closest encloser of `q.x.deep.dev.example.com.` is \
+                 `x.deep.dev.example.com.`, which holds a wildcard. A search \
+                 that stopped one level short looked for `*.deep.dev` and found \
+                 nothing"
+            );
+        };
+        assert_eq!(deepest[0].data, a("203.0.113.53"));
+
+        assert_eq!(
+            z.lookup(&lower("q.deep.dev.example.com."), RecordType::A),
+            Answer::NxDomain,
+            "the closest encloser is `deep.dev.example.com.`, which holds no \
+             wildcard. A search that stopped one level short looked for `*.dev` \
+             and leaked 203.0.113.50 into the carve-out"
+        );
+
+        let Answer::Records(shallow) = z.lookup(&lower("q.dev.example.com."), RecordType::A) else {
+            panic!("`dev.example.com.` still encloses `q.dev.example.com.`");
+        };
+        assert_eq!(shallow[0].data, a("203.0.113.50"));
+    }
+
+    /// Scenario: A name below a carve-out is NXDOMAIN for every type, not just
+    /// the configured one
+    /// features/closest-encloser.feature:255
+    ///
+    /// The rcode must not depend on the QTYPE. A dual-stack client asks AAAA
+    /// alongside every A and a resolver asks ANY; if any of them answered
+    /// NOERROR the zone would be reporting two different existence answers for
+    /// one name, which is the shape of the VEGA-083 defect one level along.
+    #[test]
+    fn a_name_below_a_carve_out_is_nxdomain_for_every_type() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("*.dev", "A", &["203.0.113.50"]),
+            spec("deep.dev", "A", &["203.0.113.51"]),
+        ]);
+        for qtype in [
+            RecordType::A,
+            RecordType::AAAA,
+            RecordType::TXT,
+            RecordType::MX,
+            RecordType::ANY,
+        ] {
+            assert_eq!(
+                z.lookup(&lower("a.deep.dev.example.com."), qtype),
+                Answer::NxDomain,
+                "{qtype} at `a.deep.dev.example.com.` must be a name error like \
+                 every other type: the name does not exist and no source of \
+                 synthesis covers it, and existence is a property of the name \
+                 rather than of the question"
+            );
+        }
+        assert!(
+            !z.exists(&lower("a.deep.dev.example.com.")),
+            "`Zone::exists` is the RFC 1034 §4.3.2 step 3(c) name-error \
+             determination and it is the predicate the DNSSEC proof machinery \
+             will read. A name no source of synthesis covers does not exist"
+        );
+    }
+
+    /// Scenario: A zone holding only its apex encloses every name at the apex
+    /// features/closest-encloser.feature:315
+    ///
+    /// The degenerate zone, and the floor of the search: every in-zone name
+    /// descends from the apex and the apex is always a node, so the search
+    /// always succeeds and never has to report "none". That is what lets it
+    /// return a `NodeIdx` rather than an `Option`, which is what keeps `unwrap`
+    /// off a packet-reachable path.
+    #[test]
+    fn a_zone_holding_only_its_apex_encloses_every_name_at_the_apex() {
+        let _watchdog = watchdog();
+        let z = zone(Vec::new());
+        for name in [
+            "anything.example.com.",
+            "anything.deep.example.com.",
+            "a.b.c.d.e.f.g.example.com.",
+        ] {
+            assert_eq!(
+                z.lookup(&lower(name), RecordType::A),
+                Answer::NxDomain,
+                "{name}'s closest encloser is the apex and `*.example.com.` does \
+                 not exist"
+            );
+        }
+    }
+
+    /// Scenario: The apex itself is never covered by its own wildcard
+    /// features/closest-encloser.feature:351
+    ///
+    /// RFC 4592 §2.1.2: a wildcard's owner name never matches the name it is
+    /// attached to. The apex is a node, so it is answered by the exact arm and
+    /// the search never runs — but a search whose upper bound were the query's
+    /// OWN depth rather than its parent's would make `*.example.com.` the source
+    /// of synthesis for `example.com.` and serve the catch-all at the apex.
+    #[test]
+    fn the_apex_is_never_covered_by_its_own_wildcard() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("*", "A", &["203.0.113.1"])]);
+        assert_eq!(
+            z.lookup(&lower("example.com."), RecordType::A),
+            Answer::NoData,
+            "the apex exists and holds no A record. Synthesising here would mean \
+             the search's ceiling came from the query's own depth rather than \
+             from its parent's (RFC 4592 §2.1.2)"
+        );
+    }
+
+    /// Scenario: An asterisk in the query name gets no special processing
+    /// features/closest-encloser.feature:372
+    ///
+    /// RFC 4592 §2.3, on the raw index space VEGA-065's ban exists to protect.
+    /// `x.*.dev.example.com.` is an ordinary name whose leftmost labels happen to
+    /// include an asterisk. Its closest encloser is `*.dev.example.com.` — which
+    /// exists as an empty non-terminal because `*.*.dev` was configured — so the
+    /// source of synthesis is `*.*.dev.example.com.` and it answers.
+    ///
+    /// `LowerName::num_labels()` discounts a leading asterisk while `trim_to` and
+    /// the suffix hashes do not, so a depth computed with the wrong one indexes
+    /// one label off for exactly these names. Deleting the depth bitmap does not
+    /// delete that hazard: the closest-encloser search indexes the same space.
+    #[test]
+    fn an_asterisk_in_the_query_name_gets_no_special_processing() {
+        let _watchdog = watchdog();
+        let z = zone(vec![spec("*.*.dev", "A", &["203.0.113.60"])]);
+
+        let Answer::Records(records) = z.lookup(&lower("x.*.dev.example.com."), RecordType::A)
+        else {
+            panic!(
+                "`*.dev.example.com.` exists as an empty non-terminal, so it is \
+                 the closest encloser of `x.*.dev.example.com.` and \
+                 `*.*.dev.example.com.` is the source of synthesis"
+            );
+        };
+        assert_eq!(records[0].data, a("203.0.113.60"));
+        assert_eq!(records[0].name, Name::from(lower("x.*.dev.example.com.")));
+
+        // The wildcard's own literal name is a node, answered by the exact arm.
+        let Answer::Records(literal) = z.lookup(&lower("*.*.dev.example.com."), RecordType::A)
+        else {
+            panic!("a wildcard's own name is an ordinary node (RFC 4592 §2.1.1)");
+        };
+        assert_eq!(literal[0].data, a("203.0.113.60"));
+    }
+
+    /// Scenario: A 127-label attacker-chosen name below a carve-out is answered
+    /// without excessive work
+    /// features/closest-encloser.feature:414
+    ///
+    /// The deepest name the wire can carry — RFC 1035 §3.1 encodes a
+    /// single-octet label in two octets and terminates with one, so
+    /// `127 * 2 + 1 = 255` — aimed at the subtree the operator closed. Root
+    /// origin, because that is the only way a 127-label name is in zone at all.
+    ///
+    /// This is the input that drives the closest-encloser search to its widest
+    /// window: floor 0, ceiling 126. With `panic = "abort"` one index past the
+    /// end of the suffix hash array is a full outage from one packet, so the
+    /// whole thing runs under the process watchdog.
+    #[test]
+    fn a_query_at_the_protocol_ceiling_below_a_carve_out_is_nxdomain() {
+        const CEILING: usize = 127;
+
+        let _watchdog = watchdog();
+        // The carve-out is `a.a.` and the query is 127 `a` labels, so every one
+        // of the 124 intermediate ancestors is a name that does NOT exist and
+        // the two that do sit at the very bottom of the search window. Single
+        // -octet labels throughout, because 127 labels only fit inside RFC 1035
+        // §2.3.4's 255 octets when every one of them is one octet long.
+        let z = zone_with_origin(
+            ".",
+            vec![
+                spec("*", "A", &["203.0.113.1"]),
+                spec("a.a.", "A", &["203.0.113.2"]),
+            ],
+        );
+
+        let deep = "a.".repeat(CEILING);
+        let queried = lower(&deep);
+        assert_eq!(
+            Name::from(queried.clone()).iter().len(),
+            CEILING,
+            "the fixture must sit exactly at the decoder's ceiling, not near it"
+        );
+
+        assert_eq!(
+            z.lookup(&queried, RecordType::A),
+            Answer::NxDomain,
+            "`a.a.` exists, so every name beneath it is enclosed by a name that \
+             carries no wildcard. The apex `*` must not reach 127 labels down \
+             into it"
+        );
+
+        // And the same wildcard still covers a name it genuinely encloses, so
+        // this is not a test that passes because the zone answers nothing.
+        let Answer::Records(covered) = z.lookup(&lower("nope.example.org."), RecordType::A) else {
+            panic!("the root-origin apex wildcard encloses `nope.example.org.`");
+        };
+        assert_eq!(covered[0].data, a("203.0.113.1"));
+    }
+
+    /// Scenario: An attacker cannot reach into a carve-out by inventing labels
+    /// beneath it
+    /// features/closest-encloser.feature:402
+    ///
+    /// The security statement of VEGA-009, as a sweep rather than as one name.
+    /// The operator carved `deep.dev` out of the catch-all; an attacker who can
+    /// pick any name at all must not be able to make the server authoritatively
+    /// assert an address inside it. One example name could pass by accident —
+    /// forty invented ones at three different depths cannot.
+    #[test]
+    fn an_invented_name_beneath_a_carve_out_never_reaches_the_catch_all() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("*.dev", "A", &["203.0.113.50"]),
+            spec("deep.dev", "A", &["203.0.113.51"]),
+        ]);
+        for i in 0..40 {
+            for name in [
+                format!("n{i}.deep.dev.example.com."),
+                format!("n{i}.x.deep.dev.example.com."),
+                format!("x.n{i}.y.deep.dev.example.com."),
+            ] {
+                assert_eq!(
+                    z.lookup(&lower(&name), RecordType::A),
+                    Answer::NxDomain,
+                    "{name} is inside a subtree the operator carved out of the \
+                     catch-all. RFC 4592 §3.3.1 makes `*.<its closest encloser>` \
+                     the only source of synthesis, and none of them exists"
+                );
+            }
+        }
+    }
+
+    // ------------------------------------------------ the bitmap is subsumed
+
+    /// Scenario: The zone carries no wildcard depth bitmap
+    /// features/closest-encloser.feature:582
+    ///
+    /// Ancestor closure makes the populated node depths contiguous, so
+    /// VEGA-065's `u128 wildcard_depths` is exactly
+    /// `((1 << (max_depth + 1)) - 1) & !((1 << origin_depth) - 1)` and carries no
+    /// information a `u8` pair does not. Sixteen bytes per zone become one.
+    ///
+    /// The far more important half is the probe count. VEGA-065's was
+    /// `popcount(wildcard_depths ∩ window)` — operator-controlled, unbounded in
+    /// practice, and the direct cause of VEGA-078's ~229 µs of CPU for one
+    /// 276-byte packet. Leaving the field in place while adding the
+    /// closest-encloser search would leave the walk one `if` away from coming
+    /// back, so the field's absence is asserted rather than assumed.
+    ///
+    /// A source-level check because there is nothing observable to attach it to:
+    /// the field is private, the struct is `pub(crate)` by §10.1, and its
+    /// deletion changes no answer. That is precisely why it needs a guard.
+    #[test]
+    fn the_zone_carries_no_wildcard_depth_bitmap() {
+        let needle = concat!("wildcard_", "depths");
+        let offenders: Vec<(usize, &str)> = THIS_MODULE
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(needle))
+            .filter(|(_, line)| {
+                // Prose recording why it went is the point; a field, a mask or a
+                // walk is not.
+                let trimmed = line.trim_start();
+                !(trimmed.starts_with("//") || trimmed.starts_with('*'))
+            })
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "`{needle}` is back in this module. Ancestor closure makes the \
+             populated depths contiguous, so it carries no information the \
+             origin/max depth pair does not — and the probe loop it feeds is \
+             VEGA-078: one probe per configured wildcard depth, ~229 µs of CPU \
+             for one 276-byte packet on a 120-depth zone. Found at {offenders:?}"
+        );
+    }
+
+    /// Scenario: MAX_LABELS is still the arithmetic consequence of the 255-octet
+    /// limit
+    /// features/closest-encloser.feature:612
+    ///
+    /// The bitmap goes; the reasoning that made it correct must not. This is
+    /// VEGA-065's constant and its derivation, re-asserted in the commit that
+    /// deletes the structure it was originally sized for — because "we removed
+    /// the thing that used 127" is exactly the diff in which 127 stops being
+    /// checked.
+    ///
+    /// It is the deepest index the suffix hash array will ever see, and under
+    /// `panic = "abort"` one past it is a full outage from one packet.
+    #[test]
+    fn the_label_ceiling_survives_the_deletion_of_the_depth_bitmap() {
+        // RFC 1035 §3.1: a single-octet label costs two octets on the wire and
+        // the name is terminated by one more, so 2n + 1 <= 255 gives n = 127.
+        // Written out rather than as `MAX_LABELS` so this is a derivation and
+        // not a tautology.
+        const CEILING: usize = (255 - 1) / 2;
+        assert_eq!(
+            MAX_LABELS, CEILING,
+            "MAX_LABELS is the arithmetic consequence of RFC 1035 §2.3.4 and \
+             §3.1, not a tuning knob. It sizes the suffix hash array the \
+             closest-encloser search reads on every negative query"
+        );
+
+        // And `label_count` still counts a leading asterisk as a label, which is
+        // the index space `trim_to` and the suffix hashes share.
+        assert_eq!(label_count(&lower("*.dev.example.com.")), 4);
+        assert_eq!(label_count(&lower("*.*.dev.example.com.")), 5);
+        assert_eq!(label_count(&lower("a.*.dev.example.com.")), 5);
+    }
+
+    /// Scenario: A wildcard does not synthesise at a wildcard name that exists
+    /// features/closest-encloser.feature:193
+    ///
+    /// **VEGA-098**, as a named example rather than as a seed.
+    ///
+    /// Found by `the_wildcard_walk_agrees_with_a_naive_base_name_walk` on `main`
+    /// at `bd4b397`, in a clean worktree, with the seed in neither
+    /// `proptest-regressions` file — so proptest rediscovers it fresh on some
+    /// runs and not on others, and CI had been passing on luck. A minimal
+    /// committed example that fails today and passes after S3 is worth more than
+    /// a generator that finds it one run in ten.
+    ///
+    /// ```text
+    ///   zone:  ["* TXT", "*.*.dev A"]
+    ///   query: *.dev.example.com. TXT
+    ///   got    Records([*.dev.example.com. TXT "hello"])
+    ///   want   NoData
+    /// ```
+    ///
+    /// # The mechanism, because it is not the obvious one
+    ///
+    /// S2 made `*.dev.example.com.` an **empty non-terminal**: `*.*.dev` is
+    /// configured beneath it, and ancestor closure materialises every strict
+    /// ancestor whatever its leftmost label happens to be (RFC 4592 §2.1.1 makes
+    /// a wildcard a property of the NAME, never of how the node came to exist).
+    ///
+    /// A name that exists must stop synthesis outright — RFC 4592 §2.2.2 — so
+    /// the answer is NODATA. The apex `* TXT` is applied to it anyway, because
+    /// the exact-match probe deliberately **excludes wildcard nodes**: the map
+    /// model S1 replaced held wildcards in neither `exact` nor `names`, and
+    /// preserving that was an S1 fidelity decision with the note that "that
+    /// exclusion is what S2 and S3 remove, with a ruling".
+    ///
+    /// **This is the ruling, and this is the removal.** It is the one part of S3
+    /// that is not about the closest encloser at all: the closest-encloser search
+    /// never runs here, because the name is a node and step 3.a answers it. So
+    /// an implementation that fixed only the search would still fail this, which
+    /// is why it is a named test and not left to the differential.
+    ///
+    /// S2 did not introduce the defect. It made VEGA-009 reachable in a shape the
+    /// oracle can see, and the oracle was right to fail.
+    #[test]
+    fn a_wildcard_does_not_synthesise_at_a_wildcard_name_that_exists() {
+        let _watchdog = watchdog();
+        let z = zone(vec![
+            spec("*", "TXT", &["\"hello\""]),
+            spec("*.*.dev", "A", &["203.0.113.60"]),
+        ]);
+
+        assert_eq!(
+            z.lookup(&lower("*.dev.example.com."), RecordType::TXT),
+            Answer::NoData,
+            "`*.dev.example.com.` exists — `*.*.dev.example.com.` is configured \
+             beneath it, so ancestor closure materialises it (RFC 4592 §2.1.1, \
+             §2.2.2). A name that exists stops synthesis, so the apex `* TXT` \
+             must not be applied to it. VEGA-098"
+        );
+
+        // The other half of the same contract, and the reason this cannot be
+        // fixed by simply refusing to answer wildcard-shaped names: the node
+        // that DOES carry records still answers at its own literal name (RFC
+        // 4592 §2.3 — an asterisk in a QNAME gets no special processing).
+        let Answer::Records(records) = z.lookup(&lower("*.*.dev.example.com."), RecordType::A)
+        else {
+            panic!(
+                "the configured wildcard must still answer a query for its own \
+                 literal name; excluding wildcard nodes from the exact probe is \
+                 what this test exists to remove, not to widen"
+            );
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].data, a("203.0.113.60"));
+        assert_eq!(records[0].name, Name::from(lower("*.*.dev.example.com.")));
+
+        // And the empty non-terminal still covers the names below it, because a
+        // wildcard that is an empty non-terminal is still a source of synthesis
+        // carrying no RRset (RFC 1034 §4.3.2 step 3(c), S2's T2 class).
+        assert_eq!(
+            z.lookup(&lower("x.dev.example.com."), RecordType::TXT),
+            Answer::NoData,
+            "`*.dev.example.com.` is the source of synthesis for \
+             `x.dev.example.com.` and carries no TXT, so the name error is \
+             forbidden — and the apex `* TXT` must not be reached either, \
+             because RFC 4592 §3.3.1 permits no search for an alternate"
+        );
     }
 }

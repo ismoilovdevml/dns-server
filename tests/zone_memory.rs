@@ -359,7 +359,7 @@ fn deep_config() -> ZoneConfig {
 }
 
 /// Scenario: An empty non-terminal costs one node and nothing else
-/// features/empty-non-terminals.feature:410
+/// features/empty-non-terminals.feature:421
 ///
 /// AC-2.6's memory half, and the number the release note owes an operator: RSS
 /// grows on upgrade with no config change at all, and "roughly" is not good
@@ -412,6 +412,84 @@ fn empty_non_terminal_budget(flat_live: i64, unmet: &mut Vec<String>) {
     }
 }
 
+/// The flat fixture's live heap, measured at `bd4b397`, to the byte.
+///
+/// 30,255,464 B — 28.8 MiB, 302 B per record — and it has not moved between S1
+/// and S2. The fixture is FLAT (`h{i}`), so it materialises zero empty
+/// non-terminals and S2 could not touch it; S3 deletes one `u128` **per zone**,
+/// so it must not move by more than 16 bytes either.
+const FLAT_FIXTURE_BYTES_AT_BD4B397: i64 = 30_255_464;
+
+/// How far the flat fixture may drift and still count as unmoved.
+///
+/// S3's only structural change to a zone's footprint is deleting
+/// `wildcard_depths: u128` and replacing it with a `u8` pair, so the arithmetic
+/// says 15 bytes smaller. 64 rather than 16, because the arena is three `Box<[T]>`
+/// whose element counts are unchanged but whose allocator padding is not
+/// something a test should assert to the byte — and because a gate that flaps on
+/// an allocator's rounding is a gate that gets deleted.
+///
+/// It is stated as a WINDOW and not a ceiling on purpose: a zone that got
+/// dramatically *smaller* is as much a signal as one that grew. The most likely
+/// way for it to shrink by megabytes is that the build started dropping records.
+const FLAT_FIXTURE_DRIFT_BYTES: i64 = 64;
+
+/// Scenario: The flat 100,000-record fixture does not grow
+/// features/closest-encloser.feature:629
+///
+/// The S3 half of the memory gate, and the reason it is separate from the 40 MiB
+/// ceiling above it: 40 MiB has 11 MiB of headroom, so it would not notice a
+/// per-node field being added to pay for a closest-encloser search. This would.
+///
+/// The obvious wrong way to make a depth search cheap is to memoise something on
+/// each node — a parent index, a cached encloser, a depth. On this fixture that
+/// is 100,001 nodes, so four bytes each is 400 KB and this fails; the 40 MiB
+/// ceiling would not move.
+///
+/// # Release only, and stated rather than silently skipped
+///
+/// A byte-exact figure is a claim about the **release** binary. A debug build of
+/// the same zone measures 33,863,698 B — 3.4 MB more, ~36 B per node — because
+/// `debug_assert_invariants` allocates a `HashSet` of every owner name for the
+/// ancestor-closure check (I-3) and the allocator sees larger, differently laid
+/// out structures throughout. Comparing that against a release baseline would
+/// fail every `cargo test` run for a reason that has nothing to do with the
+/// zone model, and a gate that is red by default is a gate somebody deletes.
+///
+/// The other budgets in this file survive a debug build because they carry
+/// headroom: 40 MiB against 28.8, 110 B per empty non-terminal against 105. This
+/// one deliberately has none, which is what makes it able to see a per-node
+/// field, so it is the one that has to say which build it is talking about.
+/// Skipping is announced on stdout rather than done quietly.
+fn flat_fixture_does_not_grow(flat_live: i64, unmet: &mut Vec<String>) {
+    let drift = flat_live - FLAT_FIXTURE_BYTES_AT_BD4B397;
+    println!(
+        "flat fixture heap: {flat_live} B against {FLAT_FIXTURE_BYTES_AT_BD4B397} B \
+         at bd4b397, drift {drift:+} B"
+    );
+    if cfg!(debug_assertions) {
+        println!(
+            "  (byte-exact drift not checked: debug build. This budget has no \
+             headroom by design, and a debug build costs ~36 B per node more \
+             than the release baseline it is stated against. Run \
+             `cargo test --release --test zone_memory`.)"
+        );
+        return;
+    }
+    if drift.abs() > FLAT_FIXTURE_DRIFT_BYTES {
+        unmet.push(format!(
+            "\"The flat 100,000-record fixture does not grow\": it is now \
+             {flat_live} B against {FLAT_FIXTURE_BYTES_AT_BD4B397} B at \
+             `bd4b397`, a drift of {drift:+} B against a window of \
+             ±{FLAT_FIXTURE_DRIFT_BYTES} B. This fixture materialises no empty \
+             non-terminals and holds one wildcard, so the only thing S3 may \
+             change here is one `u128` per ZONE. A drift of this size is \
+             per-NODE, which on 100,001 nodes is how a closest-encloser search \
+             gets made cheap by memoising something the model does not need"
+        ));
+    }
+}
+
 /// Scenario: A 100,000-record zone costs at most 40 MiB of live heap
 /// features/zone-data-model.feature:345
 ///
@@ -422,11 +500,17 @@ fn empty_non_terminal_budget(flat_live: i64, unmet: &mut Vec<String>) {
 /// features/zone-data-model.feature:370
 ///
 /// Scenario: An empty non-terminal costs one node and nothing else
-/// features/empty-non-terminals.feature:410
+/// features/empty-non-terminals.feature:421
 ///
 /// Scenario: A negative answer still allocates nothing after ancestors are
 /// materialised
-/// features/empty-non-terminals.feature:448
+/// features/empty-non-terminals.feature:459
+///
+/// Scenario: The flat 100,000-record fixture does not grow
+/// features/closest-encloser.feature:629
+///
+/// Scenario: The negative paths still allocate nothing
+/// features/closest-encloser.feature:648
 ///
 /// Several scenarios in one test because they share a 100,000-record zone that
 /// costs seconds to build, and because a `#[global_allocator]` makes a second
@@ -441,6 +525,7 @@ fn the_zone_and_its_answers_cost_what_the_ruling_budgets() {
 
     let mut unmet: Vec<String> = Vec::new();
     let (zone, flat_live) = heap_budget(&mut unmet);
+    flat_fixture_does_not_grow(flat_live, &mut unmet);
     answer_vector_budget(&zone, &mut unmet);
     drop(zone);
     empty_non_terminal_budget(flat_live, &mut unmet);

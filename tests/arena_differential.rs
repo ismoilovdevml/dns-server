@@ -120,6 +120,39 @@ struct FrozenZone {
     wildcard_parents: HashSet<LowerName>,
     names: HashSet<LowerName>,
     record_count: usize,
+    /// Which wildcard rule [`FrozenZone::wildcard_probe`] applies. See
+    /// [`WildcardRule`] — this is the S3 amendment, and the only one.
+    rule: WildcardRule,
+}
+
+/// Which wildcard rule the transcription applies.
+///
+/// # Why this is an added arm and not an edit
+///
+/// S1's and S2's contract was that [`FrozenZone`] is never updated. S3 is the
+/// commit a ruling authorises to change a *behaviour* (§5.4, AC-3.4), which is
+/// the only circumstance under which this file may grow a second rule — and the
+/// discipline is that the first one is **kept, reachable and still compared**.
+/// [`WildcardRule::DeepestWinsFrozenAtEbe1fbf`]'s body is the pre-S1 walk,
+/// moved into its own function without a character changed, and every property
+/// below still runs it and still classifies the difference against it. So what
+/// S3 changed stays visible as a diff between two rules over one transcription,
+/// exactly as S2's change stayed visible as a diff between two node sets.
+///
+/// The second arm is transcribed from **RFC 4592 §3.3.1 itself**, not from
+/// `src/zone.rs`. That is the difference between an oracle and a copy of the
+/// answer: a mistake in the arena cannot be reproduced here by construction,
+/// because nothing here was read off the implementation.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum WildcardRule {
+    /// Deepest set bit of the depth bitmap wins, probing every configured
+    /// wildcard depth from the query's parent down to the origin. `src/zone.rs`
+    /// at `ebe1fbf`, verbatim. **Never edited.**
+    DeepestWinsFrozenAtEbe1fbf,
+    /// RFC 4592 §3.3.1: find the closest encloser, form `*.<it>`, probe once.
+    /// "If the source of synthesis does not exist ... there is no wildcard
+    /// match. There is no search for an alternate."
+    ClosestEncloserRfc4592,
 }
 
 /// Three-way result, mirroring the private `Resolution`.
@@ -153,6 +186,7 @@ impl FrozenZone {
             wildcard_parents: HashSet::new(),
             names: HashSet::new(),
             record_count: 0,
+            rule: WildcardRule::DeepestWinsFrozenAtEbe1fbf,
         };
 
         if let Some(spec) = &cfg.soa {
@@ -330,7 +364,23 @@ impl FrozenZone {
         }
     }
 
+    /// Dispatch on [`Self::rule`]. Added at S3; the arm below it is untouched.
     fn wildcard_probe(
+        &self,
+        name: &LowerName,
+        record_type: RecordType,
+    ) -> (Option<&[Record]>, bool) {
+        match self.rule {
+            WildcardRule::DeepestWinsFrozenAtEbe1fbf => {
+                self.wildcard_probe_deepest_wins(name, record_type)
+            }
+            WildcardRule::ClosestEncloserRfc4592 => {
+                self.wildcard_probe_closest_encloser(name, record_type)
+            }
+        }
+    }
+
+    fn wildcard_probe_deepest_wins(
         &self,
         name: &LowerName,
         record_type: RecordType,
@@ -364,6 +414,93 @@ impl FrozenZone {
             (1u128 << (start + 1)) - 1
         };
         hi & !((1u128 << floor) - 1)
+    }
+
+    /// Every name that is a **node** in this zone.
+    ///
+    /// `names` holds ordinary owners and, once the closure has been applied, the
+    /// ordinary empty non-terminals. Wildcards are held by their PARENT in this
+    /// model, so the wildcard nodes have to be reconstituted: `*.<p>` for each
+    /// parent `p` (RFC 4592 §2.1.1 — a wildcard is a name whose leftmost label
+    /// is an asterisk, and it is an ordinary node in every other respect).
+    ///
+    /// This matters for names like `x.*.dev.example.test.`, whose closest
+    /// encloser genuinely is `*.dev.example.test.`. Leaving wildcard nodes out
+    /// would return a shallower encloser for them and silently reproduce the
+    /// defect the whole step exists to fix.
+    fn node_names(&self) -> HashSet<LowerName> {
+        let mut out = self.names.clone();
+        for parent in &self.wildcard_parents {
+            if let Ok(star) = Name::from(parent.clone()).prepend_label("*") {
+                out.insert(LowerName::from(star));
+            }
+        }
+        out
+    }
+
+    /// The closest encloser of `name`: the **deepest proper ancestor that
+    /// exists**. RFC 4592 §3.3.1, by brute-force enumeration.
+    ///
+    /// Deliberately the dumbest possible implementation — count down one label
+    /// at a time and stop at the first hit. The arena does this with a binary
+    /// search over label depth, which is correct only because ancestor closure
+    /// makes "a node exists at this depth" monotone; enumerating instead is what
+    /// makes this an independent check of that reasoning rather than a second
+    /// copy of it. If the two disagree, the closure has a hole.
+    ///
+    /// The origin is always a node and every in-zone name descends from it, so
+    /// this always succeeds. `None` only for a name that is not strictly below
+    /// the origin, which has no proper in-zone ancestor to be enclosed by.
+    fn closest_encloser(&self, name: &LowerName, nodes: &HashSet<LowerName>) -> Option<LowerName> {
+        let full = Name::from(name.clone());
+        let depth = full.iter().len();
+        let floor = label_count(&self.lower_origin);
+        if depth <= floor {
+            return None;
+        }
+        for d in (floor..depth).rev() {
+            let ancestor = LowerName::from(full.trim_to(d));
+            if nodes.contains(&ancestor) {
+                return Some(ancestor);
+            }
+        }
+        None
+    }
+
+    /// RFC 4592 §3.3.1, transcribed clause by clause.
+    ///
+    /// ```text
+    /// "If the 'closest encloser' of the query name is a wildcard domain name
+    ///  ... the wildcard record is the source of synthesis ... If the source of
+    ///  synthesis does not exist ... there is no wildcard match. There is no
+    ///  search for an alternate ... the lookup does not look for other wildcard
+    ///  records."
+    /// ```
+    ///
+    /// ONE probe. The absence of a loop here is the whole content of S3.
+    fn wildcard_probe_closest_encloser(
+        &self,
+        name: &LowerName,
+        record_type: RecordType,
+    ) -> (Option<&[Record]>, bool) {
+        let nodes = self.node_names();
+        let Some(ce) = self.closest_encloser(name, &nodes) else {
+            return (None, false);
+        };
+        // The source of synthesis is `*.<ce>` and that name only.
+        if !self.wildcard_parents.contains(&ce) {
+            return (None, false);
+        }
+        (
+            self.wildcard.get(&(ce, record_type)).map(Vec::as_slice),
+            true,
+        )
+    }
+
+    /// The same transcription under the closest-encloser rule.
+    fn under_the_rfc_rule(mut self) -> Self {
+        self.rule = WildcardRule::ClosestEncloserRfc4592;
+        self
     }
 
     /// Close the node set under ancestry — **the whole of S2**, expressed as
@@ -424,48 +561,58 @@ fn declared_node_names(cfg: &ZoneConfig) -> Vec<LowerName> {
 
     let mut out = vec![lower_origin.clone()];
     for spec in &cfg.records {
-        let label = spec.name.trim();
-        let is_wildcard = label == "*" || label.starts_with("*.");
-        let owner_label = if is_wildcard {
-            label
-                .strip_prefix('*')
-                .unwrap_or("")
-                .trim_start_matches('.')
-        } else {
-            label
-        };
-
-        let owner = if owner_label.is_empty() || owner_label == "@" {
-            origin.clone()
-        } else if owner_label.ends_with('.') {
-            let Ok(mut name) = owner_label.parse::<Name>() else {
-                continue;
-            };
-            name.set_fqdn(true);
-            if !lower_origin.zone_of(&LowerName::from(name.clone())) {
-                continue;
-            }
-            name
-        } else {
-            let Ok(name) = Name::parse(owner_label, Some(&origin)) else {
-                continue;
-            };
-            name
-        };
-
-        if is_wildcard {
-            // A wildcard with no representable owner name is not served, so it
-            // implies no ancestors either. Pinned by
-            // `src/zone.rs::a_wildcard_whose_owner_name_exceeds_the_octet_limit_materialises_no_ancestors`.
-            let Ok(name) = owner.prepend_label("*") else {
-                continue;
-            };
-            out.push(LowerName::from(name));
-        } else {
-            out.push(LowerName::from(owner));
+        if let Some(name) = spec_node_name(&origin, &lower_origin, spec) {
+            out.push(name);
         }
     }
     out
+}
+
+/// The node name one spec declares, or `None` when it declares none.
+///
+/// Extracted at S3 so [`declared_node_names`] and [`ConfigModel`] cannot drift:
+/// the classifier's whole claim is that it reads the same operator input the
+/// build reads, and two copies of this qualification logic is how that stops
+/// being true.
+///
+/// Two cases produce no node at all: a spec that does not qualify (the build
+/// fails, and the caller only reaches here when both builds agreed it failed)
+/// and a wildcard whose parent sits within two octets of RFC 1035 §2.3.4's 255,
+/// so `*.<parent>` has no representable name and S1 warns and serves the zone
+/// without it.
+fn spec_node_name(origin: &Name, lower_origin: &LowerName, spec: &RecordSpec) -> Option<LowerName> {
+    let label = spec.name.trim();
+    let is_wildcard = label == "*" || label.starts_with("*.");
+    let owner_label = if is_wildcard {
+        label
+            .strip_prefix('*')
+            .unwrap_or("")
+            .trim_start_matches('.')
+    } else {
+        label
+    };
+
+    let owner = if owner_label.is_empty() || owner_label == "@" {
+        origin.clone()
+    } else if owner_label.ends_with('.') {
+        let mut name = owner_label.parse::<Name>().ok()?;
+        name.set_fqdn(true);
+        if !lower_origin.zone_of(&LowerName::from(name.clone())) {
+            return None;
+        }
+        name
+    } else {
+        Name::parse(owner_label, Some(origin)).ok()?
+    };
+
+    if is_wildcard {
+        // A wildcard with no representable owner name is not served, so it
+        // implies no ancestors either. Pinned by
+        // `src/zone.rs::a_wildcard_whose_owner_name_exceeds_the_octet_limit_materialises_no_ancestors`.
+        Some(LowerName::from(owner.prepend_label("*").ok()?))
+    } else {
+        Some(LowerName::from(owner))
+    }
 }
 
 /// Every name that becomes a node **only** because something exists beneath it:
@@ -576,6 +723,363 @@ fn classify(
             if let Some(RData::CNAME(target)) = new.last().map(|r| &r.data) {
                 if ents.contains(&LowerName::from(target.0.clone())) {
                     return Some(Transition::CnameChaseStopsAtAnEmptyNonTerminal);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+// ===========================================================================
+// S3: the closest-encloser rule, computed from the CONFIG
+// ===========================================================================
+
+/// The zone as the **operator's config** describes it, for the S3 classifier.
+///
+/// Everything the classifier needs to decide whether the closest-encloser rule
+/// may change an answer, derived from `ZoneConfig` alone. The `Zone` under test
+/// contributes nothing to it — which is the entire reason the differential is
+/// worth running. An oracle that read the implementation's own node set would
+/// agree with any bug that was consistent with itself.
+struct ConfigModel {
+    origin_depth: usize,
+    /// Every name that is a node: the declared owners (a wildcard under its own
+    /// `*.x` name, RFC 4592 §2.1.1) plus the ancestor closure S2 materialises.
+    nodes: HashSet<LowerName>,
+    /// `p` for every wildcard node `*.p`, whether declared or materialised.
+    wildcard_parents: HashSet<LowerName>,
+    /// `(p, rtype)` for every wildcard `*.p` the config declares with records of
+    /// `rtype`. A wildcard that exists only as an empty non-terminal appears in
+    /// `wildcard_parents` and in none of these, which is precisely the shape
+    /// that separates "covered" from "answered".
+    wildcard_types: HashSet<(LowerName, RecordType)>,
+}
+
+impl ConfigModel {
+    fn build(cfg: &ZoneConfig) -> Self {
+        let mut nodes: HashSet<LowerName> = declared_node_names(cfg).into_iter().collect();
+        nodes.extend(ancestor_closure(cfg));
+
+        let wildcard_parents: HashSet<LowerName> = nodes
+            .iter()
+            .filter(|n| is_wildcard_name(n))
+            .map(LowerName::base_name)
+            .collect();
+
+        let mut wildcard_types = HashSet::new();
+        if let Ok(mut origin) = cfg.origin.parse::<Name>() {
+            origin.set_fqdn(true);
+            let lower_origin = LowerName::from(origin.clone());
+            for spec in &cfg.records {
+                let Some(node) = spec_node_name(&origin, &lower_origin, spec) else {
+                    continue;
+                };
+                if !is_wildcard_name(&node) {
+                    continue;
+                }
+                let Ok(rtype) = spec.record_type.to_uppercase().parse::<RecordType>() else {
+                    continue;
+                };
+                if spec.values.is_empty() {
+                    continue;
+                }
+                wildcard_types.insert((node.base_name(), rtype));
+            }
+        }
+
+        let origin_depth = cfg.origin.parse::<Name>().map_or(0, |mut o| {
+            o.set_fqdn(true);
+            o.iter().len()
+        });
+
+        Self {
+            origin_depth,
+            nodes,
+            wildcard_parents,
+            wildcard_types,
+        }
+    }
+
+    /// The closest encloser of `q`: the deepest proper ancestor that is a node.
+    ///
+    /// `None` for a name that is not strictly below the origin — the apex
+    /// itself, the root, an out-of-zone name. Those are answered before any
+    /// wildcard rule applies, so "no closest encloser" and "no transition
+    /// permitted" are the same statement.
+    fn closest_encloser(&self, q: &LowerName) -> Option<LowerName> {
+        let full = Name::from(q.clone());
+        let depth = full.iter().len();
+        if depth <= self.origin_depth {
+            return None;
+        }
+        (self.origin_depth..depth).rev().find_map(|d| {
+            let ancestor = LowerName::from(full.trim_to(d));
+            self.nodes.contains(&ancestor).then_some(ancestor)
+        })
+    }
+
+    /// Every proper ancestor of `q` that is a wildcard's parent, deepest first.
+    ///
+    /// This is the set the pre-S3 walk consulted. The window is RFC 4592
+    /// §3.3.1's: a wildcard's parent is a *proper* ancestor of the names it
+    /// covers, so `*.apps` never covers `apps` itself.
+    fn wildcard_ancestors(&self, q: &LowerName) -> Vec<LowerName> {
+        let full = Name::from(q.clone());
+        let depth = full.iter().len();
+        (self.origin_depth..depth)
+            .rev()
+            .map(|d| LowerName::from(full.trim_to(d)))
+            .filter(|a| self.wildcard_parents.contains(a))
+            .collect()
+    }
+
+    /// The wildcard the **pre-S3 walk** would have answered `q`/`rtype` from:
+    /// the deepest ancestor carrying an RRset of that type.
+    fn deepest_typed_wildcard(&self, q: &LowerName, rtype: RecordType) -> Option<LowerName> {
+        self.wildcard_ancestors(q)
+            .into_iter()
+            .find(|p| self.wildcard_types.contains(&(p.clone(), rtype)))
+    }
+
+    /// **The predicate the whole classifier rests on.** True when the
+    /// closest-encloser rule resolves `q`/`rtype` differently from a
+    /// deepest-wins walk over the same node set.
+    ///
+    /// Derived, not asserted. Under ancestor closure every wildcard parent that
+    /// is an ancestor of `q` is itself a node ancestor of `q`, so it can never
+    /// be *deeper* than the closest encloser. The two rules can therefore only
+    /// diverge in two ways, and this is both of them:
+    ///
+    ///   * the walk answered from a wildcard that is not `*.<CE>` — either
+    ///     because the CE holds no wildcard at all, or because it holds one
+    ///     carrying other types and the walk carried on past it;
+    ///   * the walk called the name *covered* on the strength of a wildcard
+    ///     above the CE, so the name error was suppressed by a wildcard RFC 4592
+    ///     §3.3.1 forbids consulting.
+    ///
+    /// A name that is itself a node is excluded outright: it is answered by the
+    /// exact-match arm and no wildcard rule of any kind applies to it. That one
+    /// line is what stops S3 being allowed to undo S2 — see
+    /// `the_classifier_refuses_transitions_the_closest_encloser_rule_cannot_produce`.
+    fn synthesis_moved(&self, q: &LowerName, rtype: RecordType) -> bool {
+        if self.nodes.contains(q) {
+            return false;
+        }
+        let Some(ce) = self.closest_encloser(q) else {
+            return false;
+        };
+        let answered_from_the_wrong_name = self
+            .deepest_typed_wildcard(q, rtype)
+            .is_some_and(|p| p != ce);
+        answered_from_the_wrong_name || self.coverage_narrowed_at(q, &ce)
+    }
+
+    /// True when `q` was covered by a wildcard above its closest encloser, and
+    /// so stops being covered at all.
+    fn coverage_narrowed_at(&self, q: &LowerName, ce: &LowerName) -> bool {
+        !self.wildcard_parents.contains(ce) && !self.wildcard_ancestors(q).is_empty()
+    }
+
+    /// [`Self::coverage_narrowed_at`] without a precomputed closest encloser.
+    ///
+    /// This is what `Zone::exists` narrows by, and existence narrowing is the
+    /// one direction S2's differential explicitly forbade — so at S3 it has to
+    /// be permitted, but only exactly here.
+    fn coverage_narrowed(&self, q: &LowerName) -> bool {
+        if self.nodes.contains(q) {
+            return false;
+        }
+        self.closest_encloser(q)
+            .is_some_and(|ce| self.coverage_narrowed_at(q, &ce))
+    }
+
+    /// What RFC 4592 §3.3.1 and RFC 1034 §4.3.2 step 3(c) say a name with no
+    /// synthesised answer resolves to.
+    ///
+    /// NXDOMAIN when the source of synthesis does not exist; NODATA when it
+    /// exists and carries no RRset of this type, because the authoritative name
+    /// error is set *only* when the `*` node is absent (VEGA-083, preserved).
+    fn rfc_negative(&self, q: &LowerName, rtype: RecordType) -> Option<Answer> {
+        let ce = self.closest_encloser(q)?;
+        if !self.wildcard_parents.contains(&ce) {
+            return Some(Answer::NxDomain);
+        }
+        if self.wildcard_types.contains(&(ce, rtype)) {
+            // The source of synthesis carries the type, so the RFC answer is a
+            // record, not a negative.
+            return None;
+        }
+        Some(Answer::NoData)
+    }
+}
+
+/// Every name in `cfg` that **carves a subtree out of a wildcard**: a node,
+/// itself not a wildcard, with a wildcard's parent as a proper ancestor.
+///
+/// These are the closest enclosers that change an answer at S3, and the query
+/// generator derives its names from them rather than hoping to land on one. The
+/// list includes empty non-terminals, because `*.dev` + `a.b.deep.dev` carves
+/// out `b.deep.dev` and `deep.dev` — names the operator never wrote — and that
+/// is the shape S3 could not have been built without S2 for.
+///
+/// Sorted, so a `HashSet`'s iteration order cannot make a case a coin flip
+/// between two runs of the same seed.
+fn carve_out_names(cfg: &ZoneConfig) -> Vec<String> {
+    let mut nodes: HashSet<LowerName> = declared_node_names(cfg).into_iter().collect();
+    nodes.extend(ancestor_closure(cfg));
+    let parents: HashSet<LowerName> = nodes
+        .iter()
+        .filter(|n| is_wildcard_name(n))
+        .map(LowerName::base_name)
+        .collect();
+
+    let mut out: Vec<String> = nodes
+        .iter()
+        .filter(|n| !is_wildcard_name(n))
+        .filter(|n| {
+            parents
+                .iter()
+                .any(|p| p.zone_of(n) && label_count(p) < label_count(n))
+        })
+        .map(std::string::ToString::to_string)
+        .collect();
+    out.sort();
+    out
+}
+
+/// The three ways S3 may change an answer, and the only three.
+///
+/// Each is decided from [`ConfigModel`], never from what the implementation
+/// returned. A rule of the shape "a synthesised answer may become NXDOMAIN"
+/// would also pass a build that had simply stopped synthesising, which is why
+/// the classes are named and their preconditions derived.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum S3Transition {
+    /// **W1** — a synthesised answer whose source of synthesis was not
+    /// `*.<closest encloser>` becomes exactly what RFC 4592 §3.3.1 says:
+    /// NXDOMAIN when the closest encloser holds no wildcard, NODATA when it
+    /// holds one carrying other types. This is VEGA-009.
+    SynthesisRestrictedToTheClosestEncloser,
+    /// **W2** — a NODATA that came from coverage *above* the closest encloser
+    /// becomes NXDOMAIN. The name error is restored, and this is the arm QTYPE
+    /// ANY takes, because ANY is never an RRTYPE and so only ever reads
+    /// coverage.
+    NameErrorRestoredAboveTheClosestEncloser,
+    /// **W3** — a CNAME chase whose target was reached only by a synthesis above
+    /// the closest encloser loses its tail. The surviving answer is a strict
+    /// prefix of the old one ending on the CNAME, never a reordering and never a
+    /// different record.
+    CnameChaseLosesAnUnreachableSynthesis,
+    /// **W4** — a wildcard is no longer applied AT a wildcard-shaped name that
+    /// exists. RFC 4592 §2.2.2: synthesis does not apply at a name that exists,
+    /// and RFC 4592 §2.1.1 makes "is a wildcard" a property of the NAME, so
+    /// `*.dev` being an empty non-terminal blocks the apex `*` exactly as
+    /// `deep.dev` does.
+    ///
+    /// # This class was not in the ruling, and it was not in the fixture
+    ///
+    /// **VEGA-098.** The ruling's §13 lists AC-3.1 … AC-3.7 and none of them
+    /// covers it, because it is not about the closest encloser at all: the
+    /// search never runs for these names, since the name is a node and RFC 1034
+    /// §4.3.2 step 3.a answers it. It is the other half of S3 — removing the
+    /// exact-match probe's deliberate exclusion of wildcard nodes, which S1
+    /// introduced for map-model fidelity with the note that "that exclusion is
+    /// what S2 and S3 remove, with a ruling".
+    ///
+    /// It was found by `the_wildcard_walk_agrees_with_a_naive_base_name_walk` on
+    /// `main`, not by anything written for S3, and this file's first S3 fixture
+    /// did not contain the shape. That is the argument for keeping the
+    /// classification exhaustive and failing on anything unnamed: a class nobody
+    /// predicted showed up as an unclassified difference rather than as a silent
+    /// pass.
+    SynthesisRefusedAtAWildcardNameThatExists,
+}
+
+/// Which S3 transition, if any, explains `before -> after`. `None` means "not a
+/// transition the closest-encloser rule can produce", and the caller must fail.
+fn classify_s3(
+    model: &ConfigModel,
+    queried: &LowerName,
+    qtype: RecordType,
+    before: &Answer,
+    after: &Answer,
+) -> Option<S3Transition> {
+    if rendered(before) == rendered(after) {
+        return None;
+    }
+
+    // A name that EXISTS is answered by the exact-match arm and no wildcard rule
+    // of any kind applies to it — including turning an empty non-terminal's
+    // NODATA back into a name error, which is S2's gain and not S3's to spend.
+    //
+    // That guard lives inside `synthesis_moved` and `coverage_narrowed` rather
+    // than here, and the difference is load-bearing. W3's queried name is a
+    // CNAME owner, so it is ALWAYS a node; the name whose synthesis moved is the
+    // chase TARGET. A guard at the top of this function refuses W3 outright and
+    // reports the class as unreachable — which is exactly what it did on the
+    // first run of `each_permitted_s3_transition_class_is_reached_by_the_fixture`.
+    //
+    // W1: the answer section loses a synthesis that came from the wrong name.
+    if let Answer::Records(old) = before {
+        let synthesised_here = !old.is_empty()
+            && old
+                .iter()
+                .all(|r| LowerName::from(r.name.clone()) == *queried);
+        if synthesised_here
+            && model.synthesis_moved(queried, qtype)
+            && model
+                .rfc_negative(queried, qtype)
+                .is_some_and(|want| rendered(&want) == rendered(after))
+        {
+            return Some(S3Transition::SynthesisRestrictedToTheClosestEncloser);
+        }
+    }
+
+    // W2: coverage narrows to the closest encloser and the name error returns.
+    if matches!(before, Answer::NoData)
+        && matches!(after, Answer::NxDomain)
+        && model.coverage_narrowed(queried)
+    {
+        return Some(S3Transition::NameErrorRestoredAboveTheClosestEncloser);
+    }
+
+    // W4: the queried name is a wildcard-shaped node, so it EXISTS and no
+    // synthesis may be applied at it (RFC 4592 §2.2.2). The answer must become
+    // exactly what that node holds: its own records of this type if it declares
+    // any, and NODATA otherwise. VEGA-098.
+    if model.nodes.contains(queried) && is_wildcard_name(queried) {
+        let declares_the_type = model.wildcard_types.contains(&(queried.base_name(), qtype));
+        let correct = if declares_the_type {
+            // Its own RRset, owned by its own name — never a synthesis, and
+            // never someone else's records.
+            matches!(after, Answer::Records(records)
+                if !records.is_empty()
+                    && records
+                        .iter()
+                        .all(|r| LowerName::from(r.name.clone()) == *queried))
+        } else {
+            matches!(after, Answer::NoData)
+        };
+        if correct {
+            return Some(S3Transition::SynthesisRefusedAtAWildcardNameThatExists);
+        }
+        // A wildcard node whose answer changed to anything else is not a
+        // transition this step may make. Returning here rather than falling
+        // through keeps W3 from rescuing it on a coincidence of shape.
+        return None;
+    }
+
+    // W3: the chase stopped at a target the RFC rule no longer synthesises for.
+    // A truncation, never a reordering or a rewrite.
+    if let (Answer::Records(old), Answer::Records(new)) = (before, after) {
+        let (_, old_rendered) = rendered(before);
+        let (_, new_rendered) = rendered(after);
+        if new.len() < old.len() && old_rendered.starts_with(new_rendered.as_slice()) {
+            if let Some(RData::CNAME(target)) = new.last().map(|r| &r.data) {
+                let target = LowerName::from(target.0.clone());
+                if model.synthesis_moved(&target, qtype) {
+                    return Some(S3Transition::CnameChaseLosesAnUnreachableSynthesis);
                 }
             }
         }
@@ -724,6 +1228,48 @@ fn broken_spec() -> impl Strategy<Value = RecordSpec> {
     ]
 }
 
+/// A wildcard **and a name carved out from underneath it**, as one unit.
+///
+/// S3's interesting case needs three things at once: a wildcard, a name that
+/// exists between it and the query, and a query below that name. Left to
+/// independent generators that combination is rarer than S2's — S2 needed only a
+/// name with an ancestor — and the repository has already paid for the
+/// alternative once: `a_wildcard_covered_name_exists_for_every_type` filtered
+/// with `prop_assume!` and aborted on CI with "Too many global rejects: 247
+/// successes, 1024 rejects" while passing locally on a luckier seed.
+///
+/// So the pair is CONSTRUCTED. The carve-out name is generated first and the
+/// query is derived from it by [`carve_out_names`], which reads the config.
+/// Nothing is rejected and every case reaches the branch.
+fn carve_out_pair() -> impl Strategy<Value = Vec<RecordSpec>> {
+    (
+        prop::collection::vec(prop::sample::select(vec!["a", "b", "dev", "apps"]), 0..3),
+        typed_value(),
+        typed_value(),
+    )
+        .prop_map(|(tail, (wt, wv), (et, ev))| {
+            let parent = if tail.is_empty() {
+                "cv".to_owned()
+            } else {
+                format!("cv.{}", tail.join("."))
+            };
+            vec![
+                RecordSpec {
+                    name: format!("*.{parent}"),
+                    record_type: wt,
+                    ttl: None,
+                    values: vec![wv],
+                },
+                RecordSpec {
+                    name: format!("carved.{parent}"),
+                    record_type: et,
+                    ttl: None,
+                    values: vec![ev],
+                },
+            ]
+        })
+}
+
 fn zone_config() -> impl Strategy<Value = ZoneConfig> {
     (
         prop::collection::vec(exact_spec(), 0..6),
@@ -732,11 +1278,17 @@ fn zone_config() -> impl Strategy<Value = ZoneConfig> {
         // rate would starve the lookup half of the property.
         prop::option::weighted(0.08, broken_spec()),
         prop::option::weighted(0.85, Just(())),
+        // Mostly present, because S3's whole subject is what happens when a
+        // name exists between a wildcard and the query. Not ALWAYS present, so
+        // the zones with no carve-out at all are still generated and the
+        // no-transition path is still exercised.
+        prop::option::weighted(0.75, carve_out_pair()),
     )
-        .prop_map(|(exacts, wildcards, broken, with_soa)| {
+        .prop_map(|(exacts, wildcards, broken, with_soa, carve)| {
             let mut records = exacts;
             records.extend(wildcards);
             records.extend(broken);
+            records.extend(carve.into_iter().flatten());
             ZoneConfig {
                 origin: ORIGIN.to_owned(),
                 default_ttl: 300,
@@ -803,7 +1355,7 @@ struct QueryPlan {
 
 fn query_plan() -> impl Strategy<Value = QueryPlan> {
     (
-        0u8..15,
+        0u8..17,
         0usize..64,
         prop::collection::vec(label(), 1..4),
         0usize..=120,
@@ -910,6 +1462,24 @@ fn query_name(cfg: &ZoneConfig, plan: &QueryPlan) -> String {
             ents.sort();
             pick(&ents).map_or(origin_dot, |e| stack(&e))
         }
+        // ---------------------------------------------------------------- S3
+        // BELOW A CARVE-OUT: a wildcard covers this subtree, and a name that
+        // EXISTS sits between the wildcard's parent and the query. That name is
+        // the closest encloser, so RFC 4592 §3.3.1 allows only `*.<it>` — and
+        // this is the shape the pre-S3 walk gets wrong. CONSTRUCTED from the
+        // config by `carve_out_names`, never filtered for: the combination is
+        // rarer than S2's, and hoping to land on it is how a property reaches
+        // 1,024 global rejects on CI.
+        15 => {
+            let carves = carve_out_names(cfg);
+            pick(&carves).map_or(origin_dot, |c| stack(&c))
+        }
+        // The carve-out name ITSELF, which must keep answering. Without it a
+        // build that made the whole subtree disappear would satisfy shape 15.
+        16 => {
+            let carves = carve_out_names(cfg);
+            pick(&carves).unwrap_or(origin_dot)
+        }
         // A name the zone does not hold in any form. Labels are joined with a
         // dot, never fused: hickory rejects a label that mixes an asterisk with
         // other octets, and the alphabet contains one.
@@ -938,16 +1508,20 @@ fn query_type() -> impl Strategy<Value = RecordType> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
-    /// INVARIANT (AC-1.1, AC-2.1 … AC-2.4): the arena answers what the
-    /// transcription answers over the **ancestor-closed** node set, and every
-    /// difference from the pre-closure node set is one of three named classes.
+    /// INVARIANT (AC-1.1, AC-2.1 … AC-2.4, AC-3.1 … AC-3.3): the arena answers
+    /// what the transcription answers over the **ancestor-closed** node set
+    /// under **RFC 4592 §3.3.1**, and every difference from each of the two
+    /// earlier models is one of that model's named classes.
     ///
     /// Scenario: The arena answers exactly what today's implementation answers,
     /// for every zone and every query
     /// features/zone-data-model.feature:263
     ///
     /// Scenario: S2 changes the answer at an empty non-terminal and nowhere else
-    /// features/empty-non-terminals.feature:370
+    /// features/empty-non-terminals.feature:381
+    ///
+    /// Scenario: Every S3 difference is one of four named classes
+    /// features/closest-encloser.feature:483
     ///
     /// Also carries, in the same pass:
     ///
@@ -1006,6 +1580,16 @@ proptest! {
         let s2 = FrozenZone::build(&cfg)
             .expect("the transcription built once, so it builds twice")
             .materialise_ancestors(&ent_list);
+        // S3: the same transcription and the same node set, under RFC 4592
+        // §3.3.1 instead of deepest-wins. This is the oracle the implementation
+        // is now held to; `s2` stays alongside it so what S3 changed is a diff
+        // between two RULES over one transcription, exactly as what S2 changed
+        // is a diff between two NODE SETS over the same one.
+        let s3 = FrozenZone::build(&cfg)
+            .expect("the transcription built once, so it builds three times")
+            .materialise_ancestors(&ent_list)
+            .under_the_rfc_rule();
+        let model = ConfigModel::build(&cfg);
         let origin_depth = label_count(&frozen.lower_origin);
 
         prop_assert_eq!(
@@ -1030,7 +1614,7 @@ proptest! {
 
         prop_assert_eq!(
             real.exists(&queried),
-            s2.exists(&queried),
+            s3.exists(&queried),
             "Zone::exists disagreed for {}. It is the RFC 1034 §4.3.2 step 3(c) \
              name-error determination (VEGA-083), the ruling keeps its contract \
              through the rewrite, and it is the one predicate the DNSSEC proof \
@@ -1038,18 +1622,31 @@ proptest! {
             name,
             shape
         );
-        // Existence may only *widen*, and only over the closure. A name that
-        // existed before and does not now is a record taken out of service.
+        // EXISTENCE NARROWS AT S3, and this assertion is AMENDED rather than
+        // deleted. Through S1 and S2 it read "existence may only widen": a name
+        // that existed before and does not now is a record taken out of service,
+        // and ancestor closure can only add names.
+        //
+        // The closest-encloser rule genuinely removes some. A name whose only
+        // coverage came from a wildcard ABOVE its closest encloser stops being
+        // covered, and RFC 4592 §2.2 is explicit that a wildcard-covered name is
+        // not a node in the zone — so it stops existing, correctly. The
+        // amendment is therefore not "existence may now shrink" but "existence
+        // may shrink EXACTLY where `coverage_narrowed` says so, decided from the
+        // config". Weakening it to the first form would let a build that had
+        // stopped covering anything at all through.
         prop_assert!(
-            !frozen.exists(&queried) || real.exists(&queried),
-            "{} existed before S2 and does not now. Ancestor closure adds names \
-             to the node set; it can never remove one\n  zone: {:?}",
+            !s2.exists(&queried) || real.exists(&queried) || model.coverage_narrowed(&queried),
+            "{} existed before S3 and does not now, and its coverage did not \
+             narrow to the closest encloser. Ancestor closure never removes a \
+             name and the closest-encloser rule removes only the names a \
+             wildcard above the closest encloser was covering\n  zone: {:?}",
             name,
             shape
         );
 
         let actual = real.lookup(&queried, qtype);
-        let expected = s2.lookup(&queried, qtype);
+        let expected = s3.lookup(&queried, qtype);
         prop_assert_eq!(
             rendered(&actual),
             rendered(&expected),
@@ -1065,14 +1662,39 @@ proptest! {
             expected
         );
 
-        // …and the closure itself is held to three named classes. Without this
-        // the property above would pass against an oracle that had quietly
-        // grown a second behaviour change, which is exactly how a differential
-        // stops being a gate.
-        let before = frozen.lookup(&queried, qtype);
-        if rendered(&before) != rendered(&expected) {
+        // …and the RULE change is held to three named classes of its own,
+        // derived from the config by `ConfigModel`. Without this the property
+        // above would pass against an oracle that had quietly grown a second
+        // behaviour change, which is exactly how a differential stops being a
+        // gate.
+        let before_s3 = s2.lookup(&queried, qtype);
+        if rendered(&before_s3) != rendered(&expected) {
             prop_assert!(
-                classify(&ents, origin_depth, &queried, &before, &expected).is_some(),
+                classify_s3(&model, &queried, qtype, &before_s3, &expected).is_some(),
+                "{} {} changed between the deepest-wins rule and the \
+                 closest-encloser rule, and the change is not one that rule can \
+                 produce (W1 synthesis restricted to `*.<closest encloser>`, W2 \
+                 the name error restored above it, W3 a CNAME chase losing an \
+                 unreachable synthesis, W4 synthesis refused at a wildcard name \
+                 that exists)\n  zone: {:?}\n  before: {:?}\n  after:  \
+                 {:?}",
+                name,
+                qtype,
+                shape,
+                before_s3,
+                expected
+            );
+        }
+
+        // S2's classification is KEPT and still checked over the same case. S3
+        // and S2 are independent claims, and a step that satisfied its own fence
+        // by spending the previous step's gains is the one regression a
+        // per-step differential would otherwise miss.
+        let before = frozen.lookup(&queried, qtype);
+        let after_s2 = s2.lookup(&queried, qtype);
+        if rendered(&before) != rendered(&after_s2) {
+            prop_assert!(
+                classify(&ents, origin_depth, &queried, &before, &after_s2).is_some(),
                 "{} {} changed between the pre-S2 and post-S2 node sets, and the \
                  change is not one of the three transitions ancestor closure can \
                  produce (T1 the name is an empty non-terminal, T2 it is covered \
@@ -1290,9 +1912,17 @@ fn every_branch_of_the_lookup_agrees_with_the_transcription_over_an_ancestor_clo
     );
 }
 
-/// Scenario: A wildcard still applies below a name that exists — S2 does not fix
-/// VEGA-009
+/// Scenario: The wildcard no longer applies below a name that exists — S3
+/// discharges the fence
 /// features/empty-non-terminals.feature:327
+///
+/// AMENDED AT S3 only in its citation. The scenario it names inverted when S3
+/// landed — it used to assert that `a.deep.dev` was still answered from `*.dev`
+/// — but what THIS test does is unchanged and must stay unchanged: it hands S2's
+/// classifier the transition S3 makes and requires `None`. The fence is what
+/// stopped that fix landing a commit early; keeping the assertion after the fix
+/// has landed is what stops S2's classifier being widened later to cover
+/// something it never covered.
 ///
 /// **The proof that the permitted transition set is not too loose**, and the
 /// reason it is three named classes rather than "NXDOMAIN may become NODATA".
@@ -1385,7 +2015,7 @@ fn the_classifier_refuses_transitions_ancestor_closure_cannot_produce() {
 }
 
 /// Scenario: All three transition classes are actually reached
-/// features/empty-non-terminals.feature:395
+/// features/empty-non-terminals.feature:406
 ///
 /// The anti-vacuity half of the differential, and **it does not touch the
 /// implementation at all**: it runs the fixture through the transcription twice,
@@ -1486,4 +2116,629 @@ fn each_permitted_transition_class_is_reached_by_the_fixture() {
              entry, not a gate. Observed: {seen:?}"
         );
     }
+}
+
+// ===========================================================================
+// S3 — the closest encloser (VEGA-009, VEGA-078)
+// ===========================================================================
+
+/// The S3 fixture, built so that a closest-encloser search which is **short by
+/// one level** changes an answer in both directions.
+///
+/// S2's first classifier accepted a mutant whose ancestor closure stopped one
+/// level short, because the fixture it was checked against still produced every
+/// transition class with the shallower closure. The lesson is that an off-by-one
+/// in a depth search is only visible on a LADDER — two wildcards at adjacent
+/// depths with an existing name between them — and this fixture carries one:
+///
+/// ```text
+///   *.dev            answers q.dev
+///   deep.dev         exists, holds no wildcard
+///   x.deep.dev       exists, so it encloses q.x.deep.dev
+///   *.x.deep.dev     answers q.x.deep.dev
+/// ```
+///
+/// A search short by one answers `q.x.deep.dev` NXDOMAIN (it looks for
+/// `*.deep.dev`) *and* answers `q.deep.dev` from `*.dev` (it looks for `*.dev`).
+/// Two failures in opposite directions from one off-by-one; either alone would
+/// be invisible without the ladder. `the_fixture_exposes_a_closest_encloser_
+/// computed_one_level_short` asserts the ladder is actually there, so it cannot
+/// be edited away by a diff that looks like tidying.
+///
+/// The rest of the records exist one per transition class and per branch:
+/// `*.carve` over `sub.carve` over `*.sub.carve TXT` gives W1's NODATA arm (the
+/// source of synthesis exists and carries the wrong type); `a.b.svc` gives an
+/// empty non-terminal that must NOT move at S3; `toCarve` is a CNAME into a
+/// carved-out name for W3.
+fn s3_fixture() -> ZoneConfig {
+    let spec = |name: &str, ty: &str, value: &str| RecordSpec {
+        name: name.to_owned(),
+        record_type: ty.to_owned(),
+        ttl: None,
+        values: vec![value.to_owned()],
+    };
+    ZoneConfig {
+        origin: ORIGIN.to_owned(),
+        default_ttl: 300,
+        builtins: false,
+        soa: Some(SoaSpec {
+            mname: format!("ns1.{ORIGIN}."),
+            rname: format!("hostmaster.{ORIGIN}."),
+            serial: 1,
+            refresh: 3600,
+            retry: 900,
+            expire: 604_800,
+            minimum: 60,
+        }),
+        records: vec![
+            spec("host", "A", "203.0.113.20"),
+            // The ladder. Do not flatten it.
+            spec("*.dev", "A", "203.0.113.50"),
+            spec("deep.dev", "A", "203.0.113.51"),
+            spec("x.deep.dev", "A", "203.0.113.52"),
+            spec("*.x.deep.dev", "A", "203.0.113.53"),
+            // W1's NODATA arm: the source of synthesis exists and carries only
+            // TXT, so an A query stops there instead of walking up to `*.carve`.
+            spec("*.carve", "A", "203.0.113.60"),
+            spec("sub.carve", "A", "203.0.113.61"),
+            spec("*.sub.carve", "TXT", "\"only text here\""),
+            // An empty non-terminal, which S3 must not touch: `b.svc` and `svc`
+            // exist because `a.b.svc` does.
+            spec("a.b.svc", "A", "203.0.113.70"),
+            // W3: a CNAME whose target is inside the carve-out, so the chase
+            // that used to append `*.dev`'s synthesised A now stops at the CNAME.
+            spec("tocarve", "CNAME", &format!("q.deep.dev.{ORIGIN}.")),
+            // VEGA-098: makes `*.zone.example.test.` an empty non-terminal that
+            // is ALSO a wildcard. A name that exists stops synthesis whatever
+            // its leftmost label is (RFC 4592 §2.1.1, §2.2.2), so a wildcard
+            // above it must not be applied AT it. Paired with the apex wildcard
+            // in `s3_apex_wildcard_fixture`, which is what makes the divergence
+            // observable — found on `main` by the very oracle S3 retires.
+            spec("x.*.zone", "A", "203.0.113.80"),
+        ],
+    }
+}
+
+/// The same fixture **plus an apex wildcard**, which masks W2.
+///
+/// An apex `*` covers every name in the zone, so no name below it is ever
+/// NXDOMAIN under the old rule and "the name error is restored" cannot be
+/// observed — except at the apex wildcard's own level, which is exactly what
+/// this variant reaches. The mirror image of S2's `t2_fixture`, and here for the
+/// same reason: a class reported as unreachable because one fixture happened to
+/// hide it is the failure mode this file exists to avoid.
+fn s3_apex_wildcard_fixture() -> ZoneConfig {
+    let mut cfg = s3_fixture();
+    cfg.records.push(RecordSpec {
+        name: "*".to_owned(),
+        record_type: "A".to_owned(),
+        ttl: None,
+        values: vec!["203.0.113.1".to_owned()],
+    });
+    cfg
+}
+
+/// The names swept against the S3 fixtures, one per branch of the rule.
+fn s3_fixture_names() -> Vec<String> {
+    vec![
+        ORIGIN.to_owned() + ".",
+        format!("host.{ORIGIN}."),
+        // The ladder, queried at all three rungs.
+        format!("q.dev.{ORIGIN}."),
+        format!("q.deep.dev.{ORIGIN}."),
+        format!("q.x.deep.dev.{ORIGIN}."),
+        format!("q.r.x.deep.dev.{ORIGIN}."),
+        format!("deep.dev.{ORIGIN}."),
+        format!("x.deep.dev.{ORIGIN}."),
+        format!("*.dev.{ORIGIN}."),
+        format!("dev.{ORIGIN}."),
+        // The type-miss arm.
+        format!("q.carve.{ORIGIN}."),
+        format!("q.sub.carve.{ORIGIN}."),
+        format!("sub.carve.{ORIGIN}."),
+        // Empty non-terminals: NODATA, and S3 must leave them alone.
+        format!("b.svc.{ORIGIN}."),
+        format!("svc.{ORIGIN}."),
+        format!("q.b.svc.{ORIGIN}."),
+        // The CNAME into the carve-out.
+        format!("tocarve.{ORIGIN}."),
+        // VEGA-098's shape: a wildcard that is an empty non-terminal, a name it
+        // covers, and its parent.
+        format!("*.zone.{ORIGIN}."),
+        format!("covered.zone.{ORIGIN}."),
+        format!("zone.{ORIGIN}."),
+        // Names nothing encloses tightly, and names outside the zone.
+        format!("nothing.{ORIGIN}."),
+        format!("a.b.c.d.{ORIGIN}."),
+        "example.invalid.".to_owned(),
+        ".".to_owned(),
+    ]
+}
+
+/// Scenario: A closest encloser computed one level short is visible in an
+/// answer
+/// features/closest-encloser.feature:265
+///
+/// The anti-masking check, and it runs against the **config model** rather than
+/// against the implementation, so it holds even while the implementation is
+/// wrong. S2's warning made concrete: its class check passed against a closure
+/// that stopped one level short, because its own fixture still produced all
+/// three classes either way. This asserts the ladder rung by rung, so a
+/// classifier whose own `closest_encloser` is short by one fails HERE rather
+/// than silently agreeing with a short implementation.
+#[test]
+fn the_fixture_exposes_a_closest_encloser_computed_one_level_short() {
+    let _watchdog = testutil::arm(WATCHDOG);
+    let model = ConfigModel::build(&s3_fixture());
+
+    for (query, encloser, synthesises) in [
+        // Deepest rung: enclosed by a name that DOES hold a wildcard.
+        (
+            format!("q.x.deep.dev.{ORIGIN}."),
+            format!("x.deep.dev.{ORIGIN}."),
+            true,
+        ),
+        // Middle rung: enclosed by a name that does NOT. A search short by one
+        // lands on `dev` here and leaks `*.dev` into the carve-out.
+        (
+            format!("q.deep.dev.{ORIGIN}."),
+            format!("deep.dev.{ORIGIN}."),
+            false,
+        ),
+        // Shallowest rung: enclosed by the wildcard's own parent.
+        (format!("q.dev.{ORIGIN}."), format!("dev.{ORIGIN}."), true),
+    ] {
+        let ce = model
+            .closest_encloser(&lower(&query))
+            .unwrap_or_else(|| panic!("{query} is strictly below the origin, so it has one"));
+        assert_eq!(
+            ce,
+            lower(&encloser),
+            "the closest encloser of {query} is {encloser}. A search that is \
+             short by one level returns a shallower name here, which is how a \
+             wildcard synthesises into a subtree an operator carved out — \
+             VEGA-009 reopened, with answers that look correct"
+        );
+        assert_eq!(
+            model.wildcard_parents.contains(&ce),
+            synthesises,
+            "{encloser} {} hold a wildcard. The ladder only exposes an \
+             off-by-one while adjacent rungs disagree about this",
+            if synthesises { "must" } else { "must not" }
+        );
+    }
+
+    // …and the ladder must actually be a ladder: three consecutive depths.
+    assert_eq!(
+        model
+            .closest_encloser(&lower(&format!("q.x.deep.dev.{ORIGIN}.")))
+            .map(|n| Name::from(n).iter().len()),
+        Some(5),
+        "the ladder's rungs must sit at consecutive depths, or a search short \
+         by one still lands on a name that agrees with the truth"
+    );
+}
+
+/// Scenario: The classifier refuses transitions the closest-encloser rule cannot
+/// produce
+/// features/closest-encloser.feature:514
+///
+/// **The proof that the permitted transition set is not too loose**, and the
+/// reason it is three named classes with derived preconditions rather than
+/// "a synthesised answer may become NXDOMAIN".
+///
+/// Five refusals and two accepts. The accepts are not decoration: without them
+/// this test passes against a classifier that returns `None` for everything,
+/// which would make the differential vacuous in the one direction nobody checks.
+#[test]
+// Five refusals and three accepts belong in ONE test. Split them and the refusal
+// half keeps passing while somebody deletes the accepts, which is the exact
+// failure mode this test exists to prevent: a classifier that returns `None` for
+// everything refuses every wrong transition and makes the differential vacuous.
+// The lint is measuring length; the property being asserted is that the two
+// halves cannot be separated.
+#[allow(clippy::too_many_lines)]
+fn the_classifier_refuses_transitions_the_closest_encloser_rule_cannot_produce() {
+    let cfg = s3_fixture();
+    let model = ConfigModel::build(&cfg);
+
+    let synthesised_at = |name: &str, value: &str| {
+        Answer::Records(vec![Record::from_rdata(
+            Name::from(lower(name)),
+            300,
+            rdata::parse_value(RecordType::A, "*", value).expect("fixture rdata parses"),
+        )])
+    };
+
+    // ---------------------------------------------------------------- REFUSE
+    // 1. S3 must not undo S2. An empty non-terminal is a name that EXISTS, so
+    //    no wildcard rule of any kind applies to it. A classifier that permitted
+    //    NODATA -> NXDOMAIN wherever it appeared would let S3 silently reopen
+    //    VEGA-006 while closing VEGA-009, and this differential would stay green
+    //    the whole time. This is the highest-value assertion in the file.
+    let ent = lower(&format!("svc.{ORIGIN}."));
+    assert!(
+        model.nodes.contains(&ent),
+        "the fixture must actually declare something beneath {ent}, or this \
+         refusal is about a name that does not exist"
+    );
+    assert_eq!(
+        classify_s3(
+            &model,
+            &ent,
+            RecordType::A,
+            &Answer::NoData,
+            &Answer::NxDomain
+        ),
+        None,
+        "the classifier accepted an empty non-terminal losing its NODATA. \
+         `svc.{ORIGIN}.` exists because `a.b.svc.{ORIGIN}.` does (RFC 4592 \
+         §2.2.2); a name error there is cached for the SOA MINIMUM and, under \
+         RFC 8020 §2, denies the record beneath it. S3 changes which WILDCARD \
+         answers a covered name and nothing about which names exist"
+    );
+
+    // 2. Legitimate synthesis must not be droppable. `q.dev` is enclosed by
+    //    `dev`, which holds `*.dev` carrying A, so the RFC answer is a record.
+    //    A build that simply stopped synthesising produces exactly this
+    //    transition, and it must not be classifiable.
+    assert_eq!(
+        classify_s3(
+            &model,
+            &lower(&format!("q.dev.{ORIGIN}.")),
+            RecordType::A,
+            &synthesised_at(&format!("q.dev.{ORIGIN}."), "203.0.113.50"),
+            &Answer::NxDomain,
+        ),
+        None,
+        "the classifier accepted a wildcard being switched off. `dev.{ORIGIN}.` \
+         IS the closest encloser of `q.dev.{ORIGIN}.` and it holds `*.dev` with \
+         an A record, so RFC 4592 §3.3.1 requires the synthesis. Permitting this \
+         would let 'delete the wildcard probe' pass the differential"
+    );
+
+    // 3. The reverse direction: a wildcard GAINING reach below an existing
+    //    name. That is the signature of a closest-encloser search that is short
+    //    by one, and it is the mutant the ruling calls the most dangerous in the
+    //    model. S3 narrows synthesis; it never widens it.
+    assert_eq!(
+        classify_s3(
+            &model,
+            &lower(&format!("q.deep.dev.{ORIGIN}.")),
+            RecordType::A,
+            &Answer::NxDomain,
+            &synthesised_at(&format!("q.deep.dev.{ORIGIN}."), "203.0.113.50"),
+        ),
+        None,
+        "the classifier accepted a wildcard REACHING FURTHER after S3. \
+         `deep.dev.{ORIGIN}.` exists, so it encloses `q.deep.dev.{ORIGIN}.` and \
+         `*.dev` must not apply. A search that is short by one produces exactly \
+         this, and it is VEGA-009 reopened wearing a green differential"
+    );
+
+    // 4. The blanket rule, refused. A name whose closest encloser DOES hold the
+    //    wildcard that answered it is unaffected by S3, whatever the transition
+    //    looks like from outside.
+    assert_eq!(
+        classify_s3(
+            &model,
+            &lower(&format!("q.dev.{ORIGIN}.")),
+            RecordType::A,
+            &synthesised_at(&format!("q.dev.{ORIGIN}."), "203.0.113.50"),
+            &Answer::NoData,
+        ),
+        None,
+        "the classifier accepted RECORDS becoming NODATA at a name the closest \
+         encloser's own wildcard answers. `*.dev` carries A and `dev` is the \
+         closest encloser, so RFC 4592 §3.3.1 requires the record"
+    );
+
+    // 5. And a name nothing ever covered: there is no coverage to narrow, so
+    //    there is no transition to permit.
+    assert_eq!(
+        classify_s3(
+            &model,
+            &lower(&format!("nothing.{ORIGIN}.")),
+            RecordType::A,
+            &Answer::NoData,
+            &Answer::NxDomain,
+        ),
+        None,
+        "the classifier accepted a blanket NODATA -> NXDOMAIN. No wildcard is an \
+         ancestor of `nothing.{ORIGIN}.` in this fixture, so nothing covered it \
+         before S3 and nothing stopped covering it at S3"
+    );
+
+    // ---------------------------------------------------------------- ACCEPT
+    // 6. VEGA-009's own transition: the wildcard stops reaching into the
+    //    carve-out and the name error appears.
+    assert_eq!(
+        classify_s3(
+            &model,
+            &lower(&format!("q.deep.dev.{ORIGIN}.")),
+            RecordType::A,
+            &synthesised_at(&format!("q.deep.dev.{ORIGIN}."), "203.0.113.50"),
+            &Answer::NxDomain,
+        ),
+        Some(S3Transition::SynthesisRestrictedToTheClosestEncloser),
+        "this IS VEGA-009's transition and the classifier must recognise it, or \
+         the differential passes by refusing everything"
+    );
+
+    // 5b. W4, refused in the direction that would lose a wildcard node's OWN
+    //     records. `*.dev` declares an A record, so a query for its literal name
+    //     is an exact match under RFC 1034 §4.3.2 step 3.a and must return it —
+    //     RFC 4592 §2.3, an asterisk in a QNAME gets no special processing.
+    //     Removing the exact probe's wildcard exclusion must make these names
+    //     answer MORE precisely, never make them answer nothing.
+    let wildcard_node = lower(&format!("*.dev.{ORIGIN}."));
+    assert!(
+        model.nodes.contains(&wildcard_node),
+        "the fixture must declare `*.dev`, or this refusal is about a name that \
+         does not exist"
+    );
+    assert_eq!(
+        classify_s3(
+            &model,
+            &wildcard_node,
+            RecordType::A,
+            &synthesised_at(&format!("*.dev.{ORIGIN}."), "203.0.113.50"),
+            &Answer::NoData,
+        ),
+        None,
+        "the classifier accepted a wildcard node losing its own A record. \
+         `*.dev.{ORIGIN}.` declares one, and a query for that literal name is an \
+         exact match (RFC 4592 §2.3, RFC 1034 §4.3.2 step 3.a). W4 refuses \
+         synthesis AT a name that exists; it does not refuse the name's own \
+         RRset"
+    );
+
+    // 7. W1's other arm: the source of synthesis exists and carries the wrong
+    //    type, so the answer is NODATA rather than a name error, and it must not
+    //    fall back to `*.carve`.
+    assert_eq!(
+        classify_s3(
+            &model,
+            &lower(&format!("q.sub.carve.{ORIGIN}.")),
+            RecordType::A,
+            &synthesised_at(&format!("q.sub.carve.{ORIGIN}."), "203.0.113.60"),
+            &Answer::NoData,
+        ),
+        Some(S3Transition::SynthesisRestrictedToTheClosestEncloser),
+        "`*.sub.carve` is the source of synthesis and carries only TXT. RFC 1034 \
+         §4.3.2 step 3(c) sets the name error only when the `*` node is absent, \
+         and it is present, so this is NODATA — and `*.carve`'s A record must \
+         not be reached (\"there is no search for an alternate\")"
+    );
+
+    // 8. W4's accept: a wildcard-shaped EMPTY NON-TERMINAL stops synthesis at
+    //    itself. `*.zone` exists because `x.*.zone` is configured beneath it and
+    //    it declares nothing, so the answer is NODATA and no wildcard above it
+    //    may be applied. VEGA-098.
+    let wildcard_ent = lower(&format!("*.zone.{ORIGIN}."));
+    assert!(
+        model.nodes.contains(&wildcard_ent)
+            && !model
+                .wildcard_types
+                .iter()
+                .any(|(p, _)| { *p == wildcard_ent.base_name() }),
+        "the fixture must make `*.zone.{ORIGIN}.` an empty non-terminal — a node \
+         that declares no RRset of its own — or this accept is about a different \
+         shape entirely"
+    );
+    assert_eq!(
+        classify_s3(
+            &model,
+            &wildcard_ent,
+            RecordType::A,
+            &synthesised_at(&format!("*.zone.{ORIGIN}."), "203.0.113.1"),
+            &Answer::NoData,
+        ),
+        Some(S3Transition::SynthesisRefusedAtAWildcardNameThatExists),
+        "this IS VEGA-098's transition and the classifier must recognise it. It \
+         is the class no ruling predicted and no hand-written S3 fixture \
+         contained; it turned up as an unclassified difference, which is the \
+         only reason it is specced at all"
+    );
+}
+
+/// Scenario: All four transition classes are actually reached
+/// features/closest-encloser.feature:536
+///
+/// The anti-vacuity half of the S3 differential, and — like S2's — it **does not
+/// touch the implementation at all**. It runs the fixtures through the
+/// transcription twice, once under the deepest-wins rule and once under RFC 4592
+/// §3.3.1, and requires each of the three permitted transitions to appear.
+///
+/// Kept separate from the sweep for one reason: the sweep is RED until S3 lands,
+/// so an assertion buried at its end would not run until then — and a
+/// classification nobody has ever exercised is a whitelist, not a gate. This one
+/// is GREEN TODAY. If it goes red, either a fixture stopped producing a shape or
+/// `classify_s3` stopped recognising one, and in both cases the property that
+/// depends on it has quietly widened.
+#[test]
+fn each_permitted_s3_transition_class_is_reached_by_the_fixture() {
+    let _watchdog = testutil::arm(WATCHDOG);
+
+    let mut seen: HashSet<S3Transition> = HashSet::new();
+    let mut unclassified: Vec<String> = Vec::new();
+
+    for cfg in [s3_fixture(), s3_apex_wildcard_fixture()] {
+        let model = ConfigModel::build(&cfg);
+        let ents = ancestor_closure(&cfg);
+        let mut ent_list: Vec<LowerName> = ents.iter().cloned().collect();
+        ent_list.sort_by_key(std::string::ToString::to_string);
+
+        let s2 = FrozenZone::build(&cfg)
+            .expect("fixture builds")
+            .materialise_ancestors(&ent_list);
+        let s3 = FrozenZone::build(&cfg)
+            .expect("fixture builds twice")
+            .materialise_ancestors(&ent_list)
+            .under_the_rfc_rule();
+
+        for name in s3_fixture_names() {
+            let queried = lower(&name);
+            for qtype in [
+                RecordType::A,
+                RecordType::AAAA,
+                RecordType::TXT,
+                RecordType::CNAME,
+                RecordType::ANY,
+            ] {
+                let before = s2.lookup(&queried, qtype);
+                let after = s3.lookup(&queried, qtype);
+                if rendered(&before) == rendered(&after) {
+                    continue;
+                }
+                match classify_s3(&model, &queried, qtype, &before, &after) {
+                    Some(class) => {
+                        seen.insert(class);
+                    }
+                    None => unclassified.push(format!("{name} {qtype}: {before:?} -> {after:?}")),
+                }
+            }
+        }
+    }
+
+    assert!(
+        unclassified.is_empty(),
+        "the closest-encloser rule alone produced a difference that \
+         `classify_s3` does not recognise. Either the rule is doing more than \
+         restricting synthesis to `*.<closest encloser>`, or there is a fourth \
+         transition class that has to be named and specced before S3 can be \
+         accepted:\n  - {}",
+        unclassified.join("\n  - ")
+    );
+
+    for required in [
+        S3Transition::SynthesisRestrictedToTheClosestEncloser,
+        S3Transition::NameErrorRestoredAboveTheClosestEncloser,
+        S3Transition::CnameChaseLosesAnUnreachableSynthesis,
+        S3Transition::SynthesisRefusedAtAWildcardNameThatExists,
+    ] {
+        assert!(
+            seen.contains(&required),
+            "{required:?} was never observed on these fixtures, so the \
+             classification in the property permits it without ever checking \
+             it. A transition class nothing exercises is a whitelist entry, not \
+             a gate. Observed: {seen:?}"
+        );
+    }
+}
+
+/// Scenario: Every S3 difference is one of four named classes
+/// features/closest-encloser.feature:483
+///
+/// The deterministic branch sweep for S3, and the file's load-bearing assertion:
+/// the arena answers **what RFC 4592 §3.3.1 answers**, and every difference from
+/// the pre-S3 rule is classified.
+///
+/// Three oracles run over one fixture, and all three comparisons are kept:
+///
+///   * `frozen` — deepest-wins over the DECLARED node set, i.e. pre-S2;
+///   * `s2` — deepest-wins over the ancestor-closed node set, i.e. pre-S3;
+///   * `s3` — the RFC rule over the same closed node set.
+///
+/// `real == s3` is S3's claim. `s2 -> s3` classified by `classify_s3` is S3's
+/// fence. `frozen -> s2` classified by S2's `classify` is **kept**, so that S3
+/// cannot quietly undo S2's three classes while satisfying its own — which is
+/// the one way a step in this sequence could regress the step before it and stay
+/// green.
+///
+/// # Status: FAILS TODAY, and for the right reason
+///
+/// `q.deep.dev.example.test.` is answered from `*.dev` before S3 and is NXDOMAIN
+/// after it.
+#[test]
+fn every_branch_of_the_lookup_agrees_with_the_rfc_4592_closest_encloser_rule() {
+    let _watchdog = testutil::arm(WATCHDOG);
+
+    let cfg = s3_fixture();
+    let real = Zone::from_config(&cfg).expect("fixture zone builds");
+    let model = ConfigModel::build(&cfg);
+    let ents = ancestor_closure(&cfg);
+    let mut ent_list: Vec<LowerName> = ents.iter().cloned().collect();
+    ent_list.sort_by_key(std::string::ToString::to_string);
+
+    let frozen = FrozenZone::build(&cfg).expect("the transcription builds the fixture");
+    let s2 = FrozenZone::build(&cfg)
+        .expect("the transcription builds twice")
+        .materialise_ancestors(&ent_list);
+    let s3 = FrozenZone::build(&cfg)
+        .expect("the transcription builds three times")
+        .materialise_ancestors(&ent_list)
+        .under_the_rfc_rule();
+    let origin_depth = label_count(&frozen.lower_origin);
+
+    let types = [
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::TXT,
+        RecordType::CNAME,
+        RecordType::SOA,
+        RecordType::ANY,
+    ];
+    let names = s3_fixture_names();
+    let mut compared = 0usize;
+
+    for name in &names {
+        let queried = lower(name);
+        assert_eq!(
+            real.exists(&queried),
+            s3.exists(&queried),
+            "`Zone::exists` disagreed for {name}. It is the RFC 1034 §4.3.2 step \
+             3(c) name-error determination and the one predicate the DNSSEC \
+             proof machinery will read, so it narrows to the closest encloser \
+             with everything else"
+        );
+
+        for qtype in types {
+            let actual = real.lookup(&queried, qtype);
+            let expected = s3.lookup(&queried, qtype);
+            assert_eq!(
+                rendered(&actual),
+                rendered(&expected),
+                "{name} {qtype} disagreed with a brute-force transcription of \
+                 RFC 4592 §3.3.1 over the ancestor-closed node set. Same \
+                 variant, same records, same owner names, same TTLs, same rdata, \
+                 same order"
+            );
+
+            // S3's fence.
+            let before_s3 = s2.lookup(&queried, qtype);
+            if rendered(&before_s3) != rendered(&expected) {
+                assert!(
+                    classify_s3(&model, &queried, qtype, &before_s3, &expected).is_some(),
+                    "{name} {qtype} changed between the deepest-wins rule and \
+                     the closest-encloser rule, and the change is not one the \
+                     rule can produce (W1 synthesis restricted to the closest \
+                     encloser, W2 the name error restored, W3 a CNAME chase \
+                     losing an unreachable synthesis, W4 synthesis refused at a \
+                     wildcard name that exists)\n  before: {before_s3:?}\n  \
+                     after:  {expected:?}"
+                );
+            }
+
+            // S2's fence, KEPT. S3 must not spend S2's gains to pay for its own.
+            let before_s2 = frozen.lookup(&queried, qtype);
+            let after_s2 = s2.lookup(&queried, qtype);
+            if rendered(&before_s2) != rendered(&after_s2) {
+                assert!(
+                    classify(&ents, origin_depth, &queried, &before_s2, &after_s2).is_some(),
+                    "{name} {qtype} broke S2's classification while S3 was being \
+                     specced. Ancestor closure and the closest-encloser rule are \
+                     independent claims and both are still checked here"
+                );
+            }
+            compared += 1;
+        }
+    }
+
+    assert_eq!(
+        compared,
+        names.len() * types.len(),
+        "the branch sweep did not run every pair; a loop that silently skips is \
+         a gate that silently passes"
+    );
 }

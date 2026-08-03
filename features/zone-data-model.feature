@@ -276,7 +276,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     Then the Answer variant matches a transcription of today's implementation
     And the records match in owner name, TTL, rdata and order
 
-  @boundary @enforced tests/arena_differential.rs:777
+  @boundary @enforced tests/arena_differential.rs:1329
   Scenario: The differential covers ANY, CNAME chasing and the negative paths, not only wildcards
     # The existing differential (VEGA-065's) excludes CNAME and ANY on purpose,
     # because that issue did not touch them. S1 touches every branch of the
@@ -412,7 +412,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     Then node 0 is the zone apex
     And every ancestor that exists appears at a lower index than its descendant
 
-  @boundary @enforced src/zone.rs:2923
+  @boundary @enforced src/zone.rs:2962
   Scenario: Every node round-trips through the hash index
     # The index and the arena are built in one function from one scratch map and
     # dropped together, so they cannot drift across a reload. The failure this

@@ -540,54 +540,77 @@ Feature: Wildcard record synthesis (RFC 4592)
     When a 123-label name inside the zone is looked up for type A
     Then it costs less than 25 times a 1-label lookup in the same zone
 
-  # ------------------------------------------------------- NOT THIS ISSUE'S
-  # ONE stays red. src/zone.rs used to hold three #[ignore]d tests pinning RFC
-  # 4592 §3.3.1 (no closest encloser), RFC 4592 §2.2.2 / RFC 2308 §2.2 (no empty
-  # non-terminals) and an empty non-terminal created by a wildcard — VEGA-009
-  # and VEGA-006, both fixed by VEGA-032's zone data model rewrite.
+  # ------------------------------------------------ THE FENCE, FULLY DISCHARGED
+  # src/zone.rs held THREE #[ignore]d tests pinning RFC defects that were live in
+  # production. All three are now green:
   #
-  # AMENDED AT VEGA-032 S2, in the commit that discharges VEGA-006, which is the
-  # only commit allowed to touch this block. Two of the three are now GREEN and
-  # un-#[ignore]d; the third is VEGA-009's and belongs to S3:
+  #   * an_empty_non_terminal_is_nodata_not_nxdomain        GREEN at S2 (VEGA-006)
+  #   * the_parent_of_a_wildcard_is_not_nxdomain            GREEN at S2 (VEGA-006)
+  #   * a_wildcard_does_not_apply_below_a_name_that_exists  GREEN at S3 (VEGA-009)
   #
-  #   * an_empty_non_terminal_is_nodata_not_nxdomain  — GREEN at S2 ✓
-  #   * the_parent_of_a_wildcard_is_not_nxdomain      — GREEN at S2 ✓
-  #   * a_wildcard_does_not_apply_below_a_name_that_exists — still red, S3's
+  # ...together with VEGA-009's wire-level twin,
+  # tests/rfc_conformance.rs::a_wildcard_does_not_reach_below_a_name_that_exists.
   #
-  # WHY S2 STOPS THERE. Materialising every strict ancestor makes a name that
-  # exists as an ancestor NODATA, and a wildcard is a node named "*.x", so "x"
-  # exists for the same reason — that is both of VEGA-006's tests. It changes
-  # nothing about WHICH wildcard answers a covered name, which is the whole of
-  # VEGA-009: "*.dev" still applies below "deep.dev", wrongly, and the closest
-  # encloser rule arrives at S3 with its own differential. Ancestor closure
-  # makes that fix look like a two-line change from here; making it here would
-  # leave S3 nothing to prove and would retire VEGA-065's oracle in a commit
-  # with no ruling to retire it.
+  # AMENDED AT VEGA-032 S3, in the commit that discharges the last of them, which
+  # is the only commit allowed to touch this block. The guard in src/zone.rs is
+  # renamed for the third and final time -- to
+  # every_rfc_bug_this_model_fixes_is_green_and_none_of_them_is_ignored_again --
+  # because a guard whose name says something is still ignored while nothing is
+  # would be drift wearing a passing test. It now checks ONE direction, in TWO
+  # files: none of them may be #[ignore]d again, and neither ignore reason may
+  # reappear as a literal.
   #
-  # The history, kept because it is what makes the fence checkable rather than
-  # decorative: VEGA-065 was behaviour-preserving and all three stayed red;
-  # VEGA-083 was NOT (it turns NXDOMAIN into NODATA for covered names) and all
-  # three still stayed red under it, structurally — a wildcard can never declare
-  # ITS OWN PARENT covered, because RFC 4592 §3.3.1 makes a wildcard's parent a
-  # proper ancestor of the names it covers and the probe window is capped at the
-  # query's parent depth. VEGA-032 S0 and S1 extended the same fence and held
-  # it. Only S2 was licensed to move it, and only this far.
+  # WHAT S3 CHANGED. The walk that climbed to the first wildcard it could find is
+  # deleted. The lookup finds the CLOSEST ENCLOSER by binary search over label
+  # depth -- monotone because S2 closed the node set under ancestry, at most 8
+  # probes for any name the wire can carry -- and then makes exactly ONE probe at
+  # *.<closest encloser>. RFC 4592 3.3.1's "there is no search for an alternate"
+  # is now a property of the code rather than a comment above a loop.
   #
-  # WHAT S2 ALSO CHANGED HERE, written down because it is not obvious: a
-  # wildcard can now exist as an EMPTY NON-TERMINAL. "x.*.dev" makes
-  # "*.dev.example.com" a node with no RRset, which RFC 4592 §2.1.1 makes a
-  # source of synthesis, so names under "dev" move from NXDOMAIN to NODATA by
-  # RFC 1034 §4.3.2 step 3(c). Specced at
-  # features/empty-non-terminals.feature:311.
+  # Specced in features/closest-encloser.feature. Two consequences bear on the
+  # scenarios in THIS file and both are stated there rather than restated here:
   #
-  # The commit that discharges the remaining one — S3 — must, in the same diff,
-  # amend:
-  #   * src/zone.rs::the_rfc_bug_this_step_must_not_touch_is_still_ignored_and_the_two_it_fixes_are_not
-  #     (renamed from the_three_rfc_bugs_... at S2, because a guard whose name
-  #     says "three are still ignored" while two are green is drift wearing a
-  #     passing test)
+  #   * DEEPEST-WINS IS GONE. "The closest wildcard answers when several could
+  #     match" and "Two wildcards at non-adjacent depths are both reachable" are
+  #     still green and their assertions are unchanged -- they are now satisfied
+  #     by the closest-encloser rule instead of by walk order, which is the
+  #     point. Their comments are updated; their assertions are not weakened.
+  #   * THE DEPTH BITMAP IS GONE. Ancestor closure makes the populated depths
+  #     contiguous, so VEGA-065's u128 carries no information a u8 pair does not.
+  #     Its INVARIANT survives verbatim -- raw label counting, MAX_LABELS = 127,
+  #     the num_labels ban -- and the ban is now enforced against the RULE rather
+  #     than against a filename, with a non-vacuity assertion, because deleting
+  #     the bitmap is exactly the change that could empty the guard's scope.
+  #
+  # VEGA-078 closes with it, and not as a patch: the probe count stops being
+  # popcount(wildcard_depths) and becomes a constant.
+  #
+  # VEGA-098 closes with it too, and it is the part no ruling predicted. A
+  # wildcard that is an EMPTY NON-TERMINAL -- "x.*.dev" makes "*.dev" one -- is a
+  # name that exists, so RFC 4592 2.2.2 forbids synthesis AT it. The exact-match
+  # probe excludes wildcard nodes, an S1 fidelity decision shipped with the note
+  # that "that exclusion is what S2 and S3 remove, with a ruling"; S3 removes it.
+  # It was found by the very oracle S3 retires, on main, from a seed in neither
+  # regressions file.
+  #
+  # WHAT WAS RETIRED, AND WHAT REPLACED IT. VEGA-065's differential oracle,
+  # tests/properties.rs::the_wildcard_walk_agrees_with_a_naive_base_name_walk,
+  # compared against a naive base_name() walk -- the deliberately non-conformant
+  # rule, which is VEGA-009 written down as a reference implementation. It stayed
+  # true only by growing a whitelist: one permitted transition for VEGA-083, two
+  # more for VEGA-032 S2, and S3 would have made four. It is RETIRED HERE, in the
+  # commit that makes it wrong, and replaced by
+  # the_wildcard_answer_agrees_with_a_brute_force_rfc_4592_closest_encloser,
+  # which transcribes the RFC and permits ZERO transitions. The generators are
+  # kept exactly as VEGA-065 wrote them, asterisk-leading arms included, because
+  # those are the shapes a label-count mistake breaks.
+  #
+  # The commit that discharges the fence must, in the same diff, amend:
+  #   * src/zone.rs::every_rfc_bug_this_model_fixes_is_green_and_none_of_them_is_
+  #     ignored_again (renamed here)
   #   * the comment block above those tests in src/zone.rs
   #   * this block
+  #   * the module doc of tests/rfc_conformance.rs
   # Editing that guard is legitimate ONLY in the commit that makes the
   # corresponding test pass. That is the rule VEGA-005 Amendment 3a set for the
   # reload classification table, and it is what stops "the fence moved" and "the
