@@ -314,19 +314,25 @@ impl NodeFlags {
     /// The leftmost label is `*` (RFC 4592 §2.1.1), so this node is a source of
     /// synthesis.
     ///
-    /// **Through S2 this also means "not an ordinary node".** The model it
-    /// replaces kept wildcards in a separate map, so a query for the literal
-    /// name `*.dev.example.com.` never matched an exact key and fell through to
-    /// the wildcard walk. [`Zone::exact_node`] therefore skips these, which
-    /// reproduces that exactly — including the case that makes the difference
-    /// observable, a wildcard holding a CNAME, where treating the node as
-    /// ordinary would substitute the CNAME for a query the old model answered
-    /// NODATA. S3 is where that changes, deliberately and with a ruling.
+    /// **Since S3 it no longer means "not an ordinary node".** Through S2 it did:
+    /// the map model kept wildcards in a separate structure, so a query for the
+    /// literal name `*.dev.example.com.` never matched an exact key and fell
+    /// through to the wildcard walk, and [`Zone::exact_node`] skipped these to
+    /// reproduce that. VEGA-098 is what that exclusion cost — a wildcard that
+    /// exists as an empty non-terminal had a wildcard above it applied *at* it,
+    /// which RFC 4592 §2.2.2 forbids — and S3 removes it. A wildcard is now an
+    /// ordinary node that happens to be named `*.x`, and this flag says only
+    /// that it may be a source of synthesis for the names below its parent.
+    ///
+    /// One thing still reads it as an exclusion, narrowly: the RFC 1034 §3.6.2
+    /// CNAME substitution does not fire at a wildcard node, because no model in
+    /// this tree has ever substituted a wildcard's CNAME and widening that is not
+    /// S3's to do. See [`Zone::resolve`].
     ///
     /// Set from the **name**, never from which loop built the node: `x.*.dev`
     /// materialises `*.dev` as an empty non-terminal, and RFC 4592 §2.1.1 makes
-    /// that a wildcard however it came to exist. A node flagged otherwise is one
-    /// the exact probe matches and the wildcard probe cannot reach.
+    /// that a wildcard however it came to exist. A node flagged otherwise is a
+    /// source of synthesis the wildcard probe cannot reach.
     const WILDCARD: Self = Self(1 << 2);
 
     /// A CNAME RRset is present, so the RFC 1034 §3.6.2 substitution has
@@ -430,23 +436,30 @@ pub struct Zone {
     index: HashTable<u32>,
     hash_seed: u64,
 
-    /// Bit `d` is set when the zone holds at least one wildcard whose parent
-    /// name has exactly `d` labels.
+    /// Label count of the origin, and of the deepest node in the zone.
     ///
-    /// The parent walk probes only these depths, so answering a wildcard query
-    /// costs what the *operator* configured — one probe, for every zone anyone
-    /// actually writes — instead of what the *client* chose. Walking up one
-    /// `base_name()` at a time was O(labels²), because `base_name` rebuilds and
-    /// revalidates the whole remaining name: 174.7 µs of CPU for one 229-byte
-    /// packet, against a 9.1 µs budget (VEGA-065).
+    /// Together they are the window the closest-encloser search clamps to
+    /// (§4.3): nothing shallower than the origin is in the zone at all, and
+    /// nothing deeper than `max_depth` exists to be found, so a probe outside
+    /// them is a guaranteed miss on a name an attacker chose the length of.
     ///
-    /// **Kept at S1, and subsumed at S3, not undone.** Once S2 closes the node
-    /// set under ancestry the set of populated depths is contiguous, so this
-    /// `u128` carries no information a `u8` pair does not and the bitmap becomes
-    /// `((1 << (max_depth + 1)) - 1) & !((1 << origin_depth) - 1)`. That is
-    /// VEGA-065's invariant made structural. Until then it is what keeps the
-    /// walk bounded, and it is recomputed here over wildcard *nodes*.
-    wildcard_depths: u128,
+    /// **This pair is what subsumed VEGA-065's `u128` bitmap of wildcard
+    /// depths.** Once S2 closed the node set under ancestry the populated depths
+    /// became contiguous, so the mask was exactly
+    /// `((1 << (max_depth + 1)) - 1) & !((1 << origin_depth) - 1)` and carried no
+    /// information these two bytes do not. The bitmap's real cost was never the
+    /// sixteen bytes: it was the probe *per set bit*, one per distinct depth the
+    /// operator had configured a wildcard at, which is VEGA-078. The search below
+    /// makes that count a function of the zone's depth alone — `⌈log₂⌉` of the
+    /// window, never of how many wildcards live in it.
+    ///
+    /// `u8` because `MAX_LABELS` is 127: RFC 1035 §2.3.4 caps a name at 255
+    /// octets and §3.1 spends two on a single-octet label plus one terminator.
+    origin_depth: u8,
+    /// The label count of the deepest node in [`Self::nodes`]. See
+    /// [`Self::origin_depth`], which it is stored next to because neither is
+    /// meaningful alone.
+    max_depth: u8,
 
     /// Total number of records, for the `dns_zone_records` metric.
     record_count: usize,
@@ -554,19 +567,37 @@ impl Zone {
         Some(NodeIdx(*found))
     }
 
-    /// The ordinary (non-wildcard) node at `name`, if the zone holds one.
+    /// The node named by the `depth` rightmost labels of `name`, if the zone
+    /// holds one.
     ///
-    /// This is the arena's answer to both `exact.get(...)` and
-    /// `names.contains(...)` in the model it replaces: those two structures
-    /// agreed by construction, because every insertion wrote to both. Wildcards
-    /// were in neither, which is what [`NodeFlags::WILDCARD`] reproduces.
-    fn exact_node(&self, name: &LowerName, hashes: &SuffixHashes) -> Option<NodeIdx> {
-        let depth = hashes.labels();
+    /// The one primitive both halves of the lookup are built from: at
+    /// `depth = hashes.labels()` it is the RFC 1034 §4.3.2 step 3.a exact match,
+    /// and at every shallower depth it is one step of the closest-encloser
+    /// search. `h[depth]` is already the hash of that suffix, so no name is
+    /// materialised on either side of the comparison.
+    fn node_at(&self, name: &LowerName, depth: usize, hashes: &SuffixHashes) -> Option<NodeIdx> {
         let hash = hashes.at(depth)?;
         self.probe(hash, |node| {
-            !node.flags.contains(NodeFlags::WILDCARD)
-                && node_name_matches(&node.name, name, depth, false)
+            node_name_matches(&node.name, name, depth, false)
         })
+    }
+
+    /// The node at `name` itself, if the zone holds one — RFC 1034 §4.3.2 step
+    /// 3.a.
+    ///
+    /// **A wildcard node answers here since S3, and that is VEGA-098.** The map
+    /// model this replaced held wildcards in neither `exact` nor `names`, so a
+    /// query for the literal name `*.dev.example.com.` matched no key and fell
+    /// through to the wildcard walk; S1 reproduced that by skipping
+    /// [`NodeFlags::WILDCARD`] here, and shipped with the note that S2 and S3
+    /// remove the exclusion with a ruling. This is the removal. RFC 4592 §2.1.1
+    /// makes a wildcard an ordinary node that happens to be named `*.x`, §2.3
+    /// says an asterisk in a QNAME gets no special processing, and §2.2.2 says a
+    /// name that exists stops synthesis — so a wildcard that exists as an empty
+    /// non-terminal must answer NODATA rather than be handed to a wildcard above
+    /// it.
+    fn exact_node(&self, name: &LowerName, hashes: &SuffixHashes) -> Option<NodeIdx> {
+        self.node_at(name, hashes.labels(), hashes)
     }
 
     /// The source of synthesis `*.<the `depth` rightmost labels of `name`>`,
@@ -651,12 +682,11 @@ impl Zone {
 
     /// [`Zone::exists`] against a suffix hash the caller has already paid for.
     fn exists_hashed(&self, name: &LowerName, hashes: &SuffixHashes) -> bool {
-        // RFC 1035 §3.2.3: ANY is a QTYPE and never an RRTYPE, so it can never
-        // be the type of an RRset. The typed half of the probe therefore always
-        // misses and only the coverage bit comes back — which is the half wanted
-        // here.
-        self.exact_node(name, hashes).is_some()
-            || self.wildcard_probe(name, hashes, RecordType::ANY).1
+        // Independent of QTYPE by construction: neither half is passed one. The
+        // determination is "is there a node here, or a source of synthesis for
+        // here", and RFC 1034 §4.3.2 step 3(c) sets the name error on exactly
+        // that and never on which records the node happens to hold (VEGA-083).
+        self.exact_node(name, hashes).is_some() || self.source_of_synthesis(name, hashes).is_some()
     }
 
     /// Resolve `name`/`record_type` against the zone.
@@ -724,7 +754,21 @@ impl Zone {
                 // RFC 1034 §3.6.2: a CNAME at the owner name answers queries for
                 // any other type, and the target is chased if it lives in this
                 // zone.
-                if record_type != RecordType::CNAME && node.flags.contains(NodeFlags::HAS_CNAME) {
+                //
+                // NOT AT A WILDCARD NODE, and that is deliberate. S3 lets the
+                // exact probe see wildcard nodes (VEGA-098) and it changes what
+                // those names answer for their own types — it does not also start
+                // substituting a wildcard's CNAME, which no model in this tree
+                // has ever done: the pre-S1 map held wildcards outside `exact`,
+                // so the substitution arm could not reach one, and the RFC 4592
+                // §3.3.1 transcription in `tests/arena_differential.rs` answers
+                // NODATA here. Widening this is a third behaviour change wearing
+                // S3's commit message; it needs its own ruling, and it is flagged
+                // for one.
+                if record_type != RecordType::CNAME
+                    && node.flags.contains(NodeFlags::HAS_CNAME)
+                    && !node.flags.contains(NodeFlags::WILDCARD)
+                {
                     let cnames = self.rrsets_of(node, RecordType::CNAME);
                     if !cnames.is_empty() {
                         self.emit(cnames, &node.name, out);
@@ -748,12 +792,25 @@ impl Zone {
             }
         }
 
-        // Wildcards only apply when the queried name itself does not exist.
-        let (run, covered) = self.wildcard_probe(name, &hashes, record_type);
-        if !run.is_empty() {
-            let qname = Name::from(name.clone());
-            self.emit(run, &qname, out);
-            return Resolution::Found;
+        // No exact match, so RFC 1034 §4.3.2 step 3(c). Wildcards apply only
+        // when the queried name itself does not exist — which, since the probe
+        // above sees wildcard nodes too, is now a statement about every name and
+        // not only about ordinary ones (RFC 4592 §2.2.2).
+        let Some(idx) = self.source_of_synthesis(name, &hashes) else {
+            // "If the source of synthesis does not exist … there is no wildcard
+            // match", and step 3(c)'s first paragraph then sets the
+            // authoritative name error.
+            return Resolution::NxDomain;
+        };
+        if let Some(node) = self.nodes.get(idx.get()) {
+            let run = self.rrsets_of(node, record_type);
+            if !run.is_empty() {
+                // RFC 4592 §3.3.1: the synthesised record is owned by the QUERY
+                // name, never by the wildcard's own.
+                let qname = Name::from(name.clone());
+                self.emit(run, &qname, out);
+                return Resolution::Found;
+            }
         }
 
         // RFC 1034 §4.3.2 step 3(c) sets the authoritative name error *only*
@@ -766,11 +823,7 @@ impl Zone {
         // RFC 8020 §2 then licenses the resolver to deny the entire subtree —
         // including the records the wildcard *does* carry. A dual-stack client's
         // AAAA is enough to trigger it; no attacker is required (VEGA-083).
-        if covered {
-            Resolution::NoData
-        } else {
-            Resolution::NxDomain
-        }
+        Resolution::NoData
     }
 
     /// The first RDATA of `run`, for reading a CNAME's target.
@@ -778,91 +831,126 @@ impl Zone {
         self.rdata.get(span(run.first()?.rdata))?.first()
     }
 
-    /// Walk the wildcard depths for `name`, deepest set bit first.
+    /// The **source of synthesis** for `name`: the node `*.<closest encloser>`,
+    /// and that name and no other (RFC 4592 §3.3.1).
     ///
-    /// Returns the RRsets to synthesise from, when the zone holds one of
-    /// `record_type` at a source of synthesis for `name`, **and** whether any
-    /// source of synthesis for `name` exists at all.
+    /// > "If the source of synthesis does not exist … there is no wildcard
+    /// > match. There is no search for an alternate … the lookup does not look
+    /// > for other wildcard records."
     ///
-    /// The two halves answer different questions and only the first depends on
-    /// `record_type`: it decides the *answer section*, while coverage decides
-    /// NOERROR against NXDOMAIN (RFC 1034 §4.3.2 step 3(c)). Both callers go
-    /// through here so the two determinations cannot drift apart and start
-    /// returning a QTYPE-dependent rcode again.
+    /// One probe, on top of the search below. **The absence of a loop here is
+    /// the whole content of VEGA-009.** The model this replaces walked upwards
+    /// from the query name and answered from the first wildcard it found, so a
+    /// `*.dev` reached into `deep.dev` — a subtree the operator had explicitly
+    /// carved out — with an authoritative, correct-looking address.
     ///
-    /// Coverage is decided by finding the `*` node itself, never by the depth
-    /// bitmap. The bitmap says a wildcard exists *somewhere* at depth `d`, not
-    /// at *this* parent, and deriving coverage from it makes every name whose
-    /// parent merely shares a depth with some wildcard exist — which in a zone
-    /// with an apex wildcard is very nearly every name there is (VEGA-083,
-    /// rejected alternative 5).
-    ///
-    /// Deepest set bit first, so the closest wildcard answers — the same order
-    /// the old `base_name()` climb produced, and what
-    /// `the_deepest_wildcard_wins_when_several_could_match` pins. Every depth
-    /// skipped is a depth at which no node can exist, because equal names have
-    /// equal label counts, so dropping it cannot lose a hit. (Deepest-wins is
-    /// **not** RFC 4592 §3.3.1's closest-encloser rule. That is VEGA-009's, and
-    /// it is S3's; S1 preserves today's answer byte for byte.)
-    ///
-    /// `mask` strictly loses a bit each pass, so termination is structural
-    /// rather than a counter that has to be checked against a floor. That
-    /// matters for `origin = "."`, where the floor is 0 and a decrementing walk
-    /// needs an extra guard to avoid spinning on the root.
-    fn wildcard_probe(
-        &self,
-        name: &LowerName,
-        hashes: &SuffixHashes,
-        record_type: RecordType,
-    ) -> (&[Rrset], bool) {
-        let mut mask = self.wildcard_depths & self.wildcard_window(name);
-        let mut covered = false;
-        while mask != 0 {
-            // `mask != 0` bounds `leading_zeros()` at 127, so `depth <= 127`
-            // and neither shift below can overflow.
-            let depth = (u128::BITS - 1 - mask.leading_zeros()) as usize;
-            mask &= !(1u128 << depth);
-
-            if let Some(idx) = self.wildcard_node(name, depth, hashes) {
-                covered = true;
-                if let Some(node) = self.nodes.get(idx.get()) {
-                    let run = self.rrsets_of(node, record_type);
-                    if !run.is_empty() {
-                        return (run, true);
-                    }
-                }
-            }
-        }
-        // Deliberately no early exit on `covered`: which wildcard answers must
-        // stay exactly what it is today (deepest type match). Stopping at the
-        // deepest wildcard *parent* would be a half-step towards RFC 4592
-        // §3.3.1 closest-encloser semantics, which is VEGA-009's, not this.
-        (&[], covered)
+    /// Returns the `*` node itself rather than a bool, because RFC 1034 §4.3.2
+    /// step 3(c) needs both facts from one determination: whether the node
+    /// exists decides NXDOMAIN against NOERROR, and what it holds decides the
+    /// answer section. Reading them from two places is how they drifted apart
+    /// and made the rcode depend on the QTYPE (VEGA-083).
+    fn source_of_synthesis(&self, name: &LowerName, hashes: &SuffixHashes) -> Option<NodeIdx> {
+        let encloser = self.closest_encloser(name, hashes);
+        self.wildcard_node(name, encloser, hashes)
     }
 
-    /// The depths at which a wildcard parent of `name` could possibly sit.
+    /// The depth of the **closest encloser** of `name`: the deepest proper
+    /// ancestor of `name` that exists as a node (RFC 4592 §3.3.1).
     ///
-    /// Bounded above by the depth of `name`'s immediate parent, because a
-    /// wildcard's parent is a *proper* ancestor of the names it covers (RFC
-    /// 4592 §3.3.1), and below by the origin's depth, because [`ZoneBuilder::qualify`]
-    /// refuses to build a name outside the zone — anything shallower is a
-    /// guaranteed miss. Empty when `name` sits at or above the origin.
-    fn wildcard_window(&self, name: &LowerName) -> u128 {
-        let start = label_count(name).saturating_sub(1).min(MAX_LABELS);
-        let floor = label_count(&self.lower_origin);
-        if start < floor || floor > MAX_LABELS {
-            return 0;
+    /// A depth and not a [`NodeIdx`], because that is all the source-of-synthesis
+    /// probe needs and an index nothing reads is an index nobody maintains. S4
+    /// wants the node itself, for the RFC 1034 §4.3.2 step 3(b) cut check, and
+    /// widening the return type is the whole of that change.
+    ///
+    /// # Why a binary search is correct here
+    ///
+    /// "An ancestor of `name` at depth `d` exists" is **monotone** in `d`: if a
+    /// node sits at depth `d` then its parent is a node too, because S2 closed
+    /// the node set under ancestry (invariant I-3). So the existing ancestors
+    /// occupy a contiguous run `[origin_depth, ce]` and the deepest is found by
+    /// bisection instead of by a climb.
+    ///
+    /// **That coupling is the most dangerous one in this model.** If ancestor
+    /// closure is ever broken the predicate stops being monotone, the search
+    /// silently returns a *shallower* encloser than the truth, and a wildcard
+    /// synthesises into a carved-out subtree again — VEGA-009 reopened, with
+    /// answers that look right. `debug_assert_invariants` checks I-3 on every
+    /// build for exactly that reason.
+    ///
+    /// # Cost
+    ///
+    /// ≤ 8 probes for any name the wire can carry (`⌈log₂ 127⌉ + 1`), and the
+    /// count is a function of the zone's depth alone. VEGA-078's cost — one
+    /// probe per distinct depth the *operator* declared a wildcard at, on a query
+    /// name the *attacker* chose to make every one of them miss — has no
+    /// expression left in this shape.
+    ///
+    /// The first probe is speculative and pays for itself on the traffic that
+    /// dominates: a miss one label below something that exists, where the
+    /// immediate parent is the answer and the bisection never runs.
+    fn closest_encloser(&self, name: &LowerName, hashes: &SuffixHashes) -> usize {
+        let (floor, ceiling) = self.encloser_window(hashes.labels());
+        if ceiling <= floor {
+            // The apex is a node and every in-zone name descends from it, so the
+            // search always succeeds and never has to report "none" — which is
+            // what lets it return a depth rather than an `Option` and keeps an
+            // `unwrap` off a path a packet reaches.
+            //
+            // The floor is returned WITHOUT a probe, and for an out-of-zone name
+            // — `Zone::exists` is `pub` and does not itself check `contains` —
+            // that claim is false: the labels at that depth are somebody else's.
+            // It is still safe, because the caller's probe compares the actual
+            // labels through `node_name_matches`, so a floor that is a lie yields
+            // a miss and never a name from another zone.
+            return floor;
         }
-        // `start` is derived from a name the client chose, so the top of the
-        // range gets a branch rather than an assumption: `1u128 << 128` is a
-        // panic in debug, and with `panic = "abort"` in release one packet
-        // would be a full outage.
-        let hi = if start == MAX_LABELS {
-            u128::MAX
-        } else {
-            (1u128 << (start + 1)) - 1
-        };
-        hi & !((1u128 << floor) - 1)
+        if self.node_at(name, ceiling, hashes).is_some() {
+            return ceiling;
+        }
+
+        // Bisect the monotone predicate over `[floor, ceiling - 1]`. `floor` is
+        // the apex, known to exist without probing, and `ceiling` is known not to
+        // from the probe above — so the invariant "`low` exists, `high + 1` does
+        // not" holds on entry and `low` is the answer on exit.
+        let (mut low, mut high) = (floor, ceiling - 1);
+        while low < high {
+            // `high - low` strictly decreases every pass — `mid` is at least
+            // `low + 1` and at most `high` — so termination is structural rather
+            // than a counter somebody has to keep checking against a floor. That
+            // matters for `origin = "."`, where the floor is 0 and a decrementing
+            // walk needs an extra guard to avoid spinning on the root.
+            let mid = low + (high - low).div_ceil(2);
+            if self.node_at(name, mid, hashes).is_some() {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        low
+    }
+
+    /// The depths the closest-encloser search may probe, as inclusive bounds
+    /// `(floor, ceiling)`.
+    ///
+    /// Bounded above by the depth of the query's immediate parent, because a
+    /// wildcard's parent is a *proper* ancestor of the names it covers (RFC 4592
+    /// §3.3.1) — which is why `*.apps` never covers `apps` itself — and by
+    /// [`Zone::max_depth`], because no node is deeper than that and every probe
+    /// past it is a guaranteed miss on a name whose length the client chose.
+    /// Bounded below by the origin's depth, because [`ZoneBuilder::qualify`]
+    /// refuses to build a name outside the zone, so a node found below the floor
+    /// would be one we are not authoritative for.
+    ///
+    /// The ceiling may fall **below** the floor, for a query at or above the
+    /// origin. [`Zone::closest_encloser`] reads that as "the apex and nothing
+    /// else", which is what it is.
+    fn encloser_window(&self, labels: usize) -> (usize, usize) {
+        let floor = usize::from(self.origin_depth);
+        let ceiling = labels
+            .saturating_sub(1)
+            .min(usize::from(self.max_depth))
+            .min(MAX_LABELS);
+        (floor, ceiling)
     }
 
     // ------------------------------------------------------- the invariants
@@ -938,16 +1026,21 @@ impl Zone {
              type search is a binary search and reads the order as given"
         );
         debug_assert!(
-            self.nodes.iter().all(|node| {
-                !node.flags.contains(NodeFlags::WILDCARD) || {
-                    let depth = label_count(&LowerName::from(node.name.clone()));
-                    depth >= 1
-                        && depth - 1 <= MAX_LABELS
-                        && self.wildcard_depths & (1u128 << (depth - 1)) != 0
-                }
-            }),
-            "wildcard_depths is out of step with the wildcard nodes; a wildcard \
-             is unreachable, or a name it covers answers NXDOMAIN"
+            {
+                let floor = label_count(&self.lower_origin);
+                self.nodes.iter().all(|node| {
+                    let depth = node.name.iter().len();
+                    depth >= floor
+                        && depth <= usize::from(self.max_depth)
+                        && floor == usize::from(self.origin_depth)
+                })
+            },
+            "a node sits outside [origin_depth, max_depth]. That pair is the \
+             window the closest-encloser search clamps to, so a node outside it \
+             is one the search can never return — which means a wildcard above it \
+             reaches into a subtree that name carves out (RFC 4592 §3.3.1). This \
+             is what replaced VEGA-065's depth-bitmap invariant, and it is \
+             load-bearing for the same reason"
         );
     }
 }
@@ -1012,7 +1105,6 @@ struct ZoneBuilder<'a> {
     default_ttl: u32,
     nodes: HashMap<LowerName, ScratchNode>,
     record_count: usize,
-    wildcard_depths: u128,
 }
 
 impl<'a> ZoneBuilder<'a> {
@@ -1023,7 +1115,6 @@ impl<'a> ZoneBuilder<'a> {
             default_ttl,
             nodes: HashMap::new(),
             record_count: 0,
-            wildcard_depths: 0,
         }
     }
 
@@ -1087,30 +1178,15 @@ impl<'a> ZoneBuilder<'a> {
         self.record_count += rdata.len();
 
         let node_name = if is_wildcard {
-            // Recorded from the *parent's* depth, which is the index space the
-            // walk probes in, and recorded before the node is built so that the
-            // one case below where no node can exist still registers. A missing
-            // bit is a configured wildcard answering NXDOMAIN with nothing in
-            // the log.
-            let depth = label_count(&LowerName::from(owner.clone()));
-            // Unreachable — `qualify` builds this name through hickory, which
-            // enforces the 255-octet limit MAX_LABELS is derived from. A branch
-            // rather than an assumption, because `1u128 << 128` panics and this
-            // runs on the reload path.
-            if depth <= MAX_LABELS {
-                self.wildcard_depths |= 1u128 << depth;
-            }
             // A wildcard can fail to have a representable owner name of its
             // own: RFC 1035 §2.3.4 caps a name at 255 octets, and a parent
             // within two of that ceiling leaves no room for the `*`. By the
             // same arithmetic such a wildcard covers no representable name
             // either — every name it could match carries at least one more
             // label, which costs at least two more octets — so there is nothing
-            // for a node here to answer, and the model this replaces could not
-            // answer from it either: its probe window stops at the query's
-            // parent depth, which can never reach this parent's own. The depth
-            // bit above is still recorded and the records are still counted,
-            // because both are observable and neither needs the node.
+            // for a node here to answer, and no name whose closest encloser
+            // could be its parent. The records are still counted, because
+            // `record_count` is observable and does not need the node.
             let Ok(name) = owner.prepend_label("*") else {
                 tracing::warn!(
                     record = %spec.name,
@@ -1261,18 +1337,6 @@ impl<'a> ZoneBuilder<'a> {
                 // so this is also the form the NSEC chain will want.
                 let parent = Name::from(key.clone());
                 let wildcard = parent.iter().next() == Some(WILDCARD_LABEL);
-                if wildcard {
-                    // The bitmap is indexed by the wildcard's *parent* depth,
-                    // the index space the walk probes in. A node exists, so its
-                    // name is representable and the depth is within
-                    // `MAX_LABELS`; the branch is here because `1u128 << 128`
-                    // panics and this runs on the reload path.
-                    let depth = label_count(&key).saturating_sub(1);
-                    if depth <= MAX_LABELS {
-                        self.wildcard_depths |= 1u128 << depth;
-                    }
-                }
-
                 self.nodes.insert(
                     key,
                     ScratchNode {
@@ -1355,6 +1419,13 @@ impl<'a> ZoneBuilder<'a> {
         let mut rrsets = Vec::with_capacity(rrset_total);
         let mut rdata = Vec::with_capacity(rdata_total);
         let mut hashes = Vec::with_capacity(slots.len());
+        let origin_depth = depth_byte(label_count(&lower_origin));
+        // The deepest node in the zone, accumulated in the pass that lays the
+        // arena out rather than in a second one over it. It is the ceiling the
+        // closest-encloser search clamps to, so it must be the true maximum and
+        // not the depth of the last node in canonical order — canonical order
+        // sorts on the rightmost label first and says nothing about depth.
+        let mut max_depth = 0usize;
 
         let hash_seed = RandomState::new().hash_one(0u64);
 
@@ -1387,6 +1458,7 @@ impl<'a> ZoneBuilder<'a> {
             let rrsets_end = arena_offset(rrsets.len())?;
 
             hashes.push(name_hash(hash_seed, &lower));
+            max_depth = max_depth.max(scratch.name.iter().len());
             nodes.push(Node {
                 name: scratch.name,
                 rrsets: (rrsets_start, rrsets_end),
@@ -1416,10 +1488,31 @@ impl<'a> ZoneBuilder<'a> {
             rdata: rdata.into_boxed_slice(),
             index,
             hash_seed,
-            wildcard_depths: self.wildcard_depths,
+            // Both saturate at `MAX_LABELS` rather than being asserted to fit.
+            // Neither can exceed it — hickory refuses to build a name past RFC
+            // 1035 §2.3.4's 255 octets, which is what MAX_LABELS is derived from
+            // — but a saturating conversion on the reload path costs one
+            // instruction, and the alternative is an `expect` in a function an
+            // operator runs on every reload.
+            origin_depth,
+            max_depth: depth_byte(max_depth),
             record_count: self.record_count,
         })
     }
+}
+
+/// A label depth as the `u8` [`Zone::origin_depth`] and [`Zone::max_depth`] are
+/// stored in, clamped to [`MAX_LABELS`].
+///
+/// Clamping rather than failing, because a name past the ceiling cannot reach
+/// here: hickory refuses to build one, and `MAX_LABELS` is derived from the same
+/// RFC 1035 §2.3.4 limit it enforces. If one ever did, a clamped ceiling makes
+/// the closest-encloser search stop one depth short — a name error where a
+/// wildcard might have synthesised — which is the safe direction to be wrong in.
+fn depth_byte(depth: usize) -> u8 {
+    // `MAX_LABELS` is 127, so the conversion cannot fail after the clamp;
+    // `unwrap_or` rather than `expect` because this runs on the reload path.
+    u8::try_from(depth.min(MAX_LABELS)).unwrap_or(u8::MAX)
 }
 
 /// An arena offset as a `u32`, or a named build error.
@@ -2589,41 +2682,60 @@ mod tests {
         );
     }
 
+    /// REWRITTEN AT VEGA-032 S3, because the structure it read is gone.
+    ///
+    /// It used to assert the shape of `wildcard_window`'s `u128` mask. S3 deletes
+    /// the mask along with the bitmap it indexed, but **the two bounds it encoded
+    /// are the same two bounds the closest-encloser search clamps to**, so the
+    /// contract survives verbatim and only its expression moves.
+    ///
+    /// The upper bound — the query's parent depth, because RFC 4592 §3.3.1 makes
+    /// a wildcard's parent a *proper* ancestor of the names it covers — is
+    /// exercised by every wildcard test here. The lower one is not, and dropping
+    /// it SURVIVED the entire suite before: no node can be registered above the
+    /// origin, because `qualify` refuses to build an out-of-zone name, so probing
+    /// there is a guaranteed miss and no answer changes.
+    ///
+    /// The bound is still a contract, and the redundancy that hides it is exactly
+    /// the kind that stops being true the day somebody adds a second insertion
+    /// point. Asserted on the function, which is the only place it is visible.
     #[test]
-    fn the_wildcard_probe_window_never_reaches_below_the_origin() {
-        // `wildcard_window` documents two bounds. The upper one — the query's
-        // parent depth, because RFC 4592 §3.3.1 makes a wildcard's parent a
-        // *proper* ancestor — is exercised by every wildcard test here. The
-        // lower one is not, and dropping it (`hi & !((1 << floor) - 1)` -> `hi`)
-        // SURVIVED the entire suite: no wildcard can be registered above the
-        // origin, because `qualify` refuses to build an out-of-zone key, so the
-        // extra bits never intersect `wildcard_depths` and no answer changes.
-        //
-        // The bound is still a contract, and the redundancy that hides it is
-        // exactly the kind that stops being true when somebody adds a second
-        // insertion point. Asserted on the function rather than through
-        // `lookup`, which is the only place it is visible.
+    fn the_encloser_window_never_reaches_below_the_origin() {
         let _watchdog = watchdog();
         let z = zone_with_origin(
             "a.b.c.d.example.com",
             vec![spec("*", "A", &["203.0.113.1"])],
         );
 
-        // Eight labels queried, so the parent depth is 7; the origin is six
-        // labels, so the floor is 6. Bits 6 and 7, and nothing else.
-        let window = z.wildcard_window(&lower("x.y.a.b.c.d.example.com."));
+        // Eight labels queried, so the deepest proper ancestor sits at 7; the
+        // origin is six labels, so the floor is 6. The zone's deepest node is
+        // `*.a.b.c.d.example.com.` at 7, so `max_depth` does not clamp here.
+        let queried = lower("x.y.a.b.c.d.example.com.");
         assert_eq!(
-            window,
-            (1u128 << 6) | (1u128 << 7),
-            "the probe window must be exactly [origin depth, query parent depth]; \
-             got {window:#034x}"
+            z.encloser_window(label_count(&queried)),
+            (6, 7),
+            "the search window must be exactly [origin depth, query parent depth]"
         );
+
+        let (floor, _) = z.encloser_window(label_count(&queried));
         assert_eq!(
-            window & ((1u128 << 6) - 1),
-            0,
-            "the window reaches below the origin: every one of those depths is a \
-             guaranteed miss, and a key there would be outside the zone we are \
-             authoritative for"
+            floor,
+            label_count(z.origin()),
+            "the window reaches below the origin: every depth down there is a \
+             guaranteed miss, and a name found there would be outside the zone we \
+             are authoritative for"
+        );
+
+        // And the ceiling really is clamped by the zone as well as by the query,
+        // which is the half `max_depth` carries: nothing below depth 7 exists, so
+        // a 30-label query still starts its search at 7.
+        let deep = lower(&format!("{}x.y.a.b.c.d.example.com.", "q.".repeat(22)));
+        assert_eq!(
+            z.encloser_window(label_count(&deep)),
+            (6, 7),
+            "the ceiling must be clamped by the zone's deepest node as well as by \
+             the query's parent depth; probing the 22 depths between them is work \
+             the client chose and the operator never configured"
         );
     }
 

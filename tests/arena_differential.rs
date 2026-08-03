@@ -1836,6 +1836,21 @@ fn fixture_names() -> Vec<String> {
 /// once. The fixture is built to produce them — `_sip._tcp.host` for T1,
 /// `x.*.dev` for T2, and a CNAME whose target is an empty non-terminal for T3 —
 /// rather than left to a generator that reaches them at a rate it chooses.
+///
+/// # AMENDED AT S3, in the direction the S3 sweep already ran
+///
+/// This swept `real` against the **S2** oracle, and S3 changes answers, so
+/// `a.deep.dev.example.test.` — VEGA-009's own shape, in this fixture on purpose
+/// — went red the moment the closest-encloser search landed. That is the fix
+/// arriving, not a regression, and the S2 oracle is simply no longer what the
+/// implementation is held to.
+///
+/// So it now runs the same three oracles its S3 twin does over the S3 fixture:
+/// `real == s3` is the claim, `s2 -> s3` classified by `classify_s3` is S3's
+/// fence, and `frozen -> s2` classified by S2's `classify` is **kept** with its
+/// class counting intact. Nothing was removed: the S2 assertion that used to be
+/// `real == s2` is now `s2` sitting between two classified fences, which is
+/// strictly more than it checked before.
 #[test]
 fn every_branch_of_the_lookup_agrees_with_the_transcription_over_an_ancestor_closed_node_set() {
     let _watchdog = testutil::arm(WATCHDOG);
@@ -1843,12 +1858,17 @@ fn every_branch_of_the_lookup_agrees_with_the_transcription_over_an_ancestor_clo
     let cfg = s2_fixture();
     let real = Zone::from_config(&cfg).expect("fixture zone builds");
     let frozen = FrozenZone::build(&cfg).expect("transcription builds the same fixture");
+    let model = ConfigModel::build(&cfg);
     let ents = ancestor_closure(&cfg);
     let mut ent_list: Vec<LowerName> = ents.iter().cloned().collect();
     ent_list.sort_by_key(std::string::ToString::to_string);
     let s2 = FrozenZone::build(&cfg)
         .expect("the transcription builds twice")
         .materialise_ancestors(&ent_list);
+    let s3 = FrozenZone::build(&cfg)
+        .expect("the transcription builds three times")
+        .materialise_ancestors(&ent_list)
+        .under_the_rfc_rule();
     let origin_depth = label_count(&frozen.lower_origin);
 
     assert_eq!(real.record_count(), frozen.record_count);
@@ -1870,27 +1890,39 @@ fn every_branch_of_the_lookup_agrees_with_the_transcription_over_an_ancestor_clo
         let queried = lower(name);
         assert_eq!(
             real.exists(&queried),
-            s2.exists(&queried),
+            s3.exists(&queried),
             "Zone::exists disagreed for {name}"
         );
         for qtype in types {
             let actual = real.lookup(&queried, qtype);
-            let expected = s2.lookup(&queried, qtype);
+            let expected = s3.lookup(&queried, qtype);
             assert_eq!(
                 rendered(&actual),
                 rendered(&expected),
-                "{name} {qtype} disagreed with the transcription over the \
-                 ancestor-closed node set"
+                "{name} {qtype} disagreed with a brute-force transcription of RFC \
+                 4592 §3.3.1 over the ancestor-closed node set"
             );
 
+            // S3's fence.
+            let after_s2 = s2.lookup(&queried, qtype);
+            if rendered(&after_s2) != rendered(&expected) {
+                assert!(
+                    classify_s3(&model, &queried, qtype, &after_s2, &expected).is_some(),
+                    "{name} {qtype} changed between the deepest-wins rule and the \
+                     closest-encloser rule, and the change is not one that rule \
+                     can produce\n  before: {after_s2:?}\n  after:  {expected:?}"
+                );
+            }
+
+            // S2's fence, KEPT, with its class counting.
             let before = frozen.lookup(&queried, qtype);
-            if rendered(&before) != rendered(&expected) {
-                let class = classify(&ents, origin_depth, &queried, &before, &expected)
+            if rendered(&before) != rendered(&after_s2) {
+                let class = classify(&ents, origin_depth, &queried, &before, &after_s2)
                     .unwrap_or_else(|| {
                         panic!(
                             "{name} {qtype} changed between the pre-S2 and post-S2 \
                              node sets and the change is not one ancestor closure \
-                             can produce\n  before: {before:?}\n  after:  {expected:?}"
+                             can produce\n  before: {before:?}\n  after:  {after_s2:?}"
                         )
                     });
                 seen.insert(class);

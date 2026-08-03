@@ -19,7 +19,7 @@ Feature: Negative answers and out-of-zone refusal
 
   # ------------------------------------------------- NODATA vs NXDOMAIN
 
-  @happy @enforced src/zone.rs:400
+  @happy @enforced src/zone.rs:406
   Scenario: A name that exists with a different type resolves to NODATA
     Given the zone contains record set "www" of type "A" with values "203.0.113.20"
     When the zone is asked for "www.example.com." type AAAA

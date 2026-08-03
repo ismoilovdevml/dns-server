@@ -356,7 +356,7 @@ Feature: Wildcard record synthesis (RFC 4592)
     Then the answer section contains 1 record
     And the answer record owner is "a.b.c.d.e.example.com."
 
-  @boundary @vega-065 @enforced src/zone.rs:988
+  @boundary @vega-065 @enforced src/zone.rs:1074
   Scenario: The closest wildcard answers when several could match
     # Today the walk starts at the query name's parent and descends, so the
     # nearest wildcard wins. The bounded walk must consume its depths deepest

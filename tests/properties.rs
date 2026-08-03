@@ -269,9 +269,23 @@ fn stacked_name_that_exists(
     stack_label: &str,
     extra: usize,
 ) -> Option<String> {
+    let nodes = node_names(cfg);
+    (1..extra).find_map(|n| {
+        let candidate = format!("{}{base}", format!("{stack_label}.").repeat(n));
+        nodes.contains(&lower(&candidate)).then_some(candidate)
+    })
+}
+
+/// Every name that is a **node** in the zone this config describes: the declared
+/// owners — a wildcard under its own name, RFC 4592 §2.1.1 — plus the apex, plus
+/// every strict ancestor of both (RFC 4592 §2.2.2).
+///
+/// Factored out of [`stacked_name_that_exists`] at S3 because the property that
+/// calls it needs the same set for a second question, and the two answers have to
+/// come from one definition: whether a name is a node decides both whether it
+/// encloses what is above it and whether it can have been synthesised at all.
+fn node_names(cfg: &ZoneConfig) -> BTreeSet<LowerName> {
     let mut nodes = declared_node_names(cfg);
-    // Closed under ancestry (RFC 4592 §2.2.2), because an empty non-terminal
-    // encloses exactly as a declared name does.
     let origin_depth = label_count(&lower(&qualify("@")));
     let declared: Vec<LowerName> = nodes.iter().cloned().collect();
     for name in declared {
@@ -280,11 +294,7 @@ fn stacked_name_that_exists(
             nodes.insert(LowerName::from(full.trim_to(d)));
         }
     }
-
-    (1..extra).find_map(|n| {
-        let candidate = format!("{}{base}", format!("{stack_label}.").repeat(n));
-        nodes.contains(&lower(&candidate)).then_some(candidate)
-    })
+    nodes
 }
 
 // ---------------------------------------------------------------------------
@@ -1348,14 +1358,22 @@ proptest! {
         // walk; only the synthesised case is comparable.
         prop_assume!(extra > 0);
         if let Answer::Records(records) = &shallow {
-            // The shallow name was synthesised from a wildcard iff its answer
-            // is rewritten to it and the zone holds no exact set there.
+            // The shallow name was synthesised from a wildcard iff its answer is
+            // rewritten to it and the name is NOT A NODE.
+            //
+            // "Not a node", not "no exact record set here", and the difference is
+            // S3's. A wildcard's own literal name is a node (RFC 4592 §2.1.1),
+            // answered by the exact-match arm under RFC 4592 §2.3 — and its
+            // answer is owned by itself, so it is indistinguishable from a
+            // synthesis by shape alone. Before S3 it genuinely was one, because
+            // the exact probe skipped wildcard nodes; now it is not, and reading
+            // it as one asks this property to hold `a.*.example.test.` covered
+            // when `*.example.test.` exists and encloses it. Decided from the
+            // config, so the implementation gets no vote.
             let synthesised = records
                 .iter()
                 .all(|r| r.name.to_string().to_lowercase() == base.to_lowercase())
-                && !cfg.records.iter().any(|s| {
-                    !is_wildcard(&s.name) && qualify(&s.name).to_lowercase() == base.to_lowercase()
-                });
+                && !node_names(&cfg).contains(&lower(&base));
             if synthesised {
                 // Does any of the names we stacked on exist in the zone? If one
                 // does, it is the closest encloser of everything above it and

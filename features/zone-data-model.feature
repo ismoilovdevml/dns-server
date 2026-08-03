@@ -219,7 +219,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When it is parsed
     Then hickory rejects it as longer than 255 octets
 
-  @hostile @enforced src/zone.rs:2675
+  @hostile @enforced src/zone.rs:2780
   Scenario: A name of maximum-length labels is answered rather than mis-indexed
     # The other shape at the 255-octet limit: three 63-octet labels instead of
     # 127 one-octet ones. A hash pass that walked octets rather than label
@@ -287,7 +287,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When each name is queried for A, ANY and CNAME
     Then every answer matches the transcription exactly
 
-  @happy @enforced src/zone.rs:2193
+  @happy @enforced src/zone.rs:2279
   Scenario: VEGA-065's four asterisk-in-the-name behaviours survive the arena unmodified
     # Wildcards stop being a parent-keyed map at S1 and become nodes named
     # "*.x" (RFC 4592 §2.1.1). These four are the cases a wrong label-count
@@ -412,7 +412,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     Then node 0 is the zone apex
     And every ancestor that exists appears at a lower index than its descendant
 
-  @boundary @enforced src/zone.rs:2962
+  @boundary @enforced src/zone.rs:3067
   Scenario: Every node round-trips through the hash index
     # The index and the arena are built in one function from one scratch map and
     # dropped together, so they cannot drift across a reload. The failure this
@@ -444,7 +444,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
 
   # ----------------------------------------------------------- MALFORMED
 
-  @malformed @enforced src/zone.rs:1929
+  @malformed @enforced src/zone.rs:2015
   Scenario: An owner name outside the zone still fails the build after the rewrite
     # qualify() is the only thing standing between a config and a record for
     # somebody else's namespace. The arena build is a rewrite of everything
@@ -475,7 +475,7 @@ Feature: The zone data model — canonical order, the suffix hash, and the node 
     When a client queries a name of 127 single-octet labels
     Then it is answered with the owner rewritten to the queried name
 
-  @hostile @enforced src/zone.rs:2675
+  @hostile @enforced src/zone.rs:2780
   Scenario: A query name at exactly 255 octets is answered
     # The octet limit approached from the other direction from the label limit.
     # A name can be at the octet ceiling with very few labels, and a model that

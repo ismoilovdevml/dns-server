@@ -683,6 +683,27 @@ fn a_zone_with_many_wildcard_depths_costs_no_more_than_one_with_a_single_depth()
          the query name that makes every probe miss, and one 276-byte packet \
          buys the difference"
     );
+    // RELEASE ONLY, and announced rather than skipped quietly.
+    //
+    // The ratio above is the structural claim and it holds in either build — a
+    // debug build is uniformly slower, so both halves move together and it
+    // measures 1.1x there too. The 2 µs is a *wall clock* number, and every
+    // figure it was derived from was measured `--release`: the same query costs
+    // ~5 µs in a debug build, entirely because of `debug_assert`s and unelided
+    // abstraction, and nothing about that says anything about VEGA-078.
+    //
+    // Asserting it unconditionally would leave `cargo test` red by default, and
+    // a gate that is red by default is a gate somebody deletes — the same
+    // reasoning `tests/zone_memory.rs::flat_fixture_does_not_grow` is written
+    // with, and it is the only other absolute figure in this tree.
+    if cfg!(debug_assertions) {
+        println!(
+            "  (2 µs ceiling not checked: debug build. The ratio above is, and it \
+             is the half that carries the structural claim. Run \
+             `cargo test --release --test perf_budget`.)"
+        );
+        return;
+    }
     assert!(
         hostile_cost < Duration::from_micros(2),
         "one query against a {HOSTILE_WILDCARD_DEPTHS}-depth wildcard zone costs \

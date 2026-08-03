@@ -1,15 +1,16 @@
 //! Protocol-conformance tests driven from the wire, one RFC clause per test.
 //!
-//! These came out of fuzzing a running server with hand-built packets. Each
-//! `#[ignore]`d test below is a bug that is live today: the server answers, and
-//! answers wrongly. They are written to the RFC rather than to the code, so
-//! they stay meaningful after the fix.
+//! These came out of fuzzing a running server with hand-built packets. Three of
+//! them were `#[ignore]`d as bugs that were live at the time: the server
+//! answered, and answered wrongly. They are written to the RFC rather than to
+//! the code, so they stayed meaningful across the fix.
 //!
-//! The empty-non-terminal pair is un-`#[ignore]`d at VEGA-032 S2, which closes
-//! VEGA-006. The wildcard closest-encloser test below it is VEGA-009's and stays
-//! red until S3 — if it goes green at S2, S2 went outside its fence.
-//!
-//! Run them with `cargo test --test rfc_conformance -- --ignored`.
+//! **Nothing here is `#[ignore]`d any more.** The empty-non-terminal pair came
+//! off at VEGA-032 S2 (VEGA-006) and the wildcard closest-encloser test came off
+//! at S3 (VEGA-009). `src/zone.rs::every_rfc_bug_this_model_fixes_is_green_and_none_of_them_is_ignored_again`
+//! reads this file with `include_str!` and fails if one goes back on, in either
+//! direction — a fence that covers the zone layer but not the wire is the same
+//! bug wearing a green unit test.
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -383,13 +384,20 @@ async fn asking_for_the_empty_non_terminal_first_does_not_deny_the_record_beneat
     assert_eq!(child.answers[0].record_type(), RecordType::SRV);
 }
 
+/// VEGA-009, closed at VEGA-032 S3, over the wire.
+///
+/// The `#[ignore]` came off in the commit that installed the closest-encloser
+/// search. `src/zone.rs::every_rfc_bug_this_model_fixes_is_green_and_none_of_them_is_ignored_again`
+/// reads this file with `include_str!` and fails if it goes back on: a zone layer
+/// that answers NXDOMAIN while the handler renders NOERROR is the same bug
+/// wearing a green unit test, so the fence has to cover both files or it covers
+/// neither.
 #[tokio::test]
-#[ignore = "BUG: a wildcard is applied below an existing closest encloser (RFC 4592 s3.3.1)"]
 async fn a_wildcard_does_not_reach_below_a_name_that_exists() {
     // `deep.apps.example.test` exists, so it is the closest encloser of
-    // `a.deep.apps.example.test`. The source of synthesis would be
-    // `*.deep.apps.example.test`, which does not exist, so the answer is
-    // NXDOMAIN. The zone walks up to the first wildcard it can find instead.
+    // `a.deep.apps.example.test`. The source of synthesis is therefore
+    // `*.deep.apps.example.test`, which does not exist, and RFC 4592 §3.3.1
+    // permits no search for an alternate — so the answer is NXDOMAIN.
     let server = start(vec![
         spec("*.apps", "A", &["203.0.113.30"]),
         spec("deep.apps", "A", &["203.0.113.31"]),
