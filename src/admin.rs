@@ -7,7 +7,7 @@
 //! loopback.
 
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -271,9 +271,32 @@ impl AdminState {
                 given.len() == expected.len() && constant_time_eq(given, expected)
             }),
             // No token configured: only trust the local machine.
-            None => peer.ip().is_loopback(),
+            None => is_local(peer.ip()),
         }
     }
+}
+
+/// Whether `ip` is this machine, with IPv4-mapped IPv6 folded to IPv4 first.
+///
+/// An IPv4 client reaching a `[::]`-bound socket arrives as `::ffff:127.0.0.1`
+/// (RFC 4291 §2.5.5.2), and `is_loopback` is false for that form. So `/reload`
+/// answered 403 to `vega reload` running on the same host — on exactly the
+/// dual-stack `admin_listen` the Kubernetes manifest encourages — with a
+/// permission error and nothing to explain it (VEGA-016).
+///
+/// `to_ipv4_mapped` and not `to_ipv4`, the same choice and the same reasoning as
+/// `ratelimit::canonical_key` (VEGA-003). `to_ipv4` also matches the
+/// IPv4-*compatible* form deprecated by RFC 4291 §2.5.5.1, and it is wrong in
+/// both directions here: it would fold `::127.0.0.1` — an ordinary IPv6 address
+/// an off-host caller can present — into loopback and hand it `/reload`, and it
+/// maps `::1` to `0.0.0.1`, which is not loopback, so it would lock out the one
+/// caller the check exists to admit.
+fn is_local(ip: IpAddr) -> bool {
+    let canonical = match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+    };
+    canonical.is_loopback()
 }
 
 /// Extract a bearer token from an `Authorization` header.
@@ -359,7 +382,9 @@ pub async fn serve(
         ""
     };
     info!(%local, "admin endpoints listening (/healthz /readyz /metrics /version{reload})");
-    if state.reload.is_some() && state.token.is_none() && !local.ip().is_loopback() {
+    // The same fold as the gate itself, so the warning cannot claim callers will
+    // be rejected on a listener that in fact accepts them.
+    if state.reload.is_some() && state.token.is_none() && !is_local(local.ip()) {
         warn!(
             %local,
             "/reload is reachable off-host but no --admin-token is set; \
@@ -671,6 +696,63 @@ mod tests {
         let body = body_text(response).await;
         assert!(body.contains("\"records\":3"), "{body}");
         assert!(body.contains("example.com"), "{body}");
+    }
+
+    /// Scenario: An IPv4 client reloads through a dual-stack admin listener
+    /// features/admin-api.feature:238
+    ///
+    /// VEGA-016. On `admin_listen = "[::]:9100"` an IPv4 peer is delivered as
+    /// `::ffff:127.0.0.1`, and the bare `is_loopback` this used to call is false
+    /// for that: `vega reload` on the same host got a 403.
+    #[tokio::test]
+    async fn an_ipv4_mapped_loopback_peer_may_reload_on_a_dual_stack_listener() {
+        let state = state().with_reload(ok_hook());
+        let response = send(
+            state,
+            Method::POST,
+            "/reload",
+            "[::ffff:127.0.0.1]:40000",
+            None,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an IPv4 client on a [::] listener is on loopback and must be let in"
+        );
+    }
+
+    /// Both native stacks still behave, so the fold cannot be mistaken for
+    /// "trust anything that mentions 127".
+    #[tokio::test]
+    async fn native_v6_loopback_is_allowed_and_a_mapped_public_address_is_not() {
+        let state = state().with_reload(ok_hook());
+        let allowed = send(state.clone(), Method::POST, "/reload", "[::1]:40000", None).await;
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let refused = send(
+            state,
+            Method::POST,
+            "/reload",
+            "[::ffff:203.0.113.7]:40000",
+            None,
+        )
+        .await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "a mapped *public* address is still off-host"
+        );
+    }
+
+    /// The reason the fold is `to_ipv4_mapped` and not `to_ipv4`: the deprecated
+    /// IPv4-compatible form (RFC 4291 §2.5.5.1) is an ordinary IPv6 address, and
+    /// `to_ipv4` would hand `/reload` to whoever presents it.
+    #[tokio::test]
+    async fn the_deprecated_ipv4_compatible_form_is_not_treated_as_loopback() {
+        let state = state().with_reload(ok_hook());
+        let response = send(state, Method::POST, "/reload", "[::127.0.0.1]:40000", None).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{response:?}");
     }
 
     #[tokio::test]
