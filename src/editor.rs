@@ -386,35 +386,176 @@ impl ConfigEditor {
     }
 }
 
-/// Render to a sibling temp file, fsync, then rename over the target.
+/// How many temp names to try before giving up.
+///
+/// A collision means a temp file from a crashed process is sitting on the name
+/// this one composed — same pid after a reboot, same nanosecond. Bounded rather
+/// than looped: an unbounded retry on a directory we cannot write to is a hang,
+/// and this runs in front of an operator waiting at a prompt.
+const TEMP_NAME_ATTEMPTS: u32 = 16;
+
+/// Render to a sibling temp file, fsync it, rename over the target, then fsync
+/// the directory.
+///
+/// Four things have to hold at once, and VEGA-017 found three of them broken:
+///
+/// * **The temp name is unique per writer.** It used to be `.{filename}.tmp`,
+///   derived from the target and nothing else, and opened with `File::create` —
+///   so two `vega record add` processes truncated and wrote *the same* file at
+///   their own offsets, then both renamed it. The survivor could be a torn
+///   document, and the loser's rename failed with ENOENT. `create_new` is what
+///   makes the name ours: if the composed name is taken, we compose another
+///   rather than write into someone else's file.
+/// * **The mode is the target's.** `File::create` installs `0666 & ~umask`, so a
+///   config that install.sh deliberately left `0640` came back `0644` after any
+///   edit — and this file holds `admin_token`, the shared secret guarding
+///   `/reload`. That is the same secret VEGA-082 and VEGA-089 stopped leaking
+///   through error messages, handed to every local user instead.
+/// * **The content is on disk before the rename.** Already true.
+/// * **The rename is on disk after it.** A rename is atomic but not durable: on
+///   ext4 and xfs the directory entry can be lost to a power cut while the file
+///   it points at survives, which is the one failure the module doc promises
+///   cannot happen. The directory fsync is what makes that promise true.
+///
+/// Concurrent edits still race at a higher level: the read-modify-write in
+/// `open` … `save` takes no lock, so of two overlapping `record add` processes
+/// the later one can write a document built from a read that predates the
+/// earlier one's save, and that record is silently lost. The file it leaves is
+/// always a complete, valid document — that part is fixed here — but the fix for
+/// the lost update is an advisory lock held across the whole read-modify-write,
+/// which needs either `File::lock` (Rust 1.89; MSRV is 1.88) or a new
+/// dependency. VEGA-017 keeps that half.
 fn write_atomically(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write as _;
 
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let tmp = match dir {
-        Some(dir) => dir.join(format!(
-            ".{}.tmp",
-            path.file_name().map_or_else(
-                || "vega.toml".to_owned(),
-                |n| n.to_string_lossy().into_owned(),
-            )
-        )),
-        None => PathBuf::from(".vega.toml.tmp"),
-    };
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
 
-    {
-        let mut file =
-            fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let (mut file, tmp) = create_temp(dir, path)?;
+
+    // Anything that fails from here to the rename leaves a temp file behind, and
+    // a directory slowly filling with them is its own incident.
+    let written = (|| -> Result<()> {
+        preserve_mode(&file, path)?;
         file.write_all(contents.as_bytes())
             .with_context(|| format!("writing {}", tmp.display()))?;
         // Without the sync, a crash after the rename can leave an empty file.
         file.sync_all()
-            .with_context(|| format!("syncing {}", tmp.display()))?;
+            .with_context(|| format!("syncing {}", tmp.display()))
+    })();
+    drop(file);
+
+    if let Err(error) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
 
-    fs::rename(&tmp, path)
-        .with_context(|| format!("replacing {} with {}", path.display(), tmp.display()))?;
+    if let Err(error) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow::Error::new(error).context(format!(
+            "replacing {} with {}",
+            path.display(),
+            tmp.display()
+        )));
+    }
+
+    sync_dir(dir);
     Ok(())
+}
+
+/// Create a temp file next to `target` on a name no other writer holds.
+///
+/// pid and nanoseconds, because the collision to defend against is another
+/// process editing the same config at the same moment; the attempt counter only
+/// separates two threads of *this* process that reached the same nanosecond.
+fn create_temp(dir: &Path, target: &Path) -> Result<(fs::File, PathBuf)> {
+    let name = target.file_name().map_or_else(
+        || "vega.toml".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos());
+
+    let mut last = None;
+    for attempt in 0..TEMP_NAME_ATTEMPTS {
+        let tmp = dir.join(format!(".{name}.{pid}.{nanos}.{attempt}.tmp"));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => return Ok((file, tmp)),
+            // The only error worth another name. Anything else — no such
+            // directory, read-only filesystem, out of space — repeats.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                last = Some((tmp, error));
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("creating a temporary file in {}", dir.display())))
+            }
+        }
+    }
+
+    let (tmp, error) = last.unwrap_or_else(|| {
+        (
+            dir.to_path_buf(),
+            std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no attempt was made"),
+        )
+    });
+    Err(anyhow::Error::new(error).context(format!(
+        "creating a temporary file next to {}: {TEMP_NAME_ATTEMPTS} names were taken, \
+         the last of them {}; remove any stale .tmp files there",
+        target.display(),
+        tmp.display()
+    )))
+}
+
+/// Give the temp file the target's permission bits, so the rename cannot widen
+/// them.
+///
+/// A target that does not exist yet — `vega init` — keeps whatever the umask
+/// gave us; there is no mode to preserve, and inventing one here would hide the
+/// umask from an operator who set it deliberately.
+#[cfg(unix)]
+fn preserve_mode(file: &fs::File, target: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Ok(metadata) = fs::metadata(target) else {
+        return Ok(());
+    };
+    // Mask off the file-type bits: `st_mode` carries them, `from_mode` does not
+    // want them, and setuid/setgid/sticky (0o7000) are carried through because
+    // dropping a bit an operator set is the same class of surprise as adding one.
+    let mode = metadata.permissions().mode() & 0o7777;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+        .with_context(|| {
+            format!(
+                "setting mode {mode:o} on the replacement for {}",
+                target.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn preserve_mode(_file: &fs::File, _target: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Flush the directory entry the rename just created.
+///
+/// Best effort, and deliberately not an error: by the time this runs the rename
+/// has happened and the edit *is* applied, so failing the command here would
+/// report a completed edit as a failure. Filesystems that do not support fsync
+/// on a directory would then break every save.
+fn sync_dir(dir: &Path) {
+    if let Ok(handle) = fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
 }
 
 fn normalise_name(name: &str) -> String {
@@ -979,7 +1120,6 @@ values = ["203.0.113.10"]
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "BUG: an atomic write drops the config's permission bits, exposing admin_token (0640 -> 0644)"]
     fn saving_preserves_the_config_file_permissions() {
         // `write_atomically` creates a brand new temp file with
         // `fs::File::create` — mode 0666 & ~umask, so 0644 under the usual
@@ -1019,7 +1159,6 @@ values = ["203.0.113.10"]
     }
 
     #[test]
-    #[ignore = "BUG: write_atomically uses a fixed temp filename, so two concurrent writers to the same config corrupt each other"]
     fn two_concurrent_writers_do_not_corrupt_the_config() {
         // `write_atomically` derives the temp path purely from the target name
         // (`.vega.toml.tmp`), with no pid, no randomness and no O_EXCL.

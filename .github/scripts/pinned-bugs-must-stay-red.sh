@@ -58,10 +58,17 @@ TEST_THREADS="${TEST_THREADS:-2}"
 # they existed to stop S1 or S2 quietly fixing an RFC bug that belonged to a
 # later step, and every step has now landed. What remains pins four bugs that
 # are still live.
+# VEGA-017 took the two editor lines: the atomic write now preserves the mode
+# and the temp name is unique per writer.
+#
+#   <this commit>  VEGA-017, concurrent edits and permission bits
+#     editor::tests::saving_preserves_the_config_file_permissions
+#     editor::tests::two_concurrent_writers_do_not_corrupt_the_config
+#
+# The permission half is why VEGA-082 and VEGA-089 both recurred: a config
+# written back as 0644 exposes admin_token to every local reader.
 expected=$(
 	cat <<'EOF'
-editor::tests::saving_preserves_the_config_file_permissions
-editor::tests::two_concurrent_writers_do_not_corrupt_the_config
 txt_record_values_round_trip_through_presentation_format
 ui::tests::colour_state_is_not_shared_between_concurrent_tests
 EOF

@@ -6,7 +6,7 @@ use std::{net::IpAddr, sync::Arc, time::Instant};
 use arc_swap::ArcSwap;
 
 use hickory_proto::{
-    op::{Edns, Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode},
+    op::{Edns, Header, HeaderCounts, LowerQuery, MessageType, Metadata, OpCode, ResponseCode},
     rr::{
         rdata::{A, AAAA, HINFO, TXT},
         DNSClass, LowerName, Name, RData, Record, RecordType,
@@ -561,19 +561,25 @@ impl RequestHandler for DnsHandler {
             Err(_) => ResponseCode::ServFail,
         });
 
+        // Borrowed, not rendered. `tracing` only calls `Display` if a subscriber
+        // has asked for the event, and the shipped log filter leaves DEBUG off —
+        // so a `to_string()` here built a `String` per query, for a line nobody
+        // read, sized by a field the attacker chooses (VEGA-067). `Option` is
+        // itself a `Value`: `None` omits the field rather than logging an empty
+        // one, so the output for a real query is byte-identical to before.
         let qname = request
             .queries
             .queries()
             .first()
-            .map(|q| q.name().to_string())
-            .unwrap_or_default();
+            .map(LowerQuery::name)
+            .map(tracing::field::display);
 
         match outcome {
             Ok(info) => {
                 debug!(
                     %src,
                     ?transport,
-                    query = %qname,
+                    query = qname,
                     rcode = %resolved.code,
                     answers = resolved.answers.len(),
                     duration_us = elapsed.as_micros(),
@@ -583,7 +589,7 @@ impl RequestHandler for DnsHandler {
             }
             Err(error) => {
                 self.metrics.send_error();
-                error!(%src, query = %qname, %error, "failed to send response");
+                error!(%src, query = qname, %error, "failed to send response");
                 serve_failed(&request.metadata)
             }
         }
