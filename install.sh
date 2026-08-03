@@ -8,6 +8,11 @@
 # config file and a unit, then leaves the service stopped so you can review the
 # zone before starting it.
 #
+# Verification is not advisory. If the checksum cannot be established the
+# install aborts; the only way past that is to type --insecure-skip-checksum,
+# which is deliberately not settable from the environment so it cannot be
+# smuggled into a `curl | sh`.
+#
 # Environment overrides:
 #   VERSION=v0.2.0        install a specific tag instead of the latest release
 #   INSTALL_DIR=/opt/bin  where the binary goes (default /usr/local/bin)
@@ -25,6 +30,15 @@ CONFIG_DIR="${CONFIG_DIR:-/etc/vega}"
 SERVICE_USER="vega"
 WITH_SYSTEMD=0
 VERSION="${VERSION:-}"
+SKIP_CHECKSUM=0
+VERIFY_ATTESTATION=0
+
+# Where release artifacts are fetched from. The override exists so
+# deploy/prove-installer-rejects-tampering.sh can point this script at a scratch
+# release on disk and watch it refuse a tampered one; a gate nobody has seen
+# fail is decoration. It changes where the binary comes from, so anything able
+# to set it in your environment could equally well replace this script.
+RELEASE_BASE_URL="${VEGA_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}"
 
 # ---------------------------------------------------------------- output ----
 
@@ -55,6 +69,12 @@ Usage: install.sh [options]
   --version VERSION      install a specific release tag (e.g. v0.2.0)
   --install-dir DIR      binary destination (default: $INSTALL_DIR)
   --config-dir DIR       config destination (default: $CONFIG_DIR)
+  --verify-attestation   additionally require a valid GitHub build provenance
+                         attestation (needs the gh CLI; fatal if it is missing)
+  --insecure-skip-checksum
+                         downgrade an *unavailable* checksum from fatal to a
+                         warning. A checksum that is present and does not match
+                         is still fatal, always.
   -h, --help             show this help
 
 Without --systemd this only installs the binary, which is all you need for
@@ -71,6 +91,8 @@ while [ $# -gt 0 ]; do
         --install-dir=*) INSTALL_DIR="${1#*=}" ;;
         --config-dir) CONFIG_DIR="${2:-}"; shift ;;
         --config-dir=*) CONFIG_DIR="${1#*=}" ;;
+        --insecure-skip-checksum) SKIP_CHECKSUM=1 ;;
+        --verify-attestation) VERIFY_ATTESTATION=1 ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (try --help)" ;;
     esac
@@ -93,6 +115,29 @@ as_root() {
         sudo "$@"
     else
         die "need root to run: $* (install sudo, or re-run as root)"
+    fi
+}
+
+# True when we could create or replace $1 without escalating: walk up to the
+# nearest path component that exists and ask whether we can write to it.
+writable_dest() {
+    _d="$1"
+    while [ ! -e "$_d" ]; do
+        _parent=$(dirname "$_d")
+        [ "$_parent" != "$_d" ] || break
+        _d="$_parent"
+    done
+    [ -w "$_d" ]
+}
+
+# Escalate only when the destination is not already ours. Installing into
+# ~/.local/bin, a container build, or a scratch directory should never ask for
+# a password — and the CI proof runs with NO_SUDO=1 for exactly that reason.
+dest_root() {
+    if writable_dest "$INSTALL_DIR"; then
+        "$@"
+    else
+        as_root "$@"
     fi
 }
 
@@ -145,20 +190,45 @@ latest_version() {
         | sed -e 's/.*"tag_name"[[:space:]]*:[[:space:]]*"//' -e 's/".*//'
 }
 
+# Abort, unless the operator explicitly asked for the downgrade on the command
+# line. Everything that makes verification *impossible* funnels through here so
+# there is exactly one place where the install can proceed unverified.
+cannot_verify() {
+    if [ "$SKIP_CHECKSUM" = 1 ]; then
+        warn "$1"
+        warn "--insecure-skip-checksum was passed; installing an UNVERIFIED binary"
+        return 0
+    fi
+    die "$1
+Refusing to install unverified. Re-run with --insecure-skip-checksum only if
+you understand that this accepts whatever the network hands you:
+  curl -fsSL .../install.sh | sh -s -- --insecure-skip-checksum"
+}
+
 verify_checksum() {
     # $1 archive path, $2 checksum file, $3 archive file name
-    expected=$(grep -F "  $3" "$2" 2>/dev/null | awk '{print $1}' | head -1)
-    if [ -z "$expected" ]; then
-        expected=$(awk '{print $1}' "$2" | head -1)
-    fi
-    [ -n "$expected" ] || die "no checksum found for $3"
+    #
+    # The name must match exactly. An earlier version fell back to the first
+    # line of the file when the name was absent, which let anyone serving a
+    # one-line SHA256SUMS naming *any* other artifact have their own hash
+    # accepted for ours — verification that verifies nothing.
+    expected=$(awk -v want="$3" '$2 == want || $2 == "*" want { print $1; exit }' "$2")
+    [ -n "$expected" ] || die "SHA256SUMS for $VERSION does not list $3.
+Refusing to install: a checksum file that does not name this artifact cannot
+vouch for it."
+
+    # A 64-character lowercase hex digest, or the file is not what it claims.
+    case "$expected" in
+        *[!0-9a-f]*) die "SHA256SUMS gave a malformed digest for $3: $expected" ;;
+    esac
+    [ "${#expected}" = 64 ] || die "SHA256SUMS gave a ${#expected}-character digest for $3; expected 64"
 
     if command -v sha256sum >/dev/null 2>&1; then
         actual=$(sha256sum "$1" | awk '{print $1}')
     elif command -v shasum >/dev/null 2>&1; then
         actual=$(shasum -a 256 "$1" | awk '{print $1}')
     else
-        warn "no sha256sum or shasum found; skipping checksum verification"
+        cannot_verify "no sha256sum or shasum on PATH, so the download cannot be checked"
         return 0
     fi
 
@@ -167,6 +237,22 @@ verify_checksum() {
   actual   $actual
 Refusing to install. This is either a corrupted download or a tampered artifact."
     ok "checksum verified"
+}
+
+# Optional second signal: the artifact was produced by this repository's release
+# workflow, not merely uploaded by someone with push access to the releases
+# page. Opt-in, because it needs the gh CLI and a network round trip — but once
+# asked for it is fatal on failure, including "gh is not installed". An
+# "if available" check is not a check.
+verify_attestation() {
+    # $1 archive path
+    command -v gh >/dev/null 2>&1 \
+        || die "--verify-attestation needs the GitHub CLI (gh), which is not installed"
+    info "verifying build provenance with gh"
+    gh attestation verify "$1" --repo "$REPO" \
+        || die "build provenance attestation failed for $1.
+Refusing to install: this artifact was not produced by $REPO's release workflow."
+    ok "attestation verified"
 }
 
 # ------------------------------------------------------------------ main ----
@@ -186,7 +272,7 @@ fi
 info "version: $VERSION"
 
 ARCHIVE="${BIN_NAME}-${VERSION}-${TARGET}.tar.gz"
-BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
+BASE_URL="$RELEASE_BASE_URL/$VERSION"
 
 TMP=$(mktemp -d)
 # Clean up on every exit path, including failure.
@@ -197,10 +283,17 @@ fetch "$BASE_URL/$ARCHIVE" "$TMP/$ARCHIVE" \
     || die "download failed. Check that $VERSION has an asset for $TARGET:
   https://github.com/$REPO/releases/tag/$VERSION"
 
+# Fetching SHA256SUMS is not best-effort. Anyone who can serve you a trojaned
+# tarball can also 404 this request, so treating the 404 as "nothing to check"
+# hands them the install (VEGA-021).
 if fetch "$BASE_URL/SHA256SUMS" "$TMP/SHA256SUMS" 2>/dev/null; then
     verify_checksum "$TMP/$ARCHIVE" "$TMP/SHA256SUMS" "$ARCHIVE"
 else
-    warn "no SHA256SUMS published for $VERSION; skipping verification"
+    cannot_verify "could not fetch SHA256SUMS for $VERSION from $BASE_URL"
+fi
+
+if [ "$VERIFY_ATTESTATION" = 1 ]; then
+    verify_attestation "$TMP/$ARCHIVE"
 fi
 
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP" || die "could not extract $ARCHIVE"
@@ -208,8 +301,8 @@ tar -xzf "$TMP/$ARCHIVE" -C "$TMP" || die "could not extract $ARCHIVE"
 chmod +x "$TMP/$BIN_NAME"
 
 info "installing to $INSTALL_DIR/$BIN_NAME"
-as_root mkdir -p "$INSTALL_DIR"
-as_root install -m 0755 "$TMP/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
+dest_root mkdir -p "$INSTALL_DIR"
+dest_root install -m 0755 "$TMP/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
 ok "$("$INSTALL_DIR/$BIN_NAME" --version)"
 
 if [ "$WITH_SYSTEMD" = 1 ]; then

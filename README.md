@@ -62,6 +62,14 @@ curl -fsSL https://raw.githubusercontent.com/ismoilovdevml/vega/main/install.sh 
 Downloads the release binary for your platform, verifies its SHA-256 against the
 published `SHA256SUMS`, and installs it to `/usr/local/bin`.
 
+The verification is not advisory. If `SHA256SUMS` cannot be fetched, does not
+name your artifact, or cannot be computed because the box has neither
+`sha256sum` nor `shasum`, the installer **aborts** — the case an attacker who
+can serve you a tarball can also arrange. Getting past that takes an explicit
+`sh -s -- --insecure-skip-checksum`, and a mismatch is fatal even then. Add
+`--verify-attestation` (needs the [`gh`](https://cli.github.com) CLI) to also
+require a valid GitHub build-provenance attestation for the download.
+
 Add `--systemd` to also create the service user, a starter config in
 `/etc/vega/`, and a hardened systemd unit — left **stopped** so you can
 review the zone first:
@@ -92,8 +100,12 @@ then verify before you trust it:
 
 ```bash
 sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify vega-v0.2.0-x86_64-unknown-linux-musl.tar.gz --repo ismoilovdevml/vega
 tar -xzf vega-v0.2.0-x86_64-unknown-linux-musl.tar.gz
 ```
+
+`SHA256SUMS` is attested too, so the digests themselves come with provenance
+rather than just sitting next to the files they vouch for.
 
 **Shell completions**
 

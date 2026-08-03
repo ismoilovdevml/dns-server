@@ -160,7 +160,16 @@ jobs:
           shellcheck --shell=sh \
             deploy/check-shutdown-invariants.sh \
             deploy/prove-unit-guard-fails.sh \
+            deploy/prove-installer-rejects-tampering.sh \
             .github/scripts/pinned-bugs-must-stay-red.sh
+
+      # install.sh is the README's first instruction and it runs as root. It
+      # claimed to verify a checksum and had three ways round it (VEGA-021).
+      # This drives the real installer against scratch releases on disk and
+      # requires a non-zero exit for every artifact it cannot vouch for. No
+      # toolchain, no network: seconds, on the job that was already running.
+      - name: Prove the installer refuses what it cannot verify
+        run: ./deploy/prove-installer-rejects-tampering.sh
 
   manifests:
     name: Validate deployment manifests

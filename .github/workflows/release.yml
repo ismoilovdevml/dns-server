@@ -148,11 +148,21 @@ jobs:
 
       # Lets a consumer verify the binaries came from this workflow, not just
       # from someone with push access to the releases page.
+      #
+      # SHA256SUMS is a subject in its own right (VEGA-021): install.sh treats
+      # it as authority over every archive, so a digest list that is itself
+      # unattested is the weakest link in the chain, not a bystander.
+      #
+      # No continue-on-error. It used to carry one, which meant a release could
+      # publish silently unattested and `gh attestation verify` would fail for
+      # every user of that version with nothing in the release to explain why.
+      # If attestation breaks, the release fails and we fix it before shipping.
       - name: Attest the artifacts
         uses: actions/attest-build-provenance@v2
-        continue-on-error: true
         with:
-          subject-path: artifacts/*.tar.gz
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
 
       - name: Release notes
         id: notes
@@ -178,15 +188,20 @@ jobs:
             echo
             echo '```bash'
             echo "sha256sum -c SHA256SUMS --ignore-missing"
+            echo "gh attestation verify vega-$version-<target>.tar.gz --repo ${{ github.repository }}"
             echo '```'
+            echo
+            echo "The installer does this for you and refuses to install when it cannot."
           } > notes.md
 
           if [ -f CHANGELOG.md ]; then
-            echo "" >> notes.md
-            echo "### Changes" >> notes.md
-            echo "" >> notes.md
-            # Everything between this version's heading and the next one.
-            awk "/^## \[?v?$version\]?/{flag=1; next} /^## /{flag=0} flag" CHANGELOG.md >> notes.md || true
+            {
+              echo ""
+              echo "### Changes"
+              echo ""
+              # Everything between this version's heading and the next one.
+              awk "/^## \[?v?$version\]?/{flag=1; next} /^## /{flag=0} flag" CHANGELOG.md || true
+            } >> notes.md
           fi
           cat notes.md
 
